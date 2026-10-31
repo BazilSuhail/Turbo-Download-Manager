@@ -18,6 +18,7 @@
 ## Table of contents
 
 - [Features](#features)
+- [Comparison with IDM](#comparison-with-idm)
 - [Quick start](#quick-start)
 - [Browser setup](#browser-setup)
 - [How browser capture works](#how-browser-capture-works)
@@ -92,6 +93,48 @@
 
 ---
 
+## Comparison with IDM
+
+Internet Download Manager (IDM) is the best-known Windows download manager. The table compares
+TDM with IDM on the features people usually ask about. IDM details reflect its public documentation
+at the time of writing; check the vendor's site for current pricing and features.
+
+<table>
+  <tr>
+    <th align="left">Feature</th>
+    <th align="left">TDM</th>
+    <th align="left">IDM</th>
+  </tr>
+  <tr><td>Price</td><td>Free</td><td>Paid (free trial)</td></tr>
+  <tr><td>Licence</td><td>MIT OR Apache-2.0, open source</td><td>Proprietary, closed source</td></tr>
+  <tr><td>Windows</td><td>Yes</td><td>Yes</td></tr>
+  <tr><td>macOS and Linux</td><td>Yes (packages built from source)</td><td>No</td></tr>
+  <tr><td>Multi-connection downloads</td><td>Yes, configurable segments per file</td><td>Yes, dynamic segmentation</td></tr>
+  <tr><td>Pause and resume</td><td>Yes</td><td>Yes</td></tr>
+  <tr><td>FTP</td><td>Yes</td><td>Yes</td></tr>
+  <tr><td>HLS / DASH streams</td><td>Yes, saved as a file</td><td>Yes, via the video grabber</td></tr>
+  <tr><td>Scheduler and speed limit</td><td>Yes</td><td>Yes</td></tr>
+  <tr><td>Queues</td><td>Yes</td><td>Yes</td></tr>
+  <tr><td>Browser capture</td><td>Chrome, Edge, Brave, Vivaldi, Opera, Firefox</td><td>Chrome, Edge, Firefox and others</td></tr>
+  <tr><td>Browser extension install</td><td>Manual (Load unpacked) for now</td><td>From the browser's add-on store</td></tr>
+  <tr><td>Download prompt before starting</td><td>Yes: Download now or Add to queue</td><td>Yes</td></tr>
+  <tr><td>Verify SHA-256 checksum</td><td>Yes</td><td>Not a headline feature</td></tr>
+  <tr><td>Site grabber (download a whole site)</td><td>No</td><td>Yes</td></tr>
+  <tr><td>Antivirus scan of finished files</td><td>No</td><td>Yes (integrated scan option)</td></tr>
+  <tr><td>Batch add with patterns</td><td>Yes (<code>[001-120]</code>, <code>[a-z]</code>)</td><td>Yes</td></tr>
+  <tr><td>Dark and light themes</td><td>Yes</td><td>Limited</td></tr>
+  <tr><td>Source code you can read and change</td><td>Yes</td><td>No</td></tr>
+  <tr><td>Track record and maturity</td><td>New, pre-release</td><td>Long-established</td></tr>
+  <tr><td>Code-signed installer</td><td>Not yet</td><td>Yes</td></tr>
+</table>
+
+> [!NOTE]
+> TDM is young. IDM has more years of use, more browser integrations and features such as the site
+> grabber and antivirus scanning that TDM does not have yet. TDM's advantages are that it is free,
+> open source, and runs on macOS and Linux as well as Windows.
+
+---
+
 ## Quick start
 
 1. **Install TDM** for your system (see the table below).
@@ -121,11 +164,16 @@
   </tr>
 </table>
 
-> **Note:** Windows may show a "Windows protected your PC" warning. Click **More info → Run anyway**. Releases are not code-signed yet.
+> [!WARNING]
+> Windows may show a "Windows protected your PC" warning. Click **More info → Run anyway**. Releases are not code-signed yet.
 
 ---
 
 ## Browser setup
+
+> [!IMPORTANT]
+> Keep the extension folder where it is. If you move or delete `extension\dist\chrome`, the browser
+> loses its connection to TDM and you must load the new location again.
 
 TDM does not need admin rights to connect to a browser. Use the sidebar to start:
 
@@ -176,11 +224,16 @@ TDM does not need admin rights to connect to a browser. Use the sidebar to start
 
 ### Private (Incognito) windows
 
-The browser does not let an extension run in private windows until you allow it. Once, open the TDM card's **Details** on the extensions page and switch on **Allow in Incognito**. TDM cannot switch this on for you.
+> [!IMPORTANT]
+> The browser does not let an extension run in private windows until you allow it. Once, open the TDM card's **Details** on the extensions page and switch on **Allow in Incognito**. TDM cannot switch this on for you.
 
 ---
 
 ## How browser capture works
+
+> [!NOTE]
+> By default every HTTP/HTTPS file download is captured. TDM then asks whether to **Download now** or
+> **Add to queue**, and cancels the browser's own copy only after you choose.
 
 ```mermaid
 sequenceDiagram
@@ -208,6 +261,9 @@ sequenceDiagram
 ---
 
 ## Keyboard shortcuts
+
+> [!TIP]
+> Press <kbd>Ctrl</kbd>+<kbd>N</kbd> to paste or type a link quickly, then press Enter to start it.
 
 <table>
   <tr>
