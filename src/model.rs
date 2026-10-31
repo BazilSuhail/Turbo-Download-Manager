@@ -546,10 +546,25 @@ pub struct Settings {
     /// Take over every file download from the browser, not only the listed types.
     #[serde(default = "default_true")]
     pub capture_all: bool,
+    /// Command-line virus scanner run on each finished download; empty turns it off.
+    #[serde(default = "default_scanner")]
+    pub scanner: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Windows Defender's command-line scanner when it is installed. Empty means no scan.
+fn default_scanner() -> String {
+    if cfg!(windows) {
+        let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+        let exe = program_files.join(r"Windows Defender\MpCmdRun.exe");
+        if exe.is_file() {
+            return exe.display().to_string();
+        }
+    }
+    String::new()
 }
 
 /// Accepted ranges for the numeric settings. Anything outside is clamped
@@ -589,6 +604,7 @@ impl Default for Settings {
             light_theme: false,
             bring_to_front_on_capture: true,
             capture_all: true,
+            scanner: default_scanner(),
         }
     }
 }

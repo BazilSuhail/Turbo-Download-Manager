@@ -104,6 +104,12 @@ enum Message {
     /// The sidebar's "Set up" button for one browser, and its outcome.
     OpenBrowserGuide,
     CloseBrowserGuide,
+    Scanned(u64, tdm::scan::Verdict),
+    GrabOpen,
+    GrabUrl(String),
+    GrabStart,
+    GrabDone(Result<Vec<String>, String>),
+    GrabClose,
     CaptureStart,
     CaptureQueue,
     CaptureCancel,
@@ -119,6 +125,12 @@ struct ConfirmDelete {
     /// Opt-in: the list entry goes either way, the bytes on disk only if this
     /// is ticked.
     also_delete_file: bool,
+}
+
+struct Grab {
+    url: String,
+    working: bool,
+    error: Option<String>,
 }
 
 struct Batch {
@@ -160,6 +172,8 @@ impl Toast {
 
 struct Entry {
     id: u64,
+    /// Result of the virus scan, once the download has finished and been scanned.
+    scan: Option<tdm::scan::Verdict>,
     name: String,
     handle: Download,
     snapshot: Snapshot,
@@ -191,6 +205,8 @@ struct App {
     browsers: Vec<tdm::register::Browser>,
     /// The add-TDM-to-your-browser page.
     browser_guide: bool,
+    /// The "Grab site" dialog, while it is open.
+    grab: Option<Grab>,
     /// Browser downloads waiting for Download now or Add to queue.
     prompts: VecDeque<Incoming>,
     open_menu: Option<usize>,
@@ -344,6 +360,7 @@ impl App {
             filter: Filter::All,
             browsers: tdm::register::Browser::detected(),
             browser_guide: false,
+            grab: None,
             prompts: VecDeque::new(),
             open_menu: None,
             settings_open: false,
@@ -425,6 +442,7 @@ impl App {
             last_done: 0,
             last_tick: Instant::now(),
             speed: 0.0,
+            scan: None,
         });
         id
     }
@@ -446,6 +464,25 @@ impl App {
     /// `dest`, or a numbered sibling when a file, a resume sidecar or another
     /// download already claims it. Writing into a claimed path would
     /// overwrite the user's file, or have two downloads share one.
+    /// Queue one file from a grabbed site, kept under a folder named after the host.
+    fn add_site_file(&mut self, url: &str) {
+        let Ok(parsed) = reqwest::Url::parse(url) else { return };
+        let mut dest = self.settings.download_dir.join(parsed.host_str().unwrap_or("site"));
+        let mut segments: Vec<String> = parsed
+            .path_segments()
+            .map(|s| s.filter(|x| !x.is_empty()).map(str::to_owned).collect())
+            .unwrap_or_default();
+        if segments.is_empty() || parsed.path().ends_with('/') {
+            segments.push("index.html".to_owned());
+        }
+        for segment in segments {
+            dest.push(tdm::native_host::sanitize_filename(&segment));
+        }
+        let dest = self.free_dest(dest);
+        let record = DownloadRecord { url: url.to_owned(), dest, category_id: None, headers: Vec::new(), total: None, complete: false };
+        self.push(record, Status::Queued);
+    }
+
     fn free_dest(&self, dest: PathBuf) -> PathBuf {
         unique_dest(dest, |p| {
             let mut sidecar = p.as_os_str().to_owned();
@@ -574,6 +611,7 @@ impl App {
             || self.verify.is_some()
             || self.browser_guide
             || !self.prompts.is_empty()
+            || self.grab.is_some()
     }
 
     /// Something is mid-transition and needs every frame.
@@ -837,6 +875,7 @@ impl App {
                 Task::none()
             }
             Message::Finished(id, result) => {
+                let mut scans = Vec::new();
                 if let Some(ix) = self.index_of(id) {
                     let e = &mut self.downloads[ix];
                     e.snapshot = e.handle.snapshot();
@@ -854,9 +893,32 @@ impl App {
                         }
                         _ => {}
                     }
+                    let finished = self.downloads[ix].snapshot.status == Status::Finished;
+                    if finished && self.downloads[ix].scan.is_none() && !self.settings.scanner.is_empty() {
+                        let scanner = self.settings.scanner.clone();
+                        let file = self.downloads[ix].handle.dest().to_owned();
+                        scans.push(Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || tdm::scan::scan(&scanner, &file))
+                                    .await
+                                    .unwrap_or_else(|e| tdm::scan::Verdict::Error(e.to_string()))
+                            },
+                            move |v| Message::Scanned(id, v),
+                        ));
+                    }
                 }
                 self.save();
-                self.start_ready()
+                Task::batch([Task::batch(scans), self.start_ready()])
+            }
+            Message::Scanned(id, verdict) => {
+                if let Some(ix) = self.index_of(id) {
+                    if verdict == tdm::scan::Verdict::Threat {
+                        let name = self.downloads[ix].name.clone();
+                        self.toast(ToastKind::Error, format!("Threat found in {name}. The file is kept: review it before opening."));
+                    }
+                    self.downloads[ix].scan = Some(verdict);
+                }
+                Task::none()
             }
             Message::Clipboard(Some(clip)) => {
                 let link = clip.trim();
@@ -883,6 +945,63 @@ impl App {
             Message::CaptureQueue => self.accept_capture(false),
             Message::CaptureCancel => {
                 self.prompts.pop_front();
+                Task::none()
+            }
+            Message::GrabOpen => {
+                self.grab = Some(Grab { url: String::new(), working: false, error: None });
+                Task::none()
+            }
+            Message::GrabUrl(url) => {
+                if let Some(g) = &mut self.grab {
+                    g.url = url;
+                }
+                Task::none()
+            }
+            Message::GrabStart => {
+                let Some(g) = &mut self.grab else { return Task::none() };
+                if g.working {
+                    return Task::none();
+                }
+                match reqwest::Url::parse(g.url.trim()) {
+                    Ok(url) if matches!(url.scheme(), "http" | "https") => {
+                        g.working = true;
+                        g.error = None;
+                        Task::perform(
+                            async move {
+                                tdm::grabber::crawl(url)
+                                    .await
+                                    .map(|found| found.into_iter().map(|u| u.to_string()).collect())
+                            },
+                            Message::GrabDone,
+                        )
+                    }
+                    _ => {
+                        g.error = Some("Enter a full http:// or https:// address.".to_owned());
+                        Task::none()
+                    }
+                }
+            }
+            Message::GrabDone(result) => match result {
+                Ok(urls) => {
+                    self.grab = None;
+                    let n = urls.len();
+                    for url in &urls {
+                        self.add_site_file(url);
+                    }
+                    self.save();
+                    self.toast(ToastKind::Success, format!("Grabbed {n} file{}", plural(n)));
+                    self.start_ready()
+                }
+                Err(e) => {
+                    if let Some(g) = &mut self.grab {
+                        g.working = false;
+                        g.error = Some(e);
+                    }
+                    Task::none()
+                }
+            },
+            Message::GrabClose => {
+                self.grab = None;
                 Task::none()
             }
             Message::OpenBrowserGuide => {
@@ -1025,6 +1144,9 @@ impl App {
                 || self.verify.take().is_some()
                 || self.batch.take().is_some()
                 || self.confirm_delete.take().is_some();
+            if !closed && self.grab.is_some() {
+                return self.update(Message::GrabClose);
+            }
             if !closed && !self.prompts.is_empty() {
                 return self.update(Message::CaptureCancel);
             }
@@ -1214,7 +1336,9 @@ impl App {
         if let Some(i) = self.open_menu {
             layers = layers.push(self.menu_dropdown(i, &p));
         }
-        let dialog = if !self.prompts.is_empty() {
+        let dialog = if self.grab.is_some() {
+            Some((self.grab_dialog(&p), Message::GrabClose))
+        } else if !self.prompts.is_empty() {
             Some((self.capture_dialog(&p), Message::CaptureCancel))
         } else if self.verify.is_some() {
             Some((self.verify_dialog(&p), Message::CloseVerify))
@@ -1304,6 +1428,13 @@ impl App {
                 .style(theme::input)
                 .size(13)
                 .padding([8, 12]),
+            tip(
+                button(text("Grab site").size(13))
+                    .padding([8, 10])
+                    .style(theme::flat(false))
+                    .on_press(Message::GrabOpen),
+                "Download every file of a website",
+            ),
             tip(
                 button(glyph(Icon::Batch, 16.0, p.text))
                     .padding(8)
@@ -1538,6 +1669,13 @@ impl App {
         }
         if let (Status::Failed, Some(err)) = (s.status, &s.error) {
             detail = short_error(err);
+        }
+        if let (Status::Finished, Some(verdict)) = (s.status, &e.scan) {
+            detail = match verdict {
+                tdm::scan::Verdict::Clean => "Virus scan: clean".to_owned(),
+                tdm::scan::Verdict::Threat => "Virus scan: THREAT FOUND".to_owned(),
+                tdm::scan::Verdict::Error(_) => "Virus scan: could not run".to_owned(),
+            };
         }
 
         let shimmer = running.then(|| (self.now.saturating_duration_since(self.epoch).as_secs_f32() / 1.8).fract());
@@ -1802,6 +1940,46 @@ impl App {
 
     /// Preferences: the pages, plus the switch that belongs to this shell
     /// rather than to a settings page.
+    /// "Grab site": one start address, then every file the crawl finds is queued.
+    fn grab_dialog(&self, p: &Palette) -> Element<'_, Message> {
+        let Some(g) = &self.grab else { return space(Length::Shrink, Length::Shrink).into() };
+        let (note, colour) = match (&g.error, g.working) {
+            (Some(e), _) => (e.clone(), p.danger),
+            (None, true) => ("Reading the site\u{2026} this can take a minute.".to_owned(), p.muted),
+            (None, false) => (
+                format!(
+                    "Up to {} files, {} levels of pages, this site only. robots.txt is respected.",
+                    tdm::grabber::MAX_PAGES,
+                    tdm::grabber::MAX_DEPTH
+                ),
+                p.muted,
+            ),
+        };
+        let grab_button = button(text("Grab").size(13)).padding([7, 18]).style(theme::accent);
+        let grab_button = if g.working { grab_button } else { grab_button.on_press(Message::GrabStart) };
+        column![
+            row![glyph(Icon::Batch, 20.0, p.accent), text("Grab a website").size(16).font(bold())]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            text_input("https://example.com", &g.url)
+                .on_input(Message::GrabUrl)
+                .on_submit(Message::GrabStart)
+                .style(theme::input)
+                .size(13)
+                .padding(8),
+            text(note).size(12).color(colour),
+            row![
+                space(Length::Fill, Length::Shrink),
+                button(text("Close").size(13)).padding([7, 18]).style(theme::flat(false)).on_press(Message::GrabClose),
+                grab_button,
+            ]
+            .spacing(8),
+        ]
+        .spacing(12)
+        .max_width(560)
+        .into()
+    }
+
     /// The prompt for a download the browser handed over, like IDM's: name,
     /// size and folder, then Download now or Add to queue.
     fn capture_dialog(&self, p: &Palette) -> Element<'_, Message> {
