@@ -30,6 +30,7 @@
 - [Command line](#command-line)
 - [Configuration and data](#configuration-and-data)
 - [Building from source](#building-from-source)
+  - [Set up from a fresh clone](#set-up-from-a-fresh-clone)
 - [Testing](#testing)
 - [Project layout](#project-layout)
 - [Troubleshooting](#troubleshooting)
@@ -348,6 +349,79 @@ Nothing is written outside your user profile, and no administrator rights are ne
 
 ## Building from source
 
+### Set up from a fresh clone
+
+**1. Install the tools (Windows)**
+
+<table>
+  <tr>
+    <th align="left">Tool</th>
+    <th align="left">Why</th>
+    <th align="left">Get it</th>
+  </tr>
+  <tr>
+    <td>Git</td>
+    <td>Clone the repository</td>
+    <td><a href="https://git-scm.com/download/win">git-scm.com</a></td>
+  </tr>
+  <tr>
+    <td>Rust 1.85+ (rustup)</td>
+    <td>Builds the app</td>
+    <td><a href="https://rustup.rs">rustup.rs</a></td>
+  </tr>
+  <tr>
+    <td>Visual Studio Build Tools, with the <b>Desktop development with C++</b> workload</td>
+    <td>The Windows linker, the Windows SDK, and the resource compiler that embeds the icon in <code>tdm.exe</code></td>
+    <td><a href="https://visualstudio.microsoft.com/visual-cpp-build-tools/">Visual Studio Build Tools</a></td>
+  </tr>
+  <tr>
+    <td>Node.js 18+</td>
+    <td>Builds the browser extension</td>
+    <td><a href="https://nodejs.org">nodejs.org</a></td>
+  </tr>
+</table>
+
+**2. Clone, run, and build the extension**
+
+```sh
+git clone https://github.com/BazilSuhail/Turbo-Download-Manager.git
+cd Turbo-Download-Manager
+cargo run                  # builds and starts TDM; the first build takes a few minutes
+node extension/build.mjs   # creates extension/dist/chrome and extension/dist/firefox
+```
+
+Then, in TDM, click **Add** in the **BROWSERS** section and follow [Browser setup](#browser-setup).
+
+**3. What git does and does not include**
+
+<table>
+  <tr>
+    <th align="left">Item</th>
+    <th align="left">In git</th>
+    <th align="left">How it is created</th>
+  </tr>
+  <tr><td>Source code, tests, icons, logo, installer templates</td><td>Yes</td><td>Already in the clone</td></tr>
+  <tr><td><code>Cargo.lock</code> (pinned crate versions)</td><td>Yes</td><td>Already in the clone</td></tr>
+  <tr><td><code>target/</code> (compiled app)</td><td>No</td><td><code>cargo build</code> or <code>cargo run</code></td></tr>
+  <tr><td><code>extension/dist/</code> (the folder to load in the browser)</td><td>No</td><td><code>node extension/build.mjs</code></td></tr>
+  <tr><td><code>installer/</code> (setup files)</td><td>No</td><td><code>cargo packager --release --formats nsis</code></td></tr>
+  <tr><td>Extension signing key</td><td>No, kept private</td><td>Needed only to publish the extension, never to build or run it</td></tr>
+</table>
+
+**Optional tasks**
+
+```sh
+cargo test && cargo clippy --all-targets   # check the code
+node --test extension/                     # check the extension
+
+pip install pillow && python packaging/make_logo.py   # regenerate all logo files from assets/tdm-logo.png
+
+cargo install cargo-packager --locked
+cargo packager --release --formats nsis    # Windows setup file
+```
+
+### Build commands
+
 **Requirements**
 
 <table>
@@ -437,6 +511,18 @@ For a manual check of the browser extension, follow [`extension/selftest.md`](ex
   <tr>
     <td>The extension stops working after you move its folder</td>
     <td>Load it again from its new location.</td>
+  </tr>
+  <tr>
+    <td><code>link.exe</code> not found, or the build fails at linking</td>
+    <td>Install the Visual Studio Build Tools with the <b>Desktop development with C++</b> workload, then open a new terminal.</td>
+  </tr>
+  <tr>
+    <td>The first build is very slow</td>
+    <td>Normal. Cargo downloads and compiles every crate once; later builds are much faster.</td>
+  </tr>
+  <tr>
+    <td>"Extension files are missing from this install" when adding a browser</td>
+    <td>Run <code>node extension/build.mjs</code> in the project folder, then try again.</td>
   </tr>
   <tr>
     <td>Windows blocks the installer</td>
