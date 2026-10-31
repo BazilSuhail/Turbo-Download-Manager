@@ -94,85 +94,18 @@ pub fn category_icon(id: Option<u32>) -> Icon {
     }
 }
 
-/// The application mark, `size`×`size` RGBA8: a bold orange T with three
-/// forward chevrons on a charcoal rounded tile. Same geometry as
-/// `packaging/gen_art.py`; supersampled 4×4 for smooth edges.
-pub fn app_icon(size: u32) -> Vec<u8> {
-    const SS: u32 = 4;
-    let mut out = Vec::with_capacity((size * size * 4) as usize);
-    for py in 0..size {
-        for px in 0..size {
-            let mut sum = [0f32; 3];
-            let mut hits = 0u32;
-            for sy in 0..SS {
-                for sx in 0..SS {
-                    let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) / size as f32;
-                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / size as f32;
-                    if let Some(c) = sample(x, y) {
-                        for (s, v) in sum.iter_mut().zip(c) {
-                            *s += v;
-                        }
-                        hits += 1;
-                    }
-                }
-            }
-            if hits == 0 {
-                out.extend_from_slice(&[0, 0, 0, 0]);
-                continue;
-            }
-            for s in sum {
-                out.push((s / hits as f32).round() as u8);
-            }
-            out.push((255 * hits / (SS * SS)) as u8);
-        }
+/// The TDM logo as straight RGBA8, for the window icon (64 px) and the header
+/// mark (32 px). Generated from `assets/tdm-logo.png` by `packaging/make_logo.py`.
+const APP_ICON_64: &[u8] = include_bytes!("../../assets/app-icon-64.rgba");
+const APP_ICON_32: &[u8] = include_bytes!("../../assets/app-icon-32.rgba");
+
+/// The logo at `size` px, which must be 32 or 64.
+pub fn app_icon(size: u32) -> &'static [u8] {
+    match size {
+        32 => APP_ICON_32,
+        64 => APP_ICON_64,
+        _ => panic!("no app icon at {size} px; ship one with packaging/make_logo.py"),
     }
-    out
-}
-
-const TILE_TOP: [f32; 3] = [46.0, 40.0, 35.0];
-const TILE_BOTTOM: [f32; 3] = [22.0, 19.0, 17.0];
-const MARK_TOP: [f32; 3] = [255.0, 184.0, 77.0];
-const MARK_BOTTOM: [f32; 3] = [255.0, 106.0, 26.0];
-const CHEVRON_TIPS: [f32; 3] = [0.70, 0.79, 0.88];
-const CHEVRON_ARM: f32 = 0.10;
-const CHEVRON_RISE: f32 = 0.17;
-const CHEVRON_HALF: f32 = 0.034;
-
-/// Colour at a unit-square point (y down), or `None` outside the tile.
-fn sample(x: f32, y: f32) -> Option<[f32; 3]> {
-    let dx = ((x - 0.5).abs() - 0.28).max(0.0);
-    let dy = ((y - 0.5).abs() - 0.28).max(0.0);
-    if dx * dx + dy * dy > 0.22 * 0.22 {
-        return None;
-    }
-    if in_mark(x, y) {
-        Some(lerp(MARK_TOP, MARK_BOTTOM, ((y - 0.30) / 0.42).clamp(0.0, 1.0)))
-    } else {
-        Some(lerp(TILE_TOP, TILE_BOTTOM, y))
-    }
-}
-
-fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
-}
-
-fn in_mark(x: f32, y: f32) -> bool {
-    let bar = (0.12..=0.56).contains(&x) && (0.30..=0.41).contains(&y);
-    let stem = (0.29..=0.39).contains(&x) && (0.30..=0.72).contains(&y);
-    bar || stem || CHEVRON_TIPS.iter().any(|&tip| in_chevron(x, y, tip))
-}
-
-fn in_chevron(x: f32, y: f32, tip: f32) -> bool {
-    let back = tip - CHEVRON_ARM;
-    let up = seg_dist(x, y, back, 0.5 - CHEVRON_RISE, tip, 0.5);
-    let down = seg_dist(x, y, tip, 0.5, back, 0.5 + CHEVRON_RISE);
-    up.min(down) <= CHEVRON_HALF
-}
-
-fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    let (dx, dy) = (bx - ax, by - ay);
-    let t = (((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
-    (px - ax - t * dx).hypot(py - ay - t * dy)
 }
 
 #[cfg(test)]
@@ -220,18 +153,13 @@ mod tests {
     }
 
     #[test]
-    fn the_app_icon_is_a_charcoal_tile_with_an_orange_t() {
-        let size = 64;
-        let px = app_icon(size);
-        assert_eq!(px.len(), (size * size * 4) as usize);
-        let at = |x: u32, y: u32| &px[((y * size + x) * 4) as usize..][..4];
-        assert_eq!(at(0, 0)[3], 0, "corners are transparent");
-        let opaque = px.chunks(4).filter(|p| p[3] == 255).count();
-        assert!(opaque > (size * size / 3) as usize, "only {opaque} opaque pixels");
-        // The T's stem is orange and opaque; the tile under the mark is dark charcoal.
-        let stem = at(22, 38);
-        assert!(stem[3] == 255 && stem[0] > 200 && stem[2] < 80, "stem is {stem:?}");
-        let tile = at(32, 60);
-        assert!(tile[3] == 255 && tile[0] < 60, "tile is {tile:?}");
+    fn the_app_icon_is_the_logo_at_each_shipped_size() {
+        for size in [32u32, 64] {
+            let px = app_icon(size);
+            assert_eq!(px.len(), (size * size * 4) as usize, "{size} px");
+            // The logo has a transparent margin, so a visible share is the right check.
+            let visible = px.chunks(4).filter(|p| p[3] > 0).count();
+            assert!(visible > (size * size / 4) as usize, "{size} px: only {visible} visible pixels");
+        }
     }
 }

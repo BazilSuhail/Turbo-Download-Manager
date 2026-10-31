@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/tdm-logo.png" alt="Turbo Download Manager logo" width="140">
+</p>
+
 <h1 align="center">Turbo Download Manager (TDM)</h1>
 
 <p align="center">

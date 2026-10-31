@@ -262,7 +262,7 @@ fn main() -> iced::Result {
         .window(window::Settings {
             size: iced::Size::new(900.0, 560.0),
             min_size: Some(iced::Size::new(560.0, 320.0)),
-            icon: window::icon::from_rgba(assets::app_icon(64), 64, 64).ok(),
+            icon: window::icon::from_rgba(assets::app_icon(64).to_vec(), 64, 64).ok(),
             ..Default::default()
         })
         .run()
@@ -1363,7 +1363,7 @@ impl App {
     }
 
     fn header(&self, p: &Palette) -> Element<'_, Message> {
-        let mark = image(image::Handle::from_rgba(32, 32, assets::app_icon(32))).width(20).height(20);
+        let mark = image(image::Handle::from_rgba(32, 32, assets::app_icon(32).to_vec())).width(20).height(20);
         let mut bar = row![
             container(row![mark, text("TDM").size(14).font(bold())].spacing(6).align_y(Alignment::Center))
                 .padding([0, 6]),

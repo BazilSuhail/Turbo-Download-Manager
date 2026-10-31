@@ -14,8 +14,8 @@ extension/installer/licensing), and finished with fixes from their findings.
 - **New original artwork**:
   - 29 hand-written SVG icons in `assets/icons/`
   - the app icon, drawn in code (`src/ui/assets.rs`)
-  - installer icons and bitmaps from `packaging/gen_art.py`
-  - extension icons from `extension/tools/make-icons.mjs`
+  - installer icons and bitmaps from `packaging/make_logo.py`, generated from the owner's logo
+  - extension icons from the same logo
 - **Licensing**: added `LICENSE-MIT` and `LICENSE-APACHE`, and set `license = "MIT OR Apache-2.0"`.
 
 ## 2. New UI

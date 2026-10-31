@@ -11,6 +11,9 @@ readme = "packaging/README.md"
 keywords = ["download-manager", "downloader", "http", "ftp", "gui"]
 categories = ["network-programming", "gui"]
 
+[build-dependencies]
+winres = "0.1"
+
 [dependencies]
 dirs = "6"
 futures-util = "0.3.34"

@@ -14,7 +14,7 @@ The MV3 browser companion for **Turbo Download Manager**. It:
 
 Everything it sends and receives is defined by `../src/native_host.rs`.
 Licensed MIT OR Apache-2.0, like the rest of TDM. All code and artwork is
-original (the icons are drawn by `tools/make-icons.mjs`).
+original (the icons are generated from the logo by `packaging/make_logo.py`).
 
 ## 1. Install the app first
 
@@ -134,7 +134,7 @@ No content scripts and no host access unless you grant them.
 ```sh
 node --test extension/            # filter, media detection, API shim
 node extension/build.mjs          # dist/chrome, dist/firefox (+ zips)
-node extension/tools/make-icons.mjs   # regenerate icons/*.png
+python packaging/make_logo.py   # regenerate icons/*.png from the logo
 ```
 
 Manual checks: `selftest.md`.
