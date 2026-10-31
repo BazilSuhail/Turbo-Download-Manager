@@ -1,0 +1,17 @@
+# Build output and packaged installers (rebuild or attach them to a release)
+/target/
+/installer/
+extension/dist/
+
+# Packed extension files and private keys must never be committed
+*.crx
+*.pem
+*.zip
+.env
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+__pycache__/

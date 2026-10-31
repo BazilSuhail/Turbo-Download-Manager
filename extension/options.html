@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>TDM Download Capture</title>
+    <link rel="stylesheet" href="ui.css" />
+    <style>
+      body { margin: 0 auto; max-width: 44rem; padding: 2rem 1.25rem 3rem; }
+      main { display: grid; gap: 14px; }
+      .brand img { height: 40px; width: 40px; }
+      .brand h1 { font-size: 20px; }
+      h2 { font-size: 13px; font-weight: 650; letter-spacing: .06em; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; }
+      .card .row + .row, .card .row + .hint + .row { margin-top: 12px; }
+      .status-text { flex: 1; font-weight: 600; }
+      .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+      .granted { color: var(--ok); font-size: 13px; font-weight: 600; }
+      dl { display: grid; gap: 8px 16px; grid-template-columns: max-content 1fr; margin: 0; }
+      dt { color: var(--muted); }
+      dd { margin: 0; overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header class="brand">
+        <img src="icons/icon48.png" alt="" />
+        <div>
+          <h1>TDM Download Capture</h1>
+          <small>Browser companion for Turbo Download Manager</small>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2>Connection</h2>
+        <div class="row">
+          <span class="dot" id="dot"></span>
+          <span class="status-text" id="state">Checking…</span>
+          <button id="reconnect" class="btn" type="button">Reconnect</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Capture</h2>
+        <div class="row spread">
+          <label for="enabled"><strong>Capture downloads automatically</strong></label>
+          <span class="switch"><input id="enabled" type="checkbox" role="switch" /><span></span></span>
+        </div>
+        <p class="hint">With this off, nothing is intercepted; the right-click items, the popup and the video button still work.</p>
+        <div class="row spread">
+          <p class="hint" id="incogText">Checking private windows…</p>
+          <button id="incogBtn" class="btn" type="button" hidden>Open settings</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Optional access</h2>
+        <div class="row spread">
+          <strong>Send cookies with downloads</strong>
+          <span class="buttons">
+            <span id="cookieState" class="granted"></span>
+            <button id="grantCookies" class="btn primary" type="button">Allow cookies</button>
+          </span>
+        </div>
+        <p class="hint">Without it, downloads that need your session (anything behind a login) may fail once handed over.</p>
+
+        <div class="row spread">
+          <strong>Media detection</strong>
+          <span class="buttons">
+            <span id="mediaState" class="granted"></span>
+            <button id="grantMedia" class="btn primary" type="button">Grant media detection</button>
+            <button id="revokeMedia" class="btn" type="button">Turn off</button>
+          </span>
+        </div>
+        <p class="hint">
+          Shows a download button when you hover a video and notices streamed
+          media (HLS/DASH, MP4, WebM…) as pages load. Needs access to all sites;
+          nothing leaves your computer except the URL you choose to download,
+          which goes to the TDM app. Already-open tabs need a reload.
+        </p>
+      </section>
+
+      <section class="card">
+        <h2>Details</h2>
+        <dl>
+          <dt>Native host</dt><dd><code id="hostName"></code></dd>
+          <dt>Host version</dt><dd id="hostVersion"></dd>
+          <dt>Extension id</dt><dd><code id="extensionId"></code></dd>
+          <dt>Capture types</dt><dd id="captureExtensions"></dd>
+          <dt>Excluded hosts</dt><dd id="exceptionHosts"></dd>
+          <dt>Last download</dt><dd id="lastAction"></dd>
+          <dt>Last error</dt><dd id="lastError"></dd>
+        </dl>
+      </section>
+    </main>
+
+    <script src="options.js"></script>
+  </body>
+</html>

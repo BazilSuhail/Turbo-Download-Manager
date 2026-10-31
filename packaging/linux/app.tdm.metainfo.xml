@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>app.tdm</id>
+  <name>Turbo Download Manager</name>
+  <summary>Fast, segmented downloads with browser capture</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="app.tdm">
+    <name>Bazil Suhail and Abdullah Masood</name>
+  </developer>
+  <description>
+    <p>
+      TDM splits each download into parallel segments, resumes interrupted
+      transfers, and runs queues on a schedule. Its companion browser extension
+      hands downloads from Chrome, Edge, Brave, Vivaldi and Firefox straight to
+      the app.
+    </p>
+  </description>
+  <launchable type="desktop-id">tdm.desktop</launchable>
+  <url type="homepage">https://github.com/tdm/tdm</url>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>tdm</binary>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-10-27"/>
+  </releases>
+</component>

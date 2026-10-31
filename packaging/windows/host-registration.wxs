@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Browser native-messaging registration for the MSI, mirroring the NSIS
+  installer: `tdm.exe` with the register-host flag after the files are
+  installed and with unregister-host before they are removed on a real uninstall (not the
+  removal half of a major upgrade). "Path" is the File id of the main
+  executable in cargo-packager's main.wxs. Impersonated, so the per-user
+  HKCU keys and %APPDATA% manifests are the installing user's, not SYSTEM's;
+  other accounts get registered by the app itself on their first start.
+  Failures are ignored: the app re-registers at every start.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <CustomAction Id="TdmRegisterHost" FileKey="Path" ExeCommand="--register-host"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <CustomAction Id="TdmUnregisterHost" FileKey="Path" ExeCommand="--unregister-host"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="TdmRegisterHost" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="TdmUnregisterHost" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

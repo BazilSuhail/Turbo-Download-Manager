@@ -1,0 +1,73 @@
+/* Popup-only layout; tokens and components come from ui.css. */
+
+body {
+  display: grid;
+  gap: 10px;
+  overflow-x: hidden;
+  padding: 12px;
+  width: 360px;
+}
+
+.top { padding: 2px 2px 0; }
+.mark { flex: none; height: 32px; width: 32px; }
+
+/* connection status: a pill with the state dot inside */
+.pill {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 600;
+  gap: 7px;
+  max-width: 180px;
+  min-width: 0;
+  padding: 4px 11px 4px 9px;
+}
+#state { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.card { padding: 12px 14px; }
+.grow { flex: 1; min-width: 0; }
+label { cursor: pointer; display: grid; }
+label .hint { margin: 0; }
+
+/* Incognito row: a dot and one muted line; the button only when it can help */
+.incog { display: grid; gap: 10px; }
+.incog .row { align-items: flex-start; }
+.incog .dot { margin-top: 6px; }
+.incog-text { color: var(--muted); font-size: 12.5px; margin: 0; }
+.incog-text.on { color: var(--text); font-weight: 600; }
+.incog .btn { justify-self: start; }
+
+.count {
+  background: var(--surface-2);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 650;
+  padding: 1px 8px;
+}
+
+#media { list-style: none; margin: 8px 0 0; max-height: 260px; overflow-y: auto; padding: 0; }
+#media li {
+  align-items: center;
+  animation: rise 0.25s var(--ease) both;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 10px;
+  padding: 9px 0;
+}
+#media li:first-child { border-top: 0; }
+.name { display: grid; flex: 1; min-width: 0; }
+.name > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.title { font-weight: 600; }
+.where { color: var(--muted); font-size: 11.5px; }
+
+.grant { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
+.grant .btn { margin-top: 8px; width: 100%; }
+
+footer { padding: 0 4px; }
+footer .hint { margin: 0; }
+footer .row { gap: 12px; }
+footer .btn.small { font-size: 12px; padding: 3px 10px; }

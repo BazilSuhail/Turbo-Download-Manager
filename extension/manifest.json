@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "TDM Download Capture",
+  "short_name": "TDM",
+  "version": "1.1.0",
+  "description": "Hands browser downloads and page media to the Turbo Download Manager desktop application over native messaging.",
+  "author": "Bazil Suhail and Abdullah Masood",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4MV0wkRZ7GQLBhwcdCL3SHW4G7mukaPIWrsAa4e7BmpJfNxWwEKHJgebtCNG/EBHDDw4TwMKulBhfptNj+dmCSGsnVpotiO64JcJGsKF/meFmRPtaRwL84fo8c8dWHgqAJ9BoCbBmyLza3/pRVKMbgS6WmKmXrX/+7CtS9VV0ZwFO8/3tWLTsH5UVPHFFNSMzNQNohiweQou43A/brEezx4EMIQbnxcFBFFqnJOG4Pzn/llTleNn/iEpaJrtEYTQyZA1KNCasdzdxWvi1GB2lVi/ILRbOzC1W9mYAV+KFB6K8K3xyWNha1YQM0/PnuGtdvnr+Tjst/xBmVJfpfVChQIDAQAB",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "TDM Download Capture",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "options_page": "options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "downloads",
+    "nativeMessaging",
+    "storage",
+    "contextMenus",
+    "activeTab",
+    "scripting"
+  ],
+  "optional_permissions": [
+    "cookies",
+    "webRequest"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
+  ],
+  "incognito": "spanning",
+  "minimum_chrome_version": "102"
+}

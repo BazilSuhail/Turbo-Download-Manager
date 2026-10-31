@@ -1,0 +1,80 @@
+[package]
+name = "tdm"
+version = "0.1.0"
+authors = ["Bazil Suhail", "Abdullah Masood"]
+edition = "2024"
+description = "Turbo Download Manager: a fast, segmented download manager with browser capture"
+license = "MIT OR Apache-2.0"
+# shortcut: placeholder until the public repository exists.
+repository = "https://github.com/tdm/tdm"
+readme = "packaging/README.md"
+keywords = ["download-manager", "downloader", "http", "ftp", "gui"]
+categories = ["network-programming", "gui"]
+
+[dependencies]
+dirs = "6"
+futures-util = "0.3.34"
+iced = { version = "0.14.0", default-features = false, features = ["tokio", "wgpu", "tiny-skia", "image-without-codecs", "web-colors", "thread-pool", "crisp", "svg"] }
+open = "5.4"
+quick-xml = { version = "0.42.0", default-features = false }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10.9"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Installers: `cargo packager --release` (see packaging/README.md).
+[package.metadata.packager]
+product-name = "Turbo Download Manager"
+identifier = "app.tdm"
+publisher = "Bazil Suhail and Abdullah Masood"
+copyright = "Copyright (c) 2026 Bazil Suhail and Abdullah Masood"
+category = "Utility"
+homepage = "https://github.com/tdm/tdm"
+description = "Fast, segmented download manager with browser capture"
+long-description = "Turbo Download Manager splits downloads into parallel segments, resumes interrupted transfers, schedules queues and captures downloads from Chrome, Edge, Brave, Vivaldi and Firefox through its companion extension."
+license-file = "LICENSE-MIT"
+before-packaging-command = "cargo build --release"
+icons = ["packaging/icons/32x32.png", "packaging/icons/128x128.png", "packaging/icons/256x256.png", "packaging/icons/icon.ico", "packaging/icons/icon.icns"]
+
+[package.metadata.packager.nsis]
+template = "packaging/windows/installer.nsi"
+header-image = "packaging/windows/header.bmp"
+sidebar-image = "packaging/windows/sidebar.bmp"
+installer-icon = "packaging/icons/icon.ico"
+
+[package.metadata.packager.wix]
+banner-path = "packaging/windows/wix-banner.bmp"
+dialog-image-path = "packaging/windows/wix-dialog.bmp"
+# Registers/unregisters the browser host like the NSIS installer does.
+fragment-paths = ["packaging/windows/host-registration.wxs"]
+custom-action-refs = ["TdmRegisterHost", "TdmUnregisterHost"]
+
+[package.metadata.packager.deb]
+desktop-template = "packaging/linux/tdm.desktop"
+section = "net"
+files = { "packaging/linux/app.tdm.metainfo.xml" = "usr/share/metainfo/app.tdm.metainfo.xml" }
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
+info-plist-path = "packaging/macos/Info.plist"
+
+# .rpm comes from cargo-generate-rpm (cargo-packager has no rpm target):
+# `cargo generate-rpm` after `cargo build --release`.
+[package.metadata.generate-rpm]
+name = "tdm"
+summary = "Turbo Download Manager: segmented downloads with browser capture"
+assets = [
+    { source = "target/release/tdm", dest = "/usr/bin/tdm", mode = "755" },
+    { source = "packaging/linux/tdm.desktop", dest = "/usr/share/applications/tdm.desktop", mode = "644" },
+    { source = "packaging/linux/app.tdm.metainfo.xml", dest = "/usr/share/metainfo/app.tdm.metainfo.xml", mode = "644" },
+    { source = "packaging/icons/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/tdm.png", mode = "644" },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/tdm/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/tdm/LICENSE-APACHE", mode = "644", doc = true },
+]

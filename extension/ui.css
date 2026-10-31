@@ -1,0 +1,175 @@
+/* TDM brand styles shared by popup.html and options.html. */
+
+:root {
+  color-scheme: dark light;
+  --bg: #121212;
+  --surface: #1c1a19;
+  --surface-2: #262321;
+  --line: rgba(255, 255, 255, 0.08);
+  --text: #f5efe9;
+  --muted: #a59d96;
+  --accent-a: #ff7a1a;
+  --accent-b: #ffb347;
+  --accent: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+  --on-accent: #1c1a19;
+  --ok: #2fbf71;
+  --warn: #f5b041;
+  --bad: #e5484d;
+  --idle: #8a817a;
+  --radius: 12px;
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #faf7f4;
+    --surface: #ffffff;
+    --surface-2: #f3eee9;
+    --line: rgba(0, 0, 0, 0.08);
+    --text: #1c1a19;
+    --muted: #6f6760;
+    --warn: #b06a00;
+    --shadow: 0 8px 28px rgba(60, 30, 0, 0.1);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 0.92em; }
+
+/* ---- layout bits */
+
+.brand { align-items: center; display: flex; gap: 10px; }
+.brand img { height: 28px; width: 28px; }
+.brand h1 { font-size: 15px; font-weight: 650; letter-spacing: 0.01em; margin: 0; }
+.brand small { color: var(--muted); display: block; font-size: 11px; font-weight: 500; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px 16px;
+  animation: rise 0.28s var(--ease) both;
+}
+.card + .card { animation-delay: 0.05s; }
+
+.row { align-items: center; display: flex; gap: 10px; }
+.spread { justify-content: space-between; }
+.hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 0; }
+.hint.on { color: var(--text); font-weight: 600; }
+
+/* ---- status dot */
+
+.dot {
+  background: var(--idle);
+  border-radius: 50%;
+  color: var(--idle);
+  flex: none;
+  height: 9px;
+  position: relative;
+  width: 9px;
+}
+.dot.up { background: var(--ok); color: var(--ok); }
+.dot.wait { background: var(--warn); color: var(--warn); }
+.dot.down { background: var(--bad); color: var(--bad); }
+/* a ring that fades out from the dot; only for live states */
+.dot.up::after, .dot.wait::after {
+  animation: ping 2s var(--ease) infinite;
+  background: currentColor;
+  border-radius: 50%;
+  content: "";
+  inset: 0;
+  position: absolute;
+}
+
+/* ---- buttons */
+
+.btn {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 14px;
+  transition: filter 0.15s, transform 0.15s var(--ease), background 0.15s;
+  white-space: nowrap;
+}
+.btn:hover { filter: brightness(1.1); }
+.btn:active { transform: scale(0.97); }
+.btn.primary { background: var(--accent); border-color: transparent; color: var(--on-accent); }
+.btn.ok { background: var(--ok); border-color: transparent; color: #fff; }
+.btn.err { background: var(--bad); border-color: transparent; color: #fff; }
+.btn[disabled] { cursor: progress; opacity: 0.7; }
+.btn:focus-visible, .switch input:focus-visible + span, a:focus-visible {
+  outline: 2px solid var(--accent-b);
+  outline-offset: 2px;
+}
+a { color: var(--accent-b); }
+@media (prefers-color-scheme: light) { a { color: #c85500; } }
+
+/* ---- switch (a real checkbox underneath, so it stays accessible) */
+
+.switch { cursor: pointer; display: inline-flex; flex: none; position: relative; }
+.switch input { height: 1px; opacity: 0; position: absolute; width: 1px; }
+.switch span {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  height: 22px;
+  position: relative;
+  transition: background 0.2s var(--ease);
+  width: 38px;
+}
+.switch span::after {
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  content: "";
+  height: 16px;
+  left: 2px;
+  position: absolute;
+  top: 2px;
+  transition: transform 0.2s var(--ease);
+  width: 16px;
+}
+.switch input:checked + span { background: var(--accent); border-color: transparent; }
+.switch input:checked + span::after { transform: translateX(16px); }
+
+/* ---- media badges */
+
+.badge {
+  border-radius: 6px;
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 2px 6px;
+  text-transform: uppercase;
+}
+.badge.video { background: rgba(255, 122, 26, 0.16); color: var(--accent-a); }
+.badge.audio { background: rgba(255, 179, 71, 0.18); color: #d98a1c; }
+.badge.hls, .badge.dash { background: rgba(47, 191, 113, 0.15); color: var(--ok); }
+
+/* ---- motion */
+
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+@keyframes ping {
+  0% { opacity: 0.55; transform: scale(1); }
+  80%, 100% { opacity: 0; transform: scale(3); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

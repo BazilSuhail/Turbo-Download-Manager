@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Turbo Download Manager
+GenericName=Download Manager
+Comment=Fast, segmented downloads with browser capture
+Exec=tdm
+Icon=tdm
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=download;downloader;http;ftp;
+StartupWMClass=tdm
+SingleMainWindow=true
