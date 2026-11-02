@@ -251,13 +251,41 @@ pub fn side_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button:
     }
 }
 
+/// WCAG relative luminance of an sRGB colour.
+fn luminance(c: Color) -> f32 {
+    let lin = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// WCAG contrast ratio between two colours.
+fn contrast(a: Color, b: Color) -> f32 {
+    let (x, y) = (luminance(a), luminance(b));
+    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// The fill of a primary button: the accent itself when the button text reads
+/// well on it, otherwise a slightly darker shade, so the text stays at least
+/// 4.5:1. The brand accent is unchanged everywhere else.
+pub fn button_fill(p: &Palette) -> Color {
+    let mut fill = p.accent;
+    for _ in 0..24 {
+        if contrast(p.on_accent, fill) >= 4.5 {
+            break;
+        }
+        fill = Color { r: fill.r * 0.94, g: fill.g * 0.94, b: fill.b * 0.94, ..fill };
+    }
+    fill
+}
+
 /// The primary button: one solid colour in every state (no gradient). Only
 /// the shadow and the disabled fill change.
 pub fn accent(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::of(theme);
+    let fill = button_fill(&p);
     let (bg, shadow) = match status {
         button::Status::Disabled => (alpha(p.muted, 0.3), Color::TRANSPARENT),
-        _ => (p.accent, alpha(p.accent, 0.25)),
+        _ => (fill, alpha(fill, 0.25)),
     };
     button::Style {
         background: Some(bg.into()),
@@ -372,10 +400,9 @@ mod tests {
                 let r = ratio(c, p.card);
                 assert!(r >= 4.5, "{name}: {c_name} text on card is only {r:.2}:1");
             }
-            for c in [p.accent, p.accent2] {
-                let r = ratio(p.on_accent, c);
-                assert!(r >= 4.5, "{name}: button text on the accent is only {r:.2}:1");
-            }
+            let fill = button_fill(&p);
+            let r = ratio(p.on_accent, fill);
+            assert!(r >= 4.5, "{name}: button text on the button fill is only {r:.2}:1");
         }
     }
 

@@ -126,7 +126,10 @@ impl Browser {
     /// or the build output when running from source.
     pub fn extension_dir(self) -> PathBuf {
         let sub = if self == Browser::Firefox { "firefox" } else { "chrome" };
-        let beside_app = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("extension").join(sub)));
+        // Installed builds carry the folders as resources at extension/dist/<browser>.
+        let beside_app = std::env::current_exe()
+            .ok()
+            .and_then(|e| Some(e.parent()?.join("extension").join("dist").join(sub)));
         match beside_app {
             Some(dir) if dir.join("manifest.json").is_file() => dir,
             _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extension").join("dist").join(sub),

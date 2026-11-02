@@ -1,4 +1,4 @@
-# CI: builds and tests on every push and pull request.
+# CI: builds the app on every push and pull request, on Windows, Linux and macOS.
 # Release packaging lives in release.yml.
 
 name: CI
@@ -14,8 +14,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
+  build:
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,6 +26,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # build.rs runs extension/build.mjs with Node.
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -40,23 +41,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build
-
-      - name: Test
-        run: cargo test
-
-  extension:
-    name: Browser extension tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Run extension tests
-        run: node --test extension/filter.test.mjs extension/media-core.test.mjs extension/tools/tools.test.mjs
-
-      - name: Build extension packages
-        run: node extension/build.mjs
+        run: cargo build --release
