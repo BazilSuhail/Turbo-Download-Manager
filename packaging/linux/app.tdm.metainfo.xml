@@ -17,7 +17,7 @@
     </p>
   </description>
   <launchable type="desktop-id">tdm.desktop</launchable>
-  <url type="homepage">https://github.com/tdm/tdm</url>
+  <url type="homepage">https://github.com/BazilSuhail/Turbo-Download-Manager</url>
   <content_rating type="oars-1.1"/>
   <provides>
     <binary>tdm</binary>

@@ -198,19 +198,30 @@ pub fn serve(inbox: Inbox, advert: Arc<Mutex<Advert>>) -> Result<Endpoint, Error
             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
 
             live.fetch_add(1, Ordering::SeqCst);
+            // Decrements on drop, so a handler that panics still gives its slot back.
+            let slot = LiveSlot(Arc::clone(&live));
             let inbox = Arc::clone(&inbox);
             let advert = Arc::clone(&advert);
             let expected = expected.clone();
-            let live = Arc::clone(&live);
             std::thread::spawn(move || {
+                let _slot = slot;
                 if let Err(e) = handle(stream, inbox, advert, &expected) {
                     eprintln!("native host connection ended: {e}");
                 }
-                live.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
     Ok(endpoint)
+}
+
+/// One occupied slot in the connection limit. Releasing it on drop means a
+/// panicking handler cannot leak its slot.
+struct LiveSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LiveSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Publish the endpoint atomically, and on Unix with owner-only permissions.
@@ -274,8 +285,8 @@ fn dispatch(request: Request, inbox: &Inbox, advert: &Arc<Mutex<Advert>>) -> Res
             Response::Accepted { id: 0, request_id: None }
         }
         Request::Hello { .. } => {
-            *LAST_HELLO.lock().expect("hello lock") = Some(Instant::now());
-            let a = advert.lock().expect("advert lock");
+            *LAST_HELLO.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+            let a = advert.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Response::Ready {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 capture_extensions: a.capture_extensions.clone(),
@@ -285,7 +296,7 @@ fn dispatch(request: Request, inbox: &Inbox, advert: &Arc<Mutex<Advert>>) -> Res
             }
         }
         Request::Query { request_id, url } => {
-            let a = advert.lock().expect("advert lock");
+            let a = advert.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             match would_capture(&url, &a) {
                 true => Response::Accepted { id: 0, request_id },
                 false => Response::Declined { reason: "not a captured type".into(), request_id },
@@ -302,7 +313,7 @@ fn dispatch(request: Request, inbox: &Inbox, advert: &Arc<Mutex<Advert>>) -> Res
             if let Some(v) = user_agent {
                 headers.push(("User-Agent".to_owned(), v));
             }
-            let mut queue = inbox.lock().expect("inbox lock");
+            let mut queue = inbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             queue.push(Incoming { url, filename, headers, size });
             Response::Accepted { id: queue.len() as u64, request_id }
         }

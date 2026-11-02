@@ -31,7 +31,9 @@
 - [Configuration and data](#configuration-and-data)
 - [Building from source](#building-from-source)
   - [Set up from a fresh clone](#set-up-from-a-fresh-clone)
+  - [Build commands](#build-commands)
 - [Testing](#testing)
+- [Releases and CI](#releases-and-ci)
 - [Project layout](#project-layout)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
@@ -56,33 +58,73 @@
     </td>
   </tr>
   <tr>
+    <td><b>Retries</b></td>
+    <td>
+      Temporary network errors (timeouts, dropped connections, HTTP 408, 429 and 5xx) are retried
+      automatically, waiting 5 seconds and doubling each time up to 5 minutes. A download gets 3
+      automatic retries by default; this is set in <code>settings.json</code>
+      (<code>connection.auto_retry</code>, <code>connection.auto_retry_max</code>). Downloads that
+      still fail stay in the list as Failed. <b>Retry failed downloads</b> (<kbd>Ctrl</kbd>+<kbd>R</kbd>)
+      restarts them.
+    </td>
+  </tr>
+  <tr>
+    <td><b>Adding links</b></td>
+    <td>
+      Paste a link into the top bar and press Enter. Paste several links at once with
+      <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> and they open in the batch dialog, ready to edit.
+      With the clipboard watcher on (Preferences), a copied link is offered as a toast.
+    </td>
+  </tr>
+  <tr>
     <td><b>Queue and scheduling</b></td>
     <td>
       Max simultaneous downloads, a scheduler with start and stop times, a global speed limit, and
       time-of-day speed windows (for example, a cap overnight) that override it while they are open.
-      When the queue is done, TDM can stay open, close, or shut the PC down after 60 seconds.
+      When the queue is done, the <b>After queue</b> setting in Preferences can keep TDM open, close
+      it, or close it and shut the PC down about a minute later (Windows and Linux).
     </td>
   </tr>
   <tr>
     <td><b>Default folder</b></td>
     <td>
       The folder chip in the top bar shows where new downloads go. Click it, or use the
-      <b>Folder</b> menu, to choose another one. <b>Open download folder</b> opens it in Explorer.
+      <b>Folder</b> menu, to choose another one. <b>Open download folder</b> opens it in the file manager.
     </td>
   </tr>
   <tr>
     <td><b>Organising</b></td>
     <td>
-      Automatic categories (Programs, Music, Video, Documents, Compressed), search,
+      Automatic categories (Programs, Music, Video, Documents, Compressed), search (<kbd>Ctrl</kbd>+<kbd>F</kbd>),
       batch add such as <code>https://site/img[001-120].jpg</code>, and an opt-in clipboard watcher.
+    </td>
+  </tr>
+  <tr>
+    <td><b>Select and delete</b></td>
+    <td>
+      <kbd>Ctrl</kbd>+<kbd>A</kbd> switches on select mode, with a checkbox on each download. Tick
+      the downloads you want and press <kbd>Delete</kbd>. The confirmation depends on the count:
+      one download asks for a yes or no, a few idle downloads show a count and their names, and
+      ten or more, any running download, or any file to remove needs the count typed in. Deleting
+      a download keeps its file unless you tick <b>also delete the file</b>.
     </td>
   </tr>
   <tr>
     <td><b>Safety</b></td>
     <td>
-      Verify SHA-256 or MD5 against a published hash (the pasted value's length picks which).
-      Existing files are never overwritten: a name clash becomes <code>name (2).ext</code>.
-      Deleting a download keeps its file unless you tick the box.
+      <b>Verify SHA-256 or MD5</b> on a finished download, against a published hash (a 64-character
+      value is compared as SHA-256, a 32-character value as MD5). Existing files are never overwritten:
+      a name clash becomes <code>name (2).ext</code>.
+    </td>
+  </tr>
+  <tr>
+    <td><b>File type check</b></td>
+    <td>
+      After a download finishes, TDM reads the first and last bytes of the file and compares them
+      with the file name (on by default; turn it off in Preferences). If the content is an HTML or XML
+      page, or a clearly different format, a warning offers <b>Open the page in browser</b>,
+      <b>Rename to .ext</b> and <b>Keep</b>. Rename is offered only for clear mismatches, never for
+      executables, and never overwrites an existing file. The detected type is saved with the download.
     </td>
   </tr>
   <tr>
@@ -97,11 +139,26 @@
     <td>A floating <b>⬇ TDM</b> button on videos, and a popup listing media on the current tab.</td>
   </tr>
   <tr>
+    <td><b>Keyboard</b></td>
+    <td>
+      Up and Down arrows, Home and End move through the list, Space pauses and resumes the selected
+      download, and most actions have shortcuts. See <a href="#keyboard-shortcuts">Keyboard shortcuts</a>.
+    </td>
+  </tr>
+  <tr>
     <td><b>Interface</b></td>
     <td>
       TDM Dark (default) and TDM Light with an animated toggle, download cards with progress bars,
       a live speed graph, toast notifications, and no redraws while idle. The sidebar widens with
       the window. Buttons are one solid colour, with white text on the accent in dark mode.
+      The window reopens at its last size and position, unless that position is now off screen.
+    </td>
+  </tr>
+  <tr>
+    <td><b>Notifications</b></td>
+    <td>
+      When a download finishes while TDM is in the background, the taskbar button flashes. Turn this
+      off with <b>Flash the taskbar when a download finishes</b> in Preferences (on by default).
     </td>
   </tr>
   <tr>
@@ -124,7 +181,7 @@ The extension lets your browser send downloads and video links to TDM. Do this o
    node extension/build.mjs
    ```
 
-   Node.js 20 or newer must be installed for this step.
+   Node.js 18 or newer must be installed for this step.
 
 2. **Start TDM.** In the sidebar, under **BROWSERS**, click **Add**.
 
@@ -206,7 +263,7 @@ TDM is one Rust crate that builds a single `tdm` binary. The GUI runs on the
 | Protocols | `src/ftp.rs`, `src/media.rs` | FTP with ranged `REST`/`RETR`. HLS and DASH manifests are expanded into segment lists before transfer. |
 | Batch and crawl | `src/batch.rs`, `src/grabber.rs` | Expands `[001-120]`-style patterns, and collects linked files from one host. |
 | Scheduling | `src/scheduler.rs`, `src/model.rs` | Queue start and stop windows, and time-of-day speed windows. |
-| Post-download | `src/checksum.rs`, `src/scan.rs` | One pass computes SHA-256 and MD5. Defender or ClamAV can scan the finished file. |
+| Post-download | `src/checksum.rs`, `src/scan.rs`, `src/filetype.rs` | One pass computes SHA-256 and MD5. Defender or ClamAV can scan the finished file. The file-type check sniffs the file's first and last bytes against its name. |
 | Persistence | `src/store.rs` | `settings.json` and `downloads.json` in the per-user config folder, written to a temp file and then renamed. |
 | Browser bridge | `src/ipc.rs`, `src/native_host.rs`, `src/register.rs` | A loopback TCP link between the browser's native-messaging host and the running app, with a per-run token. The host writes the browser manifests and, on Windows, the registry keys. |
 | Interface | `src/main.rs`, `src/ui/` | The iced window, the menu, the Preferences dialog and the TDM Dark and Light themes. |
@@ -350,15 +407,23 @@ sequenceDiagram
     <th align="left">Shortcut</th>
     <th align="left">Action</th>
   </tr>
-  <tr><td><kbd>Ctrl</kbd>+<kbd>N</kbd></td><td>Focus the link bar</td></tr>
-  <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>Focus search</td></tr>
-  <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd></td><td>Paste a link into the link bar</td></tr>
-  <tr><td><kbd>Space</kbd></td><td>Pause or resume the selected download</td></tr>
-  <tr><td><kbd>Delete</kbd></td><td>Remove the selected download</td></tr>
-  <tr><td><kbd>Esc</kbd></td><td>Close the topmost menu or dialog</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>N</kbd></td><td>New download: move the cursor to the link bar</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd></td><td>Paste from the clipboard. One link goes into the link bar; several links open the batch dialog</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>Search downloads: move the cursor to the search box</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>A</kbd></td><td>Select downloads: turn on select mode and tick the downloads in view</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td>Retry failed downloads</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>P</kbd></td><td>Pause everything while a download is running; otherwise start the queue</td></tr>
+  <tr><td><kbd>Delete</kbd></td><td>Delete the ticked downloads if any are ticked, otherwise the selected download. Asks first</td></tr>
+  <tr><td><kbd>F2</kbd></td><td>Show the selected download's file in its folder</td></tr>
+  <tr><td><kbd>Up</kbd> / <kbd>Down</kbd></td><td>Select the previous or next download</td></tr>
+  <tr><td><kbd>Home</kbd> / <kbd>End</kbd></td><td>Select the first or last download</td></tr>
+  <tr><td><kbd>Space</kbd></td><td>Pause or resume the selected download. In select mode, tick or untick it</td></tr>
+  <tr><td><kbd>Enter</kbd></td><td>Open a finished download's file. For any other download, does what Space does</td></tr>
+  <tr><td><kbd>Esc</kbd></td><td>Close the topmost dialog or menu. With nothing open, leave select mode</td></tr>
 </table>
 
-Shortcuts are ignored while you type in a text field.
+The list shortcuts do nothing while a dialog is open. While a text field has focus, the keys the
+field uses (letters, Space, arrows) go to the field, so they do not act on the list.
 
 ---
 
@@ -398,9 +463,14 @@ Shortcuts are ignored while you type in a text field.
     <th align="left">macOS and Linux</th>
   </tr>
   <tr>
-    <td>Settings and download list</td>
+    <td>Settings (<code>settings.json</code>)</td>
     <td><code>%APPDATA%\tdm\</code></td>
-    <td><code>~/.config/tdm/</code></td>
+    <td><code>~/.config/tdm/</code> on Linux, <code>~/Library/Application Support/tdm/</code> on macOS</td>
+  </tr>
+  <tr>
+    <td>Download list (<code>downloads.json</code>)</td>
+    <td><code>%APPDATA%\tdm\</code></td>
+    <td><code>~/.config/tdm/</code> on Linux, <code>~/Library/Application Support/tdm/</code> on macOS</td>
   </tr>
   <tr>
     <td>Resume state</td>
@@ -417,6 +487,11 @@ Shortcuts are ignored while you type in a text field.
     <td>Autostart desktop entry (Linux) or LaunchAgent (macOS)</td>
   </tr>
 </table>
+
+Each download record in `downloads.json` holds the URL, destination, category, headers, mirrors and
+total size, plus the file type found by the file-type check (`kind`) and the Content-Type the server
+sent. Both files are written to a temporary file first and then renamed, so an interrupted save
+does not leave a broken file behind.
 
 Nothing is written outside your user profile, and no administrator rights are needed.
 
@@ -521,6 +596,15 @@ cargo packager --release --formats app,dmg       # macOS
 cargo packager --release --formats deb,appimage  # Linux
 ```
 
+`cargo build` (and `cargo run`) also builds the browser extension. The build script `build.rs` runs
+`extension/build.mjs` with Node.js, so Node must be on your PATH. If Node is missing, the build still
+succeeds and prints a warning, and you can run `node extension/build.mjs` yourself.
+
+The icon is embedded in `tdm.exe` by the build script. The MSVC toolchain uses `rc.exe` through `winres`.
+The GNU toolchain runs `windres` itself, from a short-path folder, because `windres` cannot handle spaces
+in the project path. This needs 8.3 short names enabled on the drive. If no short path can be found,
+the icon is skipped with a warning and the build still succeeds.
+
 **Linux system libraries** (for iced and wgpu):
 
 ```sh
@@ -543,6 +627,22 @@ node --test extension/    # extension unit tests
 The integration tests start local HTTP and FTP servers, so they need no internet access.
 
 For a manual check of the browser extension, follow [`extension/selftest.md`](extension/selftest.md).
+
+---
+
+## Releases and CI
+
+- **CI** (`.github/workflows/ci.yml`) builds the app in release mode on every push and pull request,
+  on Windows, Ubuntu 22.04 and macOS.
+- **Release** (`.github/workflows/release.yml`) runs when you push a tag that starts with `v`, such as
+  `v0.2.0`. The tag must match `version` in `Cargo.toml`, or the release stops. Tags with a hyphen
+  (such as `v0.2.0-beta.1`) are published as pre-releases.
+
+Each release builds these installers and publishes them as a GitHub release:
+
+- Windows: NSIS setup `.exe` and `.msi`
+- Linux: `.deb`, `.AppImage` and `.rpm`
+- macOS: `.dmg`
 
 ---
 
@@ -600,8 +700,16 @@ For a manual check of the browser extension, follow [`extension/selftest.md`](ex
     <td>Run <code>node extension/build.mjs</code> in the project folder, then try again.</td>
   </tr>
   <tr>
-    <td>Windows blocks the installer</td>
-    <td>Click <b>More info → Run anyway</b>. The installer is not code-signed yet.</td>
+    <td>Windows warns when running a downloaded installer (SmartScreen)</td>
+    <td>The installer is not code-signed yet. Click <b>More info</b>, then <b>Run anyway</b>.</td>
+  </tr>
+  <tr>
+    <td>A download was saved as a web page</td>
+    <td>
+      The server sent an HTML page instead of the file, and the file-type check warned about it.
+      Click <b>Open the page in browser</b> in the warning dialog to see what the server returned,
+      then download again from a fresh link. <b>Keep</b> leaves the file as it is.
+    </td>
   </tr>
 </table>
 

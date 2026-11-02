@@ -6,7 +6,7 @@ edition = "2024"
 description = "Turbo Download Manager: a fast, segmented download manager with browser capture"
 license = "MIT OR Apache-2.0"
 # shortcut: placeholder until the public repository exists.
-repository = "https://github.com/tdm/tdm"
+repository = "https://github.com/BazilSuhail/Turbo-Download-Manager"
 readme = "packaging/README.md"
 keywords = ["download-manager", "downloader", "http", "ftp", "gui"]
 categories = ["network-programming", "gui"]
@@ -17,7 +17,7 @@ winres = "0.1"
 [dependencies]
 dirs = "6"
 futures-util = "0.3.34"
-iced = { version = "0.14.0", default-features = false, features = ["tokio", "wgpu", "tiny-skia", "image-without-codecs", "web-colors", "thread-pool", "crisp", "svg"] }
+iced = { version = "0.14.0", default-features = false, features = ["tokio", "wgpu", "tiny-skia", "image-without-codecs", "web-colors", "thread-pool", "crisp", "svg", "x11", "wayland"] }
 open = "5.4"
 quick-xml = { version = "0.42.0", default-features = false }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
@@ -42,7 +42,7 @@ identifier = "app.tdm"
 publisher = "Entity Studios"
 copyright = "Copyright (c) 2026 Entity Studios"
 category = "Utility"
-homepage = "https://github.com/tdm/tdm"
+homepage = "https://github.com/BazilSuhail/Turbo-Download-Manager"
 description = "Fast, segmented download manager with browser capture"
 long-description = "Turbo Download Manager splits downloads into parallel segments, resumes interrupted transfers, schedules queues and captures downloads from Chrome, Edge, Brave, Vivaldi and Firefox through its companion extension."
 license-file = "LICENSE-MIT"

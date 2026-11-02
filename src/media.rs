@@ -10,6 +10,8 @@ use quick_xml::{Reader, XmlVersion};
 use reqwest::Url;
 use std::path::{Path, PathBuf};
 
+use crate::engine::{is_cross_site_sensitive, same_site};
+
 /// Safety valve: a manifest claiming more segments than this is treated as hostile.
 const MAX_SEGMENTS: usize = 100_000;
 
@@ -43,10 +45,10 @@ pub async fn resolve(
     headers: &[(String, String)],
     output: &Path,
 ) -> Result<Vec<MediaJob>, Error> {
-    let (text, content_type) = fetch_text(client, url, headers).await?;
+    let origin = Url::parse(url).map_err(|_| Error::BadUrl(url.to_owned()))?;
+    let (text, content_type, base) = fetch_text(client, url, headers).await?;
     let kind = detect(url, content_type.as_deref(), text.as_bytes())
         .ok_or_else(|| Error::NotAManifest(url.to_owned()))?;
-    let base = Url::parse(url).map_err(|_| Error::BadUrl(url.to_owned()))?;
 
     let jobs = match kind {
         MediaKind::Hls => {
@@ -57,9 +59,21 @@ pub async fn resolve(
                     let media_url = base
                         .join(&best.uri)
                         .map_err(|_| Error::BadUrl(best.uri.clone()))?;
-                    let (media_text, _) =
-                        fetch_text(client, media_url.as_str(), headers).await?;
-                    parse_hls_media(&media_text, &media_url)
+                    // The master may name another host. Cookies, auth and
+                    // referer are for the manifest's own site only.
+                    let media_headers: Vec<(String, String)> =
+                        if same_site(origin.host_str(), media_url.host_str()) {
+                            headers.to_vec()
+                        } else {
+                            headers
+                                .iter()
+                                .filter(|(name, _)| !is_cross_site_sensitive(name))
+                                .cloned()
+                                .collect()
+                        };
+                    let (media_text, _, media_base) =
+                        fetch_text(client, media_url.as_str(), &media_headers).await?;
+                    parse_hls_media(&media_text, &media_base)
                 }
                 None => parse_hls_media(&text, &base),
             };
@@ -80,28 +94,41 @@ pub async fn resolve(
     Ok(jobs)
 }
 
+/// Returns the body, its Content-Type, and the URL it was finally served from.
+/// After redirects that URL may be on another host, and relative URIs inside
+/// the playlist resolve against it, not against the URL we asked for.
 async fn fetch_text(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
-) -> Result<(String, Option<String>), Error> {
+) -> Result<(String, Option<String>, Url), Error> {
     let mut request = client.get(url);
     for (name, value) in headers {
         request = request.header(name, value);
     }
-    let response = request.send().await?;
+    let mut response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
         return Err(Error::Status(status.as_u16()));
     }
+    let final_url = response.url().clone();
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let bytes = response.bytes().await?;
-    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_MANIFEST_BYTES)]).into_owned();
-    Ok((text, content_type))
+    // Read chunk by chunk and stop at the cap, so a server that streams a
+    // manifest forever cannot make us buffer all of it first.
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        buf.extend_from_slice(&chunk);
+        if buf.len() >= MAX_MANIFEST_BYTES {
+            break;
+        }
+    }
+    buf.truncate(MAX_MANIFEST_BYTES);
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok((text, content_type, final_url))
 }
 
 /// A manifest URL names a playlist, not a file, so saving it as `.m3u8` leaves
@@ -899,9 +926,85 @@ fn parse_xs_duration(text: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn url(s: &str) -> Url {
         Url::parse(s).expect("test URL is a literal")
+    }
+
+    /// A master that names a media playlist on another host string must not
+    /// receive the Cookie header; the master's own fetch still gets it.
+    #[tokio::test]
+    async fn credentials_do_not_follow_the_media_playlist_to_another_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen: Arc<std::sync::Mutex<Vec<(String, bool)>>> = Arc::default();
+        let master = format!(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nhttp://localhost:{port}/media.m3u8\n"
+        );
+        let media = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n";
+
+        let server_seen = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let seen = Arc::clone(&server_seen);
+                let master = master.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if sock.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let path = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_owned();
+                    let has_cookie =
+                        head.lines().any(|l| l.to_ascii_lowercase().starts_with("cookie:"));
+                    seen.lock().expect("seen").push((path.clone(), has_cookie));
+                    let body = if path == "/media.m3u8" { media.to_owned() } else { master };
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let headers = vec![("Cookie".to_owned(), "session=secret".to_owned())];
+        let client = reqwest::Client::new();
+        let dir = std::env::temp_dir().join(format!("tdm-media-unit-{}", std::process::id()));
+        let jobs = resolve(
+            &client,
+            &format!("http://127.0.0.1:{port}/master.m3u8"),
+            &headers,
+            &dir.join("out.ts"),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(jobs.len(), 1);
+
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            seen.contains(&("/master.m3u8".to_owned(), true)),
+            "master should carry the cookie: {seen:?}"
+        );
+        assert!(
+            seen.contains(&("/media.m3u8".to_owned(), false)),
+            "media playlist on another host must not carry the cookie: {seen:?}"
+        );
     }
 
     const MASTER: &str = "\

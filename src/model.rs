@@ -248,6 +248,12 @@ pub struct DownloadSettings {
     pub duplicate_action: DuplicateAction,
     /// User-Agent for manually added downloads. Empty means the engine's own.
     pub user_agent: String,
+    /// After a download finishes, compare its real type with its name and warn on a mismatch.
+    #[serde(default = "default_true")]
+    pub check_file_type: bool,
+    /// Flash the taskbar button when a download finishes while TDM is in the background.
+    #[serde(default = "default_true")]
+    pub flash_on_complete: bool,
 }
 
 impl Default for DownloadSettings {
@@ -262,6 +268,8 @@ impl Default for DownloadSettings {
             ignore_modification_time: false,
             duplicate_action: DuplicateAction::default(),
             user_agent: String::new(),
+            check_file_type: true,
+            flash_on_complete: true,
         }
     }
 }
@@ -281,7 +289,23 @@ pub struct ConnectionSettings {
     /// timeout. Applied through `Download::set_limits`.
     pub retries: u32,
     pub timeout_secs: u32,
+    /// Retry a download automatically after a transient failure (timeout,
+    /// connection error, 408/429/5xx, short read).
+    #[serde(default = "default_true")]
+    pub auto_retry: bool,
+    /// How many automatic retries a download gets in a row. Clamped to
+    /// `AUTO_RETRY_MAX` when used.
+    #[serde(default = "default_auto_retry_max")]
+    pub auto_retry_max: u32,
 }
+
+/// Default number of automatic retries per download.
+fn default_auto_retry_max() -> u32 {
+    3
+}
+
+/// Upper bound for `ConnectionSettings::auto_retry_max`.
+pub const AUTO_RETRY_MAX: u32 = 10;
 
 impl Default for ConnectionSettings {
     fn default() -> Self {
@@ -292,6 +316,8 @@ impl Default for ConnectionSettings {
             warn_before_stopping: true,
             retries: 5,
             timeout_secs: 30,
+            auto_retry: true,
+            auto_retry_max: default_auto_retry_max(),
         }
     }
 }
@@ -620,6 +646,21 @@ pub struct Settings {
     /// Command-line virus scanner run on each finished download; empty turns it off.
     #[serde(default = "default_scanner")]
     pub scanner: String,
+    /// Main window size and position, restored at startup. `None` until the
+    /// window has been resized or moved once.
+    #[serde(default)]
+    pub window: Option<WindowGeometry>,
+}
+
+/// The main window's last size and, when known, its screen position.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub x: Option<f32>,
+    #[serde(default)]
+    pub y: Option<f32>,
 }
 
 fn default_true() -> bool {
@@ -678,6 +719,7 @@ impl Default for Settings {
             bring_to_front_on_capture: true,
             capture_all: true,
             scanner: default_scanner(),
+            window: None,
         }
     }
 }
@@ -922,5 +964,31 @@ mod tests {
         );
         assert_eq!(normalize_proxy_server("plain.lan:8080"), "http://plain.lan:8080");
         assert_eq!(normalize_proxy_server("http://already.lan:3"), "http://already.lan:3");
+    }
+
+    #[test]
+    fn old_settings_without_retry_flash_or_window_fields_load_with_defaults() {
+        // Serialize today's defaults, then strip the fields added after
+        // settings files were first written. What is left is an old file.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("window");
+        v["downloads"].as_object_mut().unwrap().remove("flash_on_complete");
+        v["connection"].as_object_mut().unwrap().remove("auto_retry");
+        v["connection"].as_object_mut().unwrap().remove("auto_retry_max");
+
+        let s: Settings = serde_json::from_value(v).expect("old settings must load");
+        assert!(s.connection.auto_retry);
+        assert_eq!(s.connection.auto_retry_max, 3);
+        assert!(s.downloads.flash_on_complete);
+        assert_eq!(s.window, None);
+    }
+
+    #[test]
+    fn window_geometry_position_is_optional() {
+        let g: WindowGeometry = serde_json::from_str(r#"{"width": 900.0, "height": 600.0}"#).unwrap();
+        assert_eq!((g.x, g.y), (None, None));
+        let full = WindowGeometry { width: 900.0, height: 600.0, x: Some(10.0), y: Some(20.0) };
+        let back: WindowGeometry = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
     }
 }

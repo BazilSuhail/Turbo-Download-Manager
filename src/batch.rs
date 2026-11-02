@@ -53,10 +53,57 @@ pub fn expand_all(text: &str) -> Result<Vec<String>, Error> {
     Ok(out)
 }
 
+/// Every http://, https:// or ftp:// link in free text such as an email or a
+/// web page copy. Duplicates are dropped and the first occurrence keeps its
+/// place. Trailing punctuation is trimmed, but a closing `)` or `]` is kept
+/// when its opening bracket is part of the link, so `[1-9]` ranges survive.
+pub fn links_in(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for token in text.split(|c: char| c.is_whitespace() || "<>\"'`".contains(c)) {
+        let token = token.trim_start_matches(|c: char| "([{".contains(c));
+        let lower = token.to_ascii_lowercase();
+        let Some(scheme) = ["https://", "http://", "ftp://"].into_iter().find(|s| lower.starts_with(s)) else {
+            continue;
+        };
+        let link = trim_trailing(token);
+        if link.len() <= scheme.len() {
+            continue;
+        }
+        if seen.insert(link.to_owned()) {
+            out.push(link.to_owned());
+        }
+    }
+    out
+}
+
+fn trim_trailing(token: &str) -> &str {
+    let mut s = token;
+    loop {
+        let Some(last) = s.chars().last() else { break };
+        let unbalanced = match last {
+            ')' => s.matches(')').count() > s.matches('(').count(),
+            ']' => s.matches(']').count() > s.matches('[').count(),
+            '.' | ',' | ';' | ':' | '!' | '?' => true,
+            _ => false,
+        };
+        if !unbalanced {
+            break;
+        }
+        s = &s[..s.len() - last.len_utf8()];
+    }
+    s
+}
+
 pub fn expand(pattern: &str) -> Result<Vec<String>, Error> {
     let parts = parse(pattern)?;
     // u128 so the product of a few large ranges cannot wrap below the limit.
-    let total = parts.iter().map(|p| p.count() as u128).product::<u128>();
+    // Even u128 can overflow on a few u64-sized ranges; saturate to the largest
+    // value then, which still fails the limit check below.
+    let total = parts
+        .iter()
+        .try_fold(1u128, |a, p| a.checked_mul(p.count() as u128))
+        .unwrap_or(u128::MAX);
     if total > MAX_EXPANSION as u128 {
         return Err(Error::TooMany(total));
     }
@@ -164,6 +211,44 @@ mod tests {
         assert_eq!(expand("x[9-1]"), Err(Error::Reversed("9-1".into())));
         assert_eq!(expand("x[z-a]"), Err(Error::Reversed("z-a".into())));
         assert_eq!(expand("[1-10000]").map(|v| v.len()), Ok(MAX_EXPANSION));
+    }
+
+    #[test]
+    fn a_product_too_big_for_u128_is_an_error_not_a_panic() {
+        // Each range has u64::MAX members, so the product is about 2^192.
+        let err = expand("[1-18446744073709551615][1-18446744073709551615][1-18446744073709551615]");
+        assert!(matches!(err, Err(Error::TooMany(_))), "got {err:?}");
+    }
+
+    #[test]
+    fn links_in_an_email_are_found_and_punctuation_trimmed() {
+        let mail = "Hi Sam,\n\
+                    The build is at https://ci.example/builds/42.\n\
+                    Logs: <http://logs.example/run?id=7>, mirror (ftp://mirror.example/pkg.tar.gz).\n\
+                    Also see \"https://docs.example/a[1-3].pdf\";\n\
+                    Thanks";
+        assert_eq!(
+            links_in(mail),
+            [
+                "https://ci.example/builds/42",
+                "http://logs.example/run?id=7",
+                "ftp://mirror.example/pkg.tar.gz",
+                "https://docs.example/a[1-3].pdf",
+            ]
+        );
+    }
+
+    #[test]
+    fn links_in_drops_duplicates_and_keeps_order() {
+        let text = "https://a.example/x https://b.example/y https://a.example/x.";
+        assert_eq!(links_in(text), ["https://a.example/x", "https://b.example/y"]);
+    }
+
+    #[test]
+    fn text_without_links_gives_nothing() {
+        assert!(links_in("no links here, just www.example.com and a: colon").is_empty());
+        assert!(links_in("").is_empty());
+        assert!(links_in("https:// alone").is_empty());
     }
 
     #[test]

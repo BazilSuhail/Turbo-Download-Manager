@@ -160,6 +160,8 @@ jobs:
           fi
 
           {
+            echo "<p align=\"center\"><img src=\"https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/assets/tdm-logo.png\" width=\"140\" alt=\"$product logo\"></p>"
+            echo
             echo "# $product v$VERSION"
             echo
             echo "$summary"

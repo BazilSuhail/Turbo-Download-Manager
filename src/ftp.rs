@@ -381,6 +381,9 @@ impl FtpUrl {
         if file.is_empty() {
             return Err(bad());
         }
+        if [user.as_str(), pass.as_str(), dir.as_str(), file].iter().any(|part| has_control_char(part)) {
+            return Err(bad());
+        }
         Ok(FtpUrl {
             host: host.to_owned(),
             port,
@@ -400,15 +403,25 @@ impl FtpUrl {
 }
 
 /// Strip the userinfo out of a URL-shaped string we could not parse.
+///
+/// A password may contain `/`, so the first `/` does not mark the end of the
+/// userinfo. The last `@` is taken as the separator instead, which is the one
+/// `FtpUrl::parse` uses as well.
 fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("//") else {
         return url.to_owned();
     };
-    let cut = rest.find('/').unwrap_or(rest.len());
-    match rest[..cut].rsplit_once('@') {
-        Some((_, hostport)) => format!("{scheme}//***@{hostport}{}", &rest[cut..]),
+    match rest.rfind('@') {
+        Some(at) => format!("{scheme}//***@{}", &rest[at + 1..]),
         None => url.to_owned(),
     }
+}
+
+/// Whether a credential or path part carries a control character. Those have
+/// no business in an FTP command line, and a CR or LF there would let a
+/// crafted URL inject extra commands into the control connection.
+fn has_control_char(s: &str) -> bool {
+    s.chars().any(|c| c < '\u{20}' || c == '\u{7f}')
 }
 
 /// What the engine needs before it can plan segments.
@@ -897,6 +910,25 @@ mod tests {
         assert_eq!((url.user.as_str(), url.pass.as_str()), ("bob", ""));
         let url = FtpUrl::parse("ftp://bob:p@ss@example.com/x.bin").unwrap();
         assert_eq!((url.user.as_str(), url.pass.as_str()), ("bob", "p@ss"));
+    }
+
+    #[test]
+    fn a_control_character_in_a_credential_or_path_is_rejected() {
+        // A CRLF in the password would end the USER/PASS line early and let
+        // the rest be read as a command.
+        assert!(FtpUrl::parse("ftp://bob:a\r\nDELE x@example.com/x.bin").is_err());
+        assert!(FtpUrl::parse("ftp://bob:pass@example.com/x\u{7f}.bin").is_err());
+        assert!(FtpUrl::parse("ftp://bob:pass@example.com/a\r\nb/x.bin").is_err());
+    }
+
+    #[test]
+    fn a_password_containing_a_slash_is_redacted_too() {
+        let redacted = redact_url("ftp://bob:pa/ss@h/x");
+        assert!(!redacted.contains("bob"), "username leaked in {redacted:?}");
+        assert!(!redacted.contains("pa/ss"), "password leaked in {redacted:?}");
+        assert_eq!(redacted, "ftp://***@h/x");
+        // A URL with no userinfo is returned as it was.
+        assert_eq!(redact_url("ftp://h/x"), "ftp://h/x");
     }
 
     #[test]

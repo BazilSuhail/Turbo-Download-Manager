@@ -23,7 +23,7 @@ use crate::ui::theme;
 
 /// Suffix for a control we render but cannot honour yet.
 const NOT_WIRED: &str = "(not yet implemented)";
-const LABEL_W: f32 = 250.0;
+const LABEL_W: f32 = 170.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -58,6 +58,8 @@ pub enum Message {
     QueuePanelOnDownloadLater(bool),
     QueuePanelOnBatchClose(bool),
     IgnoreModificationTime(bool),
+    CheckFileType(bool),
+    FlashOnComplete(bool),
     Duplicate(DuplicateAction),
     UserAgent(String),
 
@@ -152,6 +154,8 @@ pub fn update(s: &mut Settings, message: Message) {
         QueuePanelOnDownloadLater(v) => s.downloads.queue_panel_on_download_later = v,
         QueuePanelOnBatchClose(v) => s.downloads.queue_panel_on_batch_close = v,
         IgnoreModificationTime(v) => s.downloads.ignore_modification_time = v,
+        CheckFileType(v) => s.downloads.check_file_type = v,
+        FlashOnComplete(v) => s.downloads.flash_on_complete = v,
         Duplicate(v) => s.downloads.duplicate_action = v,
         UserAgent(v) => s.downloads.user_agent = v,
 
@@ -317,7 +321,7 @@ pub fn view(s: &Settings) -> Element<'_, Message> {
 
     row![
         container(scrollable(tab_list(s.options_tab)))
-            .width(Length::Fixed(150.0))
+            .width(Length::Fixed(130.0))
             .height(Length::Fill),
         // The gap on the right is the scroll bar's lane: without it the bar is
         // drawn over the last control in a row, and a half-covered button is
@@ -496,7 +500,14 @@ fn save_to(s: &Settings) -> Element<'_, Message> {
     for (i, c) in s.categories.iter().enumerate() {
         col = col.push(
             row![
-                text(&c.name).size(12).width(Length::Fixed(90.0)),
+                container(
+                    text(crate::ui::fit::middle_ellipsis(&c.name, 12))
+                        .size(12)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .width(Length::Fixed(90.0)),
+                )
+                .width(Length::Fixed(90.0))
+                .clip(true),
                 text_input("ZIP RAR", &c.mask.join(" "))
                     .on_input(move |v| Message::CategoryMask(i, v))
                     .style(theme::input)
@@ -598,6 +609,16 @@ fn downloads(s: &Settings) -> Element<'_, Message> {
         "Resume even if the server reports a newer file date",
         d.ignore_modification_time,
         Message::IgnoreModificationTime,
+    ));
+    col = col.push(check(
+        "Check the file's real type after download",
+        d.check_file_type,
+        Message::CheckFileType,
+    ));
+    col = col.push(check(
+        "Flash the taskbar when a download finishes",
+        d.flash_on_complete,
+        Message::FlashOnComplete,
     ));
     col = col.push(
         row![
@@ -748,17 +769,24 @@ const SPEED_KBPS_MAX: u32 = 1_000_000;
 
 fn speed_window_row(index: usize, w: &model::SpeedWindow) -> Element<'static, Message> {
     let kbps = w.limit.map_or(0, |b| (b / 1024) as u32);
-    row![
-        mini_stepper("From hour", u32::from(w.start.hour), 0..=23, move |h| Message::SpeedWindowStart(index, h)),
-        mini_stepper("To hour", u32::from(w.end.hour), 0..=23, move |h| Message::SpeedWindowEnd(index, h)),
-        mini_stepper("KB/s", kbps, 0..=SPEED_KBPS_MAX, move |k| Message::SpeedWindowKbps(index, k)),
-        button(text("Remove").size(12))
-            .padding([3, 10])
-            .style(theme::flat(false))
-            .on_press(Message::RemoveSpeedWindow(index)),
+    column![
+        row![
+            mini_stepper("From hour", u32::from(w.start.hour), 0..=23, move |h| Message::SpeedWindowStart(index, h)),
+            mini_stepper("To hour", u32::from(w.end.hour), 0..=23, move |h| Message::SpeedWindowEnd(index, h)),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center),
+        row![
+            mini_stepper("KB/s", kbps, 0..=SPEED_KBPS_MAX, move |k| Message::SpeedWindowKbps(index, k)),
+            button(text("Remove").size(12))
+                .padding([3, 10])
+                .style(theme::flat(false))
+                .on_press(Message::RemoveSpeedWindow(index)),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center),
     ]
-    .spacing(10)
-    .align_y(iced::Alignment::Center)
+    .spacing(4)
     .into()
 }
 
@@ -780,7 +808,7 @@ fn mini_stepper(
     row![
         text(label).size(12).style(theme::muted),
         minus,
-        container(text(value.to_string()).size(13)).center_x(Length::Fixed(64.0)),
+        container(text(value.to_string()).size(13)).center_x(Length::Fixed(40.0)),
         plus,
     ]
     .spacing(4)
@@ -919,13 +947,24 @@ fn check<'a, F>(label: &'a str, value: bool, on_toggle: F) -> Element<'a, Messag
 where
     F: Fn(bool) -> Message + 'a,
 {
-    checkbox(value).label(label).on_toggle(on_toggle).size(16).text_size(13).into()
+    checkbox(value)
+        .label(label)
+        .on_toggle(on_toggle)
+        .size(16)
+        .text_size(13)
+        .text_wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+        .into()
 }
 
 /// A checkbox we cannot honour: it shows its state and says so, instead of
 /// accepting a click that would change nothing.
 fn dead_check<'a>(label: &str, value: bool) -> Element<'a, Message> {
-    checkbox(value).label(format!("{label}  {NOT_WIRED}")).size(16).text_size(13).into()
+    checkbox(value)
+        .label(format!("{label}  {NOT_WIRED}"))
+        .size(16)
+        .text_size(13)
+        .text_wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+        .into()
 }
 
 fn dead_label<'a>(label: &str) -> Element<'a, Message> {

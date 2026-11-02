@@ -213,24 +213,28 @@ pub fn flat(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
-/// A list row or sidebar entry: like [`flat`], with an accent edge when
-/// selected.
-pub fn row_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+/// A list row: like [`flat`], with an accent edge when selected. `marked`
+/// (0..=1) is how far the row is ticked in select mode; a marked row takes
+/// an accent wash and edge in proportion.
+pub fn row_button(selected: bool, marked: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    let marked = marked.clamp(0.0, 1.0);
     move |theme, status| {
         let p = Palette::of(theme);
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let base = if selected {
+            p.raised
+        } else if hovered {
+            alpha(p.raised, 0.6)
+        } else {
+            p.card
+        };
+        let edged = selected || marked > 0.0;
         button::Style {
-            background: Some(if selected {
-                p.raised.into()
-            } else if hovered {
-                alpha(p.raised, 0.6).into()
-            } else {
-                p.card.into()
-            }),
+            background: Some(blend(base, p.accent, 0.12 * marked).into()),
             text_color: p.text,
             border: Border {
-                color: if selected { p.accent } else { p.border },
-                width: if selected { 1.5 } else { 1.0 },
+                color: if edged { p.accent } else { p.border },
+                width: if edged { 1.5 } else { 1.0 },
                 radius: 10.0.into(),
             },
             ..Default::default()

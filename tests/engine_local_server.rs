@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tdm::filetype::Kind;
 use tdm::{Download, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -581,4 +582,20 @@ async fn a_fresh_download_of_unknown_length_does_not_keep_an_old_tail() {
 
     Download::new(format!("http://{addr}/f"), &dest, 1).run().await.expect("download");
     assert_eq!(std::fs::read(&dest).expect("read output"), b"new");
+}
+
+#[tokio::test]
+async fn a_finished_download_reports_the_real_type_of_its_bytes() {
+    // A PNG signature under a .bin name: the finished snapshot reports PNG, and the bytes stay as they are.
+    let mut body = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    body.extend(sample_body(4096));
+    let url = serve(Arc::new(body.clone()), Options::default()).await;
+    let dest = temp_file("typed.bin");
+
+    let handle = Download::new(url, dest.clone(), 4);
+    handle.run().await.expect("download");
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.status, Status::Finished);
+    assert_eq!(snapshot.kind, Some(Kind::Png));
+    assert_eq!(std::fs::read(&dest).expect("read output"), body);
 }

@@ -45,6 +45,12 @@ pub struct DownloadRecord {
     /// Whether the last run finished. Everything else is re-derived.
     #[serde(default)]
     pub complete: bool,
+    /// The real file type found by sniffing, as `filetype::Kind::id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The Content-Type the server sent, kept for the type warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -186,6 +192,8 @@ mod tests {
                 mirrors: vec!["https://mirror.example.test/a.zip".into()],
                 total: Some(1234),
                 complete: false,
+                kind: Some("png".into()),
+                content_type: Some("text/html".into()),
             }],
         };
         store.save_list(&list).unwrap();
@@ -195,6 +203,41 @@ mod tests {
         assert_eq!(back.downloads[0].category_id, Some(7));
         assert_eq!(back.downloads[0].headers[0].0, "Referer");
         assert_eq!(back.downloads[0].total, Some(1234));
+        assert_eq!(back.downloads[0].kind.as_deref(), Some("png"));
+        assert_eq!(back.downloads[0].content_type.as_deref(), Some("text/html"));
+    }
+
+    #[test]
+    fn a_record_saved_before_kind_existed_still_loads() {
+        // Lists written by older builds have no kind or content_type fields.
+        let store = temp_store("old-record");
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let old = r#"{"downloads":[{"url":"https://example.test/a.zip","dest":"D:\\dl\\a.zip"}]}"#;
+        std::fs::write(store.list_path(), old).unwrap();
+
+        let list = store.load_list().expect("old list loads");
+        assert_eq!(list.downloads[0].kind, None);
+        assert_eq!(list.downloads[0].content_type, None);
+        assert!(!list.downloads[0].complete);
+    }
+
+    #[test]
+    fn an_absent_kind_is_not_written_to_disk() {
+        // Keeps old readers happy: no new keys appear unless there is a value.
+        let record = DownloadRecord {
+            url: "https://example.test/a.zip".into(),
+            dest: PathBuf::from("a.zip"),
+            category_id: None,
+            headers: vec![],
+            mirrors: vec![],
+            total: None,
+            complete: true,
+            kind: None,
+            content_type: None,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("\"kind\""), "unexpected key in {json}");
+        assert!(!json.contains("content_type"), "unexpected key in {json}");
     }
 
     #[test]

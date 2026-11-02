@@ -14,6 +14,8 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::task::JoinSet;
 
+use crate::filetype;
+
 /// Splitting a range with less than this left is not worth another connection.
 ///
 /// About 23 KB: below that a new connection's handshake costs more than the
@@ -64,6 +66,37 @@ pub enum Error {
     NeedsMux { video: String, audio: String },
 }
 
+/// A reqwest failure that happened on the wire rather than in the request
+/// itself: timeouts, connect failures, send failures and broken bodies.
+fn network_failure(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
+}
+
+impl Error {
+    /// True for failures that may clear up on their own, so a retry is worth
+    /// trying: network timeouts, connect and send failures, HTTP 408, 429 and
+    /// 5xx, FTP 4xx and socket errors, and a connection that ended early.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Error::Http(e) => network_failure(e),
+            Error::Status(code) => matches!(code, 408 | 429 | 500..=599),
+            Error::ShortRead { .. } => true,
+            Error::Ftp(e) => matches!(
+                e,
+                crate::ftp::FtpError::Timeout
+                    | crate::ftp::FtpError::Io(_)
+                    | crate::ftp::FtpError::Transient { .. }
+                    | crate::ftp::FtpError::ShortRead { .. }
+            ),
+            Error::Media(crate::media::Error::Http(e)) => network_failure(e),
+            Error::Media(crate::media::Error::Status(code)) => {
+                matches!(code, 408 | 429 | 500..)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// How many hops we follow before giving up.
 ///
 /// Ten is the conventional browser limit and is plenty for real downloads.
@@ -81,7 +114,7 @@ const MAX_REDIRECTS: usize = 10;
 /// `a.co.uk` and `co.uk` as related. That direction only ever keeps a cookie
 /// on a *narrower* host than the one that set it, so it does not leak across
 /// registrable domains, which is the case that matters here.
-fn same_site(a: Option<&str>, b: Option<&str>) -> bool {
+pub(crate) fn same_site(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => {
             let (a, b) = (a.trim_end_matches('.'), b.trim_end_matches('.'));
@@ -94,7 +127,7 @@ fn same_site(a: Option<&str>, b: Option<&str>) -> bool {
 }
 
 /// Headers that must not follow a redirect to an unrelated host.
-fn is_cross_site_sensitive(name: &str) -> bool {
+pub(crate) fn is_cross_site_sensitive(name: &str) -> bool {
     name.eq_ignore_ascii_case("cookie")
         || name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("referer")
@@ -118,6 +151,11 @@ pub struct Snapshot {
     pub total: Option<u64>,
     pub done: u64,
     pub error: Option<String>,
+    /// The real type of the finished file, from its bytes. `None` until a
+    /// normal download finishes and the sniff succeeds.
+    pub kind: Option<filetype::Kind>,
+    /// The Content-Type the server sent with the probe, trimmed.
+    pub content_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +380,11 @@ impl Download {
         &self.dest
     }
 
+    /// Point the handle at a new file name, after the file was renamed on disk.
+    pub fn set_dest(&mut self, dest: PathBuf) {
+        self.dest = dest;
+    }
+
     /// Delete the partial file and its resume sidecar.
     ///
     /// Removing a download from the list must not leave its bytes behind —
@@ -405,7 +448,14 @@ impl Download {
         let result = self.run_inner().await;
         match &result {
             Ok(()) if self.stop.load(Ordering::SeqCst) => self.set_status(Status::Paused),
-            Ok(()) => self.set_status(Status::Finished),
+            Ok(()) => {
+                // Sniffed before Finished is published, so the UI never sees a
+                // finished download without its kind.
+                let kind = self.sniff_finished().await;
+                let mut s = self.shared.lock().expect("snapshot lock");
+                s.kind = kind;
+                s.status = Status::Finished;
+            }
             Err(e) => {
                 let mut s = self.shared.lock().expect("snapshot lock");
                 s.status = Status::Failed;
@@ -415,15 +465,29 @@ impl Download {
         result
     }
 
-    async fn run_inner(&self) -> Result<(), Error> {
+    /// The real type of the finished file. Media output is a concatenation of
+    /// segments, not the file the URL names, so it is skipped. A sniff error
+    /// leaves the kind unknown rather than failing the download.
+    async fn sniff_finished(&self) -> Option<filetype::Kind> {
+        if crate::media::detect(&self.url, None, &[]).is_some() {
+            return None;
+        }
+        let path = self.dest.clone();
+        tokio::task::spawn_blocking(move || filetype::sniff_file(&path))
+            .await
+            .ok()?
+            .ok()
+    }
+
+    /// The HTTP client for this download, with the given redirect policy. The
+    /// proxy and timeout are the same for every policy.
+    fn build_client(&self, redirect: reqwest::redirect::Policy) -> Result<reqwest::Client, Error> {
         let mut builder = reqwest::Client::builder()
             .user_agent(concat!("TDM/", env!("CARGO_PKG_VERSION")))
             // Applies to the whole request including the body, so it bounds a
             // stalled transfer, not just a slow handshake.
             .timeout(self.timeout)
-            // We follow redirects ourselves in `probe` so that credentials can
-            // be dropped on a cross-site hop; see `same_site`.
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(redirect);
         if let Some(p) = &self.proxy {
             let wanted = [
                 p.http.then(|| reqwest::Proxy::http(&p.url)),
@@ -437,14 +501,27 @@ impl Download {
                 builder = builder.proxy(proxy);
             }
         }
-        let client = builder.build()?;
+        Ok(builder.build()?)
+    }
 
-        let configured = self.headers.lock().expect("headers lock").clone();
-
+    async fn run_inner(&self) -> Result<(), Error> {
         // A streaming manifest is not a file to range over: it is a list of
         // other files. Detected from the URL only — a content-type-only manifest would need a fetch before
         // we know, and that fetch is exactly what `probe` is for.
-        if crate::media::detect(&self.url, None, &[]).is_some() {
+        let media = crate::media::detect(&self.url, None, &[]).is_some();
+        // Media follows redirects itself, since a manifest is commonly moved
+        // by a CDN. The file path follows them in `probe` so that credentials
+        // can be dropped on a cross-site hop; see `same_site`.
+        let policy = if media {
+            reqwest::redirect::Policy::limited(MAX_REDIRECTS)
+        } else {
+            reqwest::redirect::Policy::none()
+        };
+        let client = self.build_client(policy)?;
+
+        let configured = self.headers.lock().expect("headers lock").clone();
+
+        if media {
             return self.run_media(&client, &configured).await;
         }
 
@@ -453,7 +530,7 @@ impl Download {
         // FTP takes a different probe and a different fetch, but the same
         // segment planner: `REST` gives us a start offset, and the segment end
         // is enforced by closing the data socket, so a range is a range.
-        let is_ftp = self.url.len() >= 6 && self.url[..6].eq_ignore_ascii_case("ftp://");
+        let is_ftp = self.url.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("ftp://"));
 
         // Probe on every run, including a resume. It resolves the redirect
         // chain and re-confirms the size and range support. Resuming against a
@@ -467,12 +544,22 @@ impl Download {
             (p.size, p.supports_rest && p.size.is_some(), Vec::new(), self.url.clone())
         } else {
             let p = probe(&client, &self.url, &configured).await?;
+            self.shared.lock().expect("snapshot lock").content_type = p.content_type;
             (p.total, p.ranged, p.headers, p.url)
         };
 
         // A saved state that no longer matches the server's answer cannot be
         // trusted: start the file again.
-        let resumed = saved.filter(|s| s.ranged == ranged && s.total == total);
+        // The sidecar only describes bytes that are on disk. If the data file
+        // is gone, or is not the size the plan assumes, resuming would mark
+        // ranges complete that were never written.
+        let on_disk = tokio::fs::metadata(&self.dest).await.ok().map(|m| m.len());
+        let resumed = saved.filter(|s| {
+            s.ranged == ranged
+                && s.total == total
+                && on_disk.is_some()
+                && (!ranged || on_disk == total)
+        });
         let fresh = resumed.is_none();
         let segments = match resumed {
             Some(s) => s.segments,
@@ -543,6 +630,9 @@ impl Download {
         let mut first_error: Option<Error> = None;
         let mut last_ramp = Instant::now();
         let mut last_total_done = 0u64;
+        // The segment layout last written to the sidecar, so an unchanged
+        // checkpoint is not rewritten every tick.
+        let mut last_saved: Option<Vec<Segment>> = None;
 
         loop {
             tokio::select! {
@@ -550,7 +640,7 @@ impl Download {
                     // A failed checkpoint must not abort a healthy transfer —
                     // the worst case is resuming from an older position, which
                     // is strictly better than losing the download.
-                    let done_now = match self.publish(&segments, total, ranged).await {
+                    let done_now = match self.publish(&segments, total, ranged, &mut last_saved).await {
                         Ok(done) => done,
                         Err(e) => {
                             eprintln!("could not checkpoint progress: {e}");
@@ -622,7 +712,7 @@ impl Download {
             }
         }
 
-        self.publish(&segments, total, ranged).await?;
+        self.publish(&segments, total, ranged, &mut last_saved).await?;
         if let Some(e) = first_error {
             return Err(e);
         }
@@ -656,16 +746,30 @@ impl Download {
         }
         // The segment count is known; the byte total is not, so progress is
         // reported against the bytes that have actually arrived.
+        // Segment requests go to the manifest's host and to whatever hosts the
+        // manifest names. Credentials are for the manifest's site only.
+        let manifest_host = reqwest::Url::parse(&self.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned));
+
         let mut done = 0u64;
         for job in &jobs {
-            let mut file = tokio::fs::File::create(&job.output).await?;
+            // Written under a `.part` name and renamed when complete, so an
+            // existing file at the output path is not truncated mid-download.
+            let part = with_suffix(&job.output, ".part");
+            let mut file = tokio::fs::File::create(&part).await?;
             for segment in &job.segments {
                 if self.stop.load(Ordering::SeqCst) {
                     file.flush().await?;
                     return Ok(());
                 }
+                let segment_host = segment.url.host_str();
+                let same = same_site(manifest_host.as_deref(), segment_host);
                 let mut request = client.get(segment.url.clone());
                 for (name, value) in headers {
+                    if !same && is_cross_site_sensitive(name) {
+                        continue;
+                    }
                     request = request.header(name, value);
                 }
                 let response = request.send().await?;
@@ -682,27 +786,37 @@ impl Download {
                 snapshot.total = None;
             }
             file.flush().await?;
+            drop(file);
+            tokio::fs::rename(&part, &job.output).await?;
         }
 
         // DASH keeps audio and video apart. Join them if ffmpeg is there;
         // otherwise say so and leave both files, rather than present a silent
         // video as finished.
         if jobs.len() > 1 && jobs.iter().any(|j| j.needs_mux) {
-            let (video, audio) = (&jobs[0].output, &jobs[1].output);
-            let status = std::process::Command::new("ffmpeg")
-                .args(["-y", "-i"])
-                .arg(video)
-                .arg("-i")
-                .arg(audio)
-                .args(["-c", "copy"])
-                .arg(&self.dest)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            let (video, audio) = (jobs[0].output.clone(), jobs[1].output.clone());
+            let dest = self.dest.clone();
+            // ffmpeg can run for minutes; keep it off the async worker threads.
+            let status = tokio::task::spawn_blocking({
+                let (video, audio) = (video.clone(), audio.clone());
+                move || {
+                    std::process::Command::new("ffmpeg")
+                        .args(["-y", "-i"])
+                        .arg(&video)
+                        .arg("-i")
+                        .arg(&audio)
+                        .args(["-c", "copy"])
+                        .arg(&dest)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                }
+            })
+            .await;
             match status {
-                Ok(s) if s.success() => {
-                    let _ = tokio::fs::remove_file(video).await;
-                    let _ = tokio::fs::remove_file(audio).await;
+                Ok(Ok(s)) if s.success() => {
+                    let _ = tokio::fs::remove_file(&video).await;
+                    let _ = tokio::fs::remove_file(&audio).await;
                 }
                 _ => {
                     return Err(Error::NeedsMux {
@@ -717,26 +831,37 @@ impl Download {
 
     /// Copy segment progress into the shared snapshot and checkpoint it to
     /// disk. Returns the total bytes fetched so far.
+    ///
+    /// `last_saved` is the segment layout already on disk. The write is skipped
+    /// when nothing has changed since it. Comparing the whole layout, not just
+    /// the byte total, also catches a split: it moves a boundary without
+    /// changing `done`, and a stale layout on disk would resume the wrong range.
     async fn publish(
         &self,
         segments: &Arc<Mutex<Vec<Segment>>>,
         total: Option<u64>,
         ranged: bool,
+        last_saved: &mut Option<Vec<Segment>>,
     ) -> Result<u64, Error> {
         let snapshot_segments = segments.lock().expect("segments lock").clone();
         let done: u64 = snapshot_segments.iter().map(|s| s.done).sum();
         self.shared.lock().expect("snapshot lock").done = done;
 
+        if last_saved.as_ref() == Some(&snapshot_segments) {
+            return Ok(done);
+        }
+
         let state = StateFile {
             url: self.url.clone(),
             total,
             ranged,
-            segments: snapshot_segments,
+            segments: snapshot_segments.clone(),
         };
         let json = serde_json::to_vec_pretty(&state)?;
         let tmp = with_suffix(&self.state_path(), ".tmp");
         tokio::fs::write(&tmp, json).await?;
         tokio::fs::rename(&tmp, self.state_path()).await?;
+        *last_saved = Some(snapshot_segments);
         Ok(done)
     }
 
@@ -746,7 +871,16 @@ impl Download {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let saved: StateFile = serde_json::from_slice(&bytes)?;
+        // A corrupt sidecar must not make the download fail on every attempt.
+        // Starting over costs the bytes already fetched, which is cheaper than
+        // a download that can never run.
+        let saved: StateFile = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ignoring unreadable resume state {}: {e}", self.state_path().display());
+                return Ok(None);
+            }
+        };
         // A state file for a different URL must not resume into this file.
         if saved.url != self.url {
             return Ok(None);
@@ -764,6 +898,8 @@ struct Probe {
     /// The headers still safe to send, after any cross-site hop stripped the
     /// sensitive ones.
     headers: Vec<(String, String)>,
+    /// The Content-Type header of the final response, trimmed; empty is `None`.
+    content_type: Option<String>,
 }
 
 /// Ask for bytes 0-0 to learn the size, whether byte ranges work, and where
@@ -821,6 +957,7 @@ async fn probe(
                     ranged: total.is_some(),
                     url: current.to_string(),
                     headers,
+                    content_type: content_type_of(&resp),
                 })
             }
             200 => Ok(Probe {
@@ -828,11 +965,22 @@ async fn probe(
                 ranged: false,
                 url: current.to_string(),
                 headers,
+                content_type: content_type_of(&resp),
             }),
             other => Err(Error::Status(other)),
         };
     }
     Err(Error::TooManyRedirects(MAX_REDIRECTS))
+}
+
+/// The response's Content-Type, trimmed. Empty or non-text values are `None`.
+fn content_type_of(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
 }
 
 /// Parse the total from `bytes 0-0/12345`.
@@ -1032,6 +1180,14 @@ impl Worker {
             return Ok(());
         }
         let from = if self.ranged { segment.resume_offset() } else { 0 };
+        // A non-ranged retry restarts the body at offset 0, so the progress
+        // recorded for the previous attempt no longer describes what is on
+        // disk. Without this reset the counter double-counts and the download
+        // reports more bytes than the file holds. It runs before the FTP branch
+        // too: `fetch_ftp` adds to the same counter.
+        if !self.ranged {
+            self.segments.lock().expect("segments lock")[self.index].done = 0;
+        }
         if self.is_ftp {
             return self.fetch_ftp(url, &segment, from).await;
         }
@@ -1085,13 +1241,6 @@ impl Worker {
 
         let mut file = OpenOptions::new().write(true).open(&self.path).await?;
         file.seek(std::io::SeekFrom::Start(from)).await?;
-        // A non-ranged retry restarts the body at offset 0, so the progress
-        // recorded for the previous attempt no longer describes what is on
-        // disk. Without this reset the counter double-counts and the download
-        // reports more bytes than the file holds.
-        if !self.ranged {
-            self.segments.lock().expect("segments lock")[self.index].done = 0;
-        }
         let mut body = resp.bytes_stream();
         while let Some(chunk) = body.next().await {
             if self.stop.load(Ordering::SeqCst) {
@@ -1178,6 +1327,56 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_transient_statuses_are_retried() {
+        for code in [408, 429, 500, 502, 503, 504, 599] {
+            assert!(Error::Status(code).is_transient(), "{code} should be transient");
+        }
+        for code in [200, 206, 301, 400, 401, 403, 404, 416, 600] {
+            assert!(!Error::Status(code).is_transient(), "{code} should not be transient");
+        }
+        assert!(Error::ShortRead { got: 1, expected: 2 }.is_transient());
+        assert!(!Error::BadUrl("x".into()).is_transient());
+        assert!(!Error::RangeIgnored.is_transient());
+    }
+
+    #[tokio::test]
+    async fn network_failures_are_transient_and_client_errors_are_not() {
+        // A socket that accepts but never answers: the request times out.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let silent_url = format!("http://{}/", silent.local_addr().expect("addr"));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let timeout = client.get(&silent_url).send().await.expect_err("should time out");
+        assert!(Error::Http(timeout).is_transient());
+        drop(silent);
+
+        // A port nothing listens on any more: the connect is refused.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let closed_url = format!("http://{}/", closed.local_addr().expect("addr"));
+        drop(closed);
+        let refused = reqwest::Client::new().get(&closed_url).send().await.expect_err("refused");
+        assert!(Error::Http(refused).is_transient());
+
+        assert!(Error::Ftp(crate::ftp::FtpError::Timeout).is_transient());
+        assert!(Error::Ftp(crate::ftp::FtpError::Io(std::io::Error::other("reset"))).is_transient());
+        assert!(
+            Error::Ftp(crate::ftp::FtpError::Transient { code: 421, text: "busy".into() })
+                .is_transient()
+        );
+        assert!(Error::Ftp(crate::ftp::FtpError::ShortRead { got: 1, expected: 2 }).is_transient());
+        assert!(Error::Media(crate::media::Error::Status(503)).is_transient());
+        assert!(Error::Media(crate::media::Error::Status(429)).is_transient());
+
+        assert!(!Error::Media(crate::media::Error::Status(404)).is_transient());
+        assert!(!Error::Ftp(crate::ftp::FtpError::Permanent { code: 550, text: "no".into() })
+            .is_transient());
+        assert!(!Error::Ftp(crate::ftp::FtpError::BadUrl("x".into())).is_transient());
+        assert!(!Error::Ftp(crate::ftp::FtpError::NoRest).is_transient());
+    }
 
     #[tokio::test]
     async fn a_discarded_download_cannot_re_create_its_own_file() {
@@ -1486,5 +1685,103 @@ mod tests {
         // An open-ended stream has no known tail to hand to anyone.
         let mut segs = segs;
         assert!(split_largest(&mut segs).is_none());
+    }
+
+    /// A scratch directory unique to this test, not yet created.
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tdm-{name}-{}", std::process::id()))
+    }
+
+    /// Serve `content` over HTTP on 127.0.0.1, honouring `Range: bytes=a-b`.
+    /// Returns the URL of the file. The server thread lives until the test
+    /// process exits.
+    fn serve_range_file(content: Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let content = content.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut range = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let line = line.trim_end();
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                            if let Some((a, b)) = v.split_once('-') {
+                                range = Some((a.trim().parse::<usize>().unwrap(), b.trim().parse::<usize>().unwrap()));
+                            }
+                        }
+                    }
+                    let len = content.len();
+                    let (start, end) = range.unwrap_or((0, len - 1));
+                    let body = &content[start..=end];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{len}\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body);
+                });
+            }
+        });
+        format!("http://{addr}/file.bin")
+    }
+
+    #[tokio::test]
+    async fn a_multibyte_url_prefix_is_an_error_not_a_panic() {
+        // Byte 6 falls inside the two-byte `é`, so slicing the prefix panics.
+        let dest = scratch("multibyte").join("x.bin");
+        let handle = Download::new("ftp:/é", dest.clone(), 1);
+        assert!(handle.run().await.is_err(), "a bad URL must fail the run");
+        assert_eq!(handle.snapshot().status, Status::Failed);
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_without_its_data_file_does_not_resume() {
+        // The sidecar claims the whole file is done, but the file itself is
+        // gone. Trusting it would "complete" a download that wrote nothing.
+        let content: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let len = content.len() as u64;
+        let url = serve_range_file(content.clone());
+
+        let dir = scratch("no-data-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("file.bin");
+        let _ = std::fs::remove_file(&dest);
+        let state = StateFile {
+            url: url.clone(),
+            total: Some(len),
+            ranged: true,
+            segments: vec![Segment { start: 0, end: len - 1, done: len, complete: true }],
+        };
+        std::fs::write(with_suffix(&dest, ".tdmstate"), serde_json::to_vec(&state).unwrap()).unwrap();
+
+        Download::new(url, dest.clone(), 1).run().await.expect("download");
+        assert_eq!(std::fs::read(&dest).unwrap(), content, "the bytes were fetched from zero");
+        assert!(!with_suffix(&dest, ".tdmstate").exists(), "a finished download drops its sidecar");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_sidecar_is_ignored_so_the_download_starts_fresh() {
+        let dir = scratch("garbage-sidecar");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("g.bin");
+        std::fs::write(with_suffix(&dest, ".tdmstate"), b"\x00 not json at all {").unwrap();
+
+        let saved = Download::new("http://x/y", dest.clone(), 1).load_state().await;
+        assert!(matches!(saved, Ok(None)), "garbage must read as no state, not an error");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
