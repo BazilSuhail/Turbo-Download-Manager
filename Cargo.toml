@@ -47,7 +47,7 @@ description = "Fast, segmented download manager with browser capture"
 long-description = "Turbo Download Manager splits downloads into parallel segments, resumes interrupted transfers, schedules queues and captures downloads from Chrome, Edge, Brave, Vivaldi and Firefox through its companion extension."
 license-file = "LICENSE-MIT"
 before-packaging-command = "cargo build --release"
-icons = ["packaging/icons/32x32.png", "packaging/icons/128x128.png", "packaging/icons/256x256.png", "packaging/icons/icon.ico", "packaging/icons/icon.icns"]
+icons = ["packaging/icons/32x32.png", "packaging/icons/128x128.png", "packaging/icons/256x256.png", "packaging/icons/icon.ico"]
 # The browser extension folders (built by build.rs) ship beside the app, at
 # <install dir>/extension/dist/{chrome,firefox}, which is where the app looks.
 resources = ["extension/dist"]
@@ -69,10 +69,6 @@ custom-action-refs = ["TdmRegisterHost", "TdmUnregisterHost"]
 desktop-template = "packaging/linux/tdm.desktop"
 section = "net"
 files = { "packaging/linux/app.tdm.metainfo.xml" = "usr/share/metainfo/app.tdm.metainfo.xml" }
-
-[package.metadata.packager.macos]
-minimum-system-version = "11.0"
-info-plist-path = "packaging/macos/Info.plist"
 
 # .rpm comes from cargo-generate-rpm (cargo-packager has no rpm target):
 # `cargo generate-rpm` after `cargo build --release`.

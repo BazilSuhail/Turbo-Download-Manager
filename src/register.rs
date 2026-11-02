@@ -2,7 +2,7 @@
 //!
 //! A browser finds a native host through a JSON manifest. On Windows the
 //! manifest can live anywhere and a per-user registry key names it; on Linux
-//! and macOS the manifest must sit in a fixed per-browser directory. Both are
+//! the manifest must sit in a fixed per-browser directory. Both are
 //! per-user, so nothing here needs elevation or affects other accounts.
 //!
 //! The manifest lists the extensions allowed to connect, so an unrelated
@@ -76,16 +76,6 @@ impl Browser {
                 .find(|p| p.is_file())
                 .ok_or(Error::NotInstalled(self.label()))?;
             std::process::Command::new(exe).arg(url).spawn()?;
-        } else if cfg!(target_os = "macos") {
-            let app = match self {
-                Browser::Chrome => "Google Chrome",
-                Browser::Edge => "Microsoft Edge",
-                Browser::Brave => "Brave Browser",
-                Browser::Vivaldi => "Vivaldi",
-                Browser::Opera => "Opera",
-                Browser::Firefox => "Firefox",
-            };
-            std::process::Command::new("open").args(["-a", app, url]).spawn()?;
         } else {
             let command = match self {
                 Browser::Chrome => "google-chrome",
@@ -151,21 +141,14 @@ impl Browser {
                 Browser::Firefox => roaming.join("Mozilla").join("Firefox"),
             });
         }
-        let mac = cfg!(target_os = "macos");
-        let support = if mac { home.join("Library").join("Application Support") } else { home.join(".config") };
+        let config = home.join(".config");
         Some(match self {
-            Browser::Chrome => support.join(if mac { "Google/Chrome" } else { "google-chrome" }),
-            Browser::Edge => support.join(if mac { "Microsoft Edge" } else { "microsoft-edge" }),
-            Browser::Brave => support.join("BraveSoftware/Brave-Browser"),
-            Browser::Vivaldi => support.join(if mac { "Vivaldi" } else { "vivaldi" }),
-            Browser::Opera => support.join(if mac { "com.operasoftware.Opera" } else { "opera" }),
-            Browser::Firefox => {
-                if mac {
-                    support.join("Firefox")
-                } else {
-                    home.join(".mozilla")
-                }
-            }
+            Browser::Chrome => config.join("google-chrome"),
+            Browser::Edge => config.join("microsoft-edge"),
+            Browser::Brave => config.join("BraveSoftware/Brave-Browser"),
+            Browser::Vivaldi => config.join("vivaldi"),
+            Browser::Opera => config.join("opera"),
+            Browser::Firefox => home.join(".mozilla"),
         })
     }
 
@@ -276,7 +259,7 @@ fn ids_in_manifest(json: &str) -> Vec<String> {
 /// plus the bundled Firefox add-on. Always rewrites the registry keys, so it
 /// repairs a registration that was removed by hand.
 ///
-/// Returns the Chromium manifest path (on Linux/macOS, the first one written).
+/// Returns the Chromium manifest path (on Linux, the first one written).
 pub fn install(extension_ids: &[String]) -> Result<PathBuf, Error> {
     if extension_ids.is_empty() {
         return install_with(&[CHROME_EXTENSION_ID.to_owned()], true);
@@ -441,48 +424,31 @@ struct Target {
     firefox: bool,
 }
 
-/// Every per-user manifest directory on Linux (`macos == false`) or macOS.
+/// Every per-user manifest directory on Linux.
 ///
 /// shortcut: Snap/Flatpak browsers keep their config inside the sandbox
 /// (`~/snap/...`, `~/.var/app/...`) and are not covered; add their paths when
 /// someone asks, they also need the sandbox's native-messaging portal.
 #[cfg_attr(windows, allow(dead_code))]
-fn unix_targets(home: &Path, macos: bool) -> Vec<Target> {
+fn unix_targets(home: &Path) -> Vec<Target> {
     let chromium = |profile: PathBuf| Target {
         dir: profile.join("NativeMessagingHosts"),
         profile,
         firefox: false,
     };
-    if macos {
-        let support = home.join("Library").join("Application Support");
-        vec![
-            chromium(support.join("Google").join("Chrome")),
-            chromium(support.join("Chromium")),
-            chromium(support.join("Microsoft Edge")),
-            chromium(support.join("BraveSoftware").join("Brave-Browser")),
-            chromium(support.join("Vivaldi")),
-            // Firefox keeps profiles under `Firefox` but reads hosts from `Mozilla`.
-            Target {
-                profile: support.join("Firefox"),
-                dir: support.join("Mozilla").join("NativeMessagingHosts"),
-                firefox: true,
-            },
-        ]
-    } else {
-        let config = home.join(".config");
-        vec![
-            chromium(config.join("google-chrome")),
-            chromium(config.join("chromium")),
-            chromium(config.join("microsoft-edge")),
-            chromium(config.join("BraveSoftware").join("Brave-Browser")),
-            chromium(config.join("vivaldi")),
-            Target {
-                profile: home.join(".mozilla"),
-                dir: home.join(".mozilla").join("native-messaging-hosts"),
-                firefox: true,
-            },
-        ]
-    }
+    let config = home.join(".config");
+    vec![
+        chromium(config.join("google-chrome")),
+        chromium(config.join("chromium")),
+        chromium(config.join("microsoft-edge")),
+        chromium(config.join("BraveSoftware").join("Brave-Browser")),
+        chromium(config.join("vivaldi")),
+        Target {
+            profile: home.join(".mozilla"),
+            dir: home.join(".mozilla").join("native-messaging-hosts"),
+            firefox: true,
+        },
+    ]
 }
 
 #[cfg(not(windows))]
@@ -492,7 +458,7 @@ mod platform {
     fn targets() -> Result<Vec<Target>, Error> {
         let home = dirs::home_dir()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
-        Ok(unix_targets(&home, cfg!(target_os = "macos")))
+        Ok(unix_targets(&home))
     }
 
     pub fn install(chromium: &str, firefox: &str, _force: bool) -> Result<PathBuf, Error> {
@@ -518,42 +484,23 @@ mod platform {
             .unwrap_or_default()
     }
 
-    /// A login item: an XDG autostart entry on Linux, a LaunchAgent on macOS.
+    /// A login item: an XDG autostart entry.
     fn autostart_path(home: &Path) -> PathBuf {
-        if cfg!(target_os = "macos") {
-            home.join("Library/LaunchAgents/app.tdm.plist")
-        } else {
-            home.join(".config/autostart/tdm.desktop")
-        }
+        home.join(".config/autostart/tdm.desktop")
     }
 
     pub fn set_autostart(exe: &Path, on: bool) -> Result<(), Error> {
         let Some(home) = dirs::home_dir() else { return Ok(()) };
-        let (path, body) = if cfg!(target_os = "macos") {
-            (
-                autostart_path(&home),
-                format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\"><dict><key>Label</key><string>app.tdm</string><key>ProgramArguments</key><array><string>{}</string></array><key>RunAtLoad</key><true/></dict></plist>
-",
-                    exe.display()
-                ),
-            )
-        } else {
-            (
-                autostart_path(&home),
-                format!(
-                    "[Desktop Entry]
+        let path = autostart_path(&home);
+        let body = format!(
+            "[Desktop Entry]
 Type=Application
 Name=Turbo Download Manager
 Exec=\"{}\"
 X-GNOME-Autostart-enabled=true
 ",
-                    exe.display()
-                ),
-            )
-        };
+            exe.display()
+        );
         if !on {
             return Ok(remove_if_present(&path)?);
         }
@@ -657,7 +604,7 @@ mod tests {
     #[test]
     fn linux_targets_cover_each_browser_under_the_home_dir() {
         let home = Path::new("/home/u");
-        let t = unix_targets(home, false);
+        let t = unix_targets(home);
         for want in [
             "/home/u/.config/google-chrome/NativeMessagingHosts",
             "/home/u/.config/chromium/NativeMessagingHosts",
@@ -675,20 +622,6 @@ mod tests {
             assert!(t.dir.starts_with(&t.profile), "{:?}", t);
             assert_eq!(t.firefox, t.profile.ends_with(".mozilla"));
         }
-    }
-
-    #[test]
-    fn macos_targets_use_application_support() {
-        let home = Path::new("/Users/u");
-        let t = unix_targets(home, true);
-        let support = Path::new("/Users/u/Library/Application Support");
-        assert!(t.iter().all(|t| t.dir.starts_with(support)));
-        assert!(t.iter().any(|t| t.dir == support.join("Google/Chrome/NativeMessagingHosts")));
-        assert!(t.iter().any(|t| t.dir == support.join("Microsoft Edge/NativeMessagingHosts")));
-        let ff: Vec<_> = t.iter().filter(|t| t.firefox).collect();
-        assert_eq!(ff.len(), 1);
-        assert_eq!(ff[0].dir, support.join("Mozilla/NativeMessagingHosts"));
-        assert_eq!(ff[0].profile, support.join("Firefox"));
     }
 
     #[test]

@@ -172,7 +172,6 @@ impl Default for GeneralSettings {
             launch_on_startup: false,
             monitor_clipboard: false,
             capture_browsers: [
-                "Apple Safari",
                 "Google Chrome",
                 "Internet Explorer",
                 "Microsoft Edge",
@@ -442,10 +441,7 @@ fn system_proxy() -> Option<String> {
 }
 
 /// The conventional proxy variables, which desktop environments and shells
-/// on Linux and macOS export.
-///
-/// shortcut: macOS GUI apps launched from Finder often see no proxy variables;
-/// parse `scutil --proxy` when a Mac user reports it.
+/// on Linux export.
 #[cfg(not(windows))]
 fn system_proxy() -> Option<String> {
     proxy_from_env(|k| std::env::var(k).ok())
@@ -855,7 +851,7 @@ mod tests {
         assert_eq!(s.options_tab, OptionsTab::General);
         assert_eq!(s.connection, ConnectionSettings::default());
         assert_eq!(s.proxy.mode, ProxyMode::None);
-        assert_eq!(s.general.capture_browsers.len(), 7);
+        assert_eq!(s.general.capture_browsers.len(), 6);
         assert!(s.downloads.show_start_dialog);
     }
 

@@ -1,5 +1,5 @@
 # Release: push a tag such as v1.1.0 and this builds the installers for
-# Windows, Linux and macOS, then publishes a GitHub release.
+# Windows and Linux, then publishes a GitHub release.
 #
 #   node scripts/bump-version.mjs 1.1.0
 #   git commit -am "chore: release v1.1.0"
@@ -65,16 +65,9 @@ jobs:
           - name: windows
             os: windows-latest
             formats: nsis,wix
-            # Installers from cargo-packager, both written to target/release.
-            globs: target/release/*-setup.exe target/release/*.msi
           - name: linux
             os: ubuntu-22.04
             formats: deb,appimage
-            globs: target/release/*.deb target/release/*.AppImage target/generate-rpm/*.rpm
-          - name: macos
-            os: macos-latest
-            formats: app,dmg
-            globs: target/release/*.dmg
     steps:
       - uses: actions/checkout@v4
 
@@ -113,13 +106,11 @@ jobs:
       - name: Collect installers
         shell: bash
         run: |
-          shopt -s nullglob
           mkdir -p dist
-          for pattern in ${{ matrix.globs }}; do
-            for file in $pattern; do
-              cp "$file" dist/
-            done
-          done
+          # find + NUL-separated paths, so product names with spaces are copied intact.
+          find target/release target/generate-rpm -maxdepth 1 -type f \
+            \( -name '*-setup.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) \
+            -print0 | xargs -0 -r -I{} cp "{}" dist/
           if [ -z "$(ls -A dist)" ]; then
             echo "No installers were produced for ${{ matrix.name }}." >&2
             exit 1
@@ -135,6 +126,10 @@ jobs:
   publish:
     name: Publish GitHub release
     needs: [check-version, build]
+    # Publish whatever builds succeeded. A platform whose build failed is listed
+    # in the release notes instead of blocking the whole release. Skipped only if
+    # the version check failed or the run was cancelled.
+    if: ${{ always() && needs.check-version.result == 'success' && needs.build.result != 'cancelled' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -146,6 +141,15 @@ jobs:
           pattern: installers-*
           path: release
           merge-multiple: true
+
+      - name: Require at least one installer
+        shell: bash
+        run: |
+          if [ -z "$(ls -A release 2>/dev/null)" ]; then
+            echo "No platform produced an installer, so there is nothing to publish." >&2
+            exit 1
+          fi
+          ls -la release
 
       - name: Checksums
         shell: bash
@@ -163,6 +167,13 @@ jobs:
           details=$(grep -m1 '^long-description' Cargo.toml | cut -d'"' -f2)
           echo "title=$product v$VERSION" >> "$GITHUB_OUTPUT"
 
+          # Platforms whose installers are missing, so the notes can say so.
+          missing=""
+          ls release/*-setup.exe release/*.msi >/dev/null 2>&1 || missing="$missing Windows,"
+          ls release/*.deb release/*.AppImage release/*.rpm >/dev/null 2>&1 || missing="$missing Linux,"
+          missing="${missing%,}"
+          echo "missing=${missing# }" >> "$GITHUB_OUTPUT"
+
           previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
           if [ -n "$previous" ]; then
             changes=$(git log --no-merges --pretty='- %s (%h)' "$previous..$GITHUB_REF_NAME")
@@ -177,6 +188,10 @@ jobs:
             echo
             echo "# $product v$VERSION"
             echo
+            if [ -n "$missing" ]; then
+              echo "> **Not in this release:** $missing. Those builds failed. Check the Actions run for the error."
+              echo
+            fi
             echo "$summary"
             echo
             echo "$details"
@@ -193,7 +208,6 @@ jobs:
                 *.deb)       what="Debian / Ubuntu package" ;;
                 *.rpm)       what="Fedora / openSUSE package" ;;
                 *.AppImage)  what="Linux portable app (run directly)" ;;
-                *.dmg)       what="macOS disk image" ;;
                 SHA256SUMS.txt) what="SHA-256 checksums for every file" ;;
                 *)           what="" ;;
               esac

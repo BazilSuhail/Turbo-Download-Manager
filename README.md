@@ -5,14 +5,14 @@
 <h1 align="center">Turbo Download Manager (TDM)</h1>
 
 <p align="center">
-  A fast, segmented download manager for Windows, macOS and Linux,<br>
+  A fast, segmented download manager for Windows and Linux,<br>
   with browser capture for Chrome, Edge, Brave, Vivaldi, Opera and Firefox.
 </p>
 
 <p align="center">
   <a href="LICENSE-MIT"><img alt="Licence: MIT OR Apache-2.0" src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-orange?style=flat-square"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/Rust-2024%20edition-orange?style=flat-square&logo=rust&logoColor=white">
-  <img alt="Platforms" src="https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square">
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-lightgrey?style=flat-square">
   <img alt="Browsers" src="https://img.shields.io/badge/browsers-Chrome%20%7C%20Edge%20%7C%20Brave%20%7C%20Firefox-blue?style=flat-square">
   <img alt="Status" src="https://img.shields.io/badge/status-pre--release-yellow?style=flat-square">
 </p>
@@ -225,7 +225,7 @@ at the time of writing; check the vendor's site for current pricing and features
   <tr><td>Price</td><td>Free</td><td>Paid (free trial)</td></tr>
   <tr><td>Licence</td><td>MIT OR Apache-2.0, open source</td><td>Proprietary, closed source</td></tr>
   <tr><td>Windows</td><td>Yes</td><td>Yes</td></tr>
-  <tr><td>macOS and Linux</td><td>Yes (packages built from source)</td><td>No</td></tr>
+  <tr><td>Linux</td><td>Yes (packages built from source)</td><td>No</td></tr>
   <tr><td>Multi-connection downloads</td><td>Yes, configurable segments per file</td><td>Yes, dynamic segmentation</td></tr>
   <tr><td>Pause and resume</td><td>Yes</td><td>Yes</td></tr>
   <tr><td>FTP</td><td>Yes</td><td>Yes</td></tr>
@@ -248,7 +248,7 @@ at the time of writing; check the vendor's site for current pricing and features
 > [!NOTE]
 > TDM is young. IDM has more years of use, more browser integrations and features such as the site
 > grabber and antivirus scanning that TDM does not have yet. TDM's advantages are that it is free,
-> open source, and runs on macOS and Linux as well as Windows.
+> open source, and runs on Linux as well as Windows.
 
 ---
 
@@ -288,11 +288,6 @@ database to run.
     <td>Windows 10 / 11 (x64)</td>
     <td><code>tdm_&lt;version&gt;_x64-setup.exe</code><br>or <code>tdm_&lt;version&gt;_x64_en-US.msi</code></td>
     <td>The setup file installs for the current user only, with no administrator prompt.</td>
-  </tr>
-  <tr>
-    <td>macOS 12+</td>
-    <td><code>.dmg</code></td>
-    <td>Drag TDM into Applications.</td>
   </tr>
   <tr>
     <td>Linux (x64)</td>
@@ -460,17 +455,17 @@ field uses (letters, Space, arrows) go to the field, so they do not act on the l
   <tr>
     <th align="left">Item</th>
     <th align="left">Windows</th>
-    <th align="left">macOS and Linux</th>
+    <th align="left">Linux</th>
   </tr>
   <tr>
     <td>Settings (<code>settings.json</code>)</td>
     <td><code>%APPDATA%\tdm\</code></td>
-    <td><code>~/.config/tdm/</code> on Linux, <code>~/Library/Application Support/tdm/</code> on macOS</td>
+    <td><code>~/.config/tdm/</code></td>
   </tr>
   <tr>
     <td>Download list (<code>downloads.json</code>)</td>
     <td><code>%APPDATA%\tdm\</code></td>
-    <td><code>~/.config/tdm/</code> on Linux, <code>~/Library/Application Support/tdm/</code> on macOS</td>
+    <td><code>~/.config/tdm/</code></td>
   </tr>
   <tr>
     <td>Resume state</td>
@@ -484,7 +479,7 @@ field uses (letters, Space, arrows) go to the field, so they do not act on the l
   <tr>
     <td>Start at login</td>
     <td>Per-user <code>Run</code> registry value</td>
-    <td>Autostart desktop entry (Linux) or LaunchAgent (macOS)</td>
+    <td>Autostart desktop entry (Linux)</td>
   </tr>
 </table>
 
@@ -592,7 +587,6 @@ node extension/build.mjs         # extension/dist/chrome and extension/dist/fire
 
 cargo install cargo-packager --locked
 cargo packager --release --formats nsis,wix      # Windows installers
-cargo packager --release --formats app,dmg       # macOS
 cargo packager --release --formats deb,appimage  # Linux
 ```
 
@@ -633,7 +627,7 @@ For a manual check of the browser extension, follow [`extension/selftest.md`](ex
 ## Releases and CI
 
 - **CI** (`.github/workflows/ci.yml`) builds the app in release mode on every push and pull request,
-  on Windows, Ubuntu 22.04 and macOS.
+  on Windows and Ubuntu 22.04.
 - **Release** (`.github/workflows/release.yml`) runs when you push a tag that starts with `v`, such as
   `v1.0.0`. The tag must match `version` in `Cargo.toml`, or the release stops. Tags with a hyphen
   (such as `v1.1.0-beta.1`) are published as pre-releases. See [docs/RELEASING.md](docs/RELEASING.md)
@@ -643,7 +637,6 @@ Each release builds these installers and publishes them as a GitHub release:
 
 - Windows: NSIS setup `.exe` and `.msi`
 - Linux: `.deb`, `.AppImage` and `.rpm`
-- macOS: `.dmg`
 
 ---
 

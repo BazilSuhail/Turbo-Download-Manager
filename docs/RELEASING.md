@@ -20,7 +20,6 @@ A pre-release has a hyphen, for example `1.1.0-beta.1`. Pre-releases are publish
 2. The **build** job builds the installers on three systems:
    - Windows: `*-setup.exe` (NSIS) and `*.msi` (WiX)
    - Linux: `*.deb`, `*.AppImage`, and `*.rpm`
-   - macOS: `*.dmg`
 3. The **publish** job collects the installers, writes `SHA256SUMS.txt`, creates the release notes, and publishes a GitHub release titled `Turbo Download Manager vX.Y.Z`. The notes list the commits since the previous tag.
 
 Each platform is built on its own runner, so the release contains one installer per platform.
@@ -128,9 +127,7 @@ The browser protocol version (`EXT_VERSION` in `extension/background.js`) is sep
 The release currently builds for:
 - Windows (64-bit)
 - Linux (64-bit, Ubuntu 22.04)
-- macOS (Apple Silicon)
 
-Intel Macs are not covered yet. Add a macOS Intel job to `.github/workflows/release.yml` to cover them.
 
 ## Requirements for the build machine
 

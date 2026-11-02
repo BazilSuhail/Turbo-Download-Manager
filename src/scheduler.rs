@@ -244,8 +244,8 @@ pub fn local_now() -> (Weekday, TimeOfDay) {
 #[cfg(unix)]
 pub fn local_now() -> (Weekday, TimeOfDay) {
     use std::ffi::{c_char, c_int, c_long};
-    // The POSIX prefix every libc we target (glibc, musl, macOS) shares,
-    // followed by the BSD/GNU extras both glibc and macOS append. The buffer
+    // The POSIX prefix every libc we target (glibc, musl) shares,
+    // followed by the BSD/GNU extras glibc appends. The buffer
     // must be at least as large as the real `struct tm`, which this is.
     #[repr(C)]
     struct Tm {
@@ -263,7 +263,7 @@ pub fn local_now() -> (Weekday, TimeOfDay) {
     }
     unsafe extern "C" {
         fn tzset();
-        // `time_t` is `long` on every 64-bit unix and on 32-bit glibc/macOS.
+        // `time_t` is `long` on every 64-bit unix and on 32-bit glibc.
         fn localtime_r(t: *const c_long, out: *mut Tm) -> *mut Tm;
     }
     let now = std::time::SystemTime::now()

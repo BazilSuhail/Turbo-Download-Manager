@@ -30,7 +30,6 @@ cargo install cargo-packager --locked
 | OS      | Command                                               | Output (in `target/release/`) |
 |---------|-------------------------------------------------------|-------------------------------|
 | Windows | `cargo packager --release --formats nsis,wix`         | `*-setup.exe`, `*.msi`        |
-| macOS   | `cargo packager --release --formats app,dmg`          | `*.app`, `*.dmg`              |
 | Linux   | `cargo packager --release --formats deb,appimage`     | `*.deb`, `*.AppImage`         |
 | Linux   | `cargo install cargo-generate-rpm && cargo generate-rpm` (after `cargo build --release`) | `target/generate-rpm/*.rpm` |
 
@@ -53,13 +52,12 @@ uninstall, as the installing user. A per-machine MSI therefore only cleans up
 that user's manifests; other accounts keep theirs until they run TDM again
 or remove it themselves.
 
-### Linux and macOS
+### Linux
 
 There is nothing to run as root at install time: the app writes the
 per-user native-messaging manifests itself on first start (for each browser
 whose profile directory exists). `linux/tdm.desktop` and
-`linux/app.tdm.metainfo.xml` (AppStream) ship in the packages;
-`macos/Info.plist` is merged into the generated bundle plist.
+`linux/app.tdm.metainfo.xml` (AppStream) ship in the packages.
 
 ### Art
 
@@ -79,5 +77,4 @@ Manifests: Windows keeps them in `%APPDATA%\tdm` and points
 BraveSoftware\Brave-Browser, Vivaldi, Mozilla}\NativeMessagingHosts\com.tdm.host`
 at them (Opera reads Chrome's key). Linux writes into
 `~/.config/{google-chrome, chromium, microsoft-edge, BraveSoftware/Brave-Browser, vivaldi}/NativeMessagingHosts`
-and `~/.mozilla/native-messaging-hosts`; macOS into the matching
-`~/Library/Application Support/...` directories.
+and `~/.mozilla/native-messaging-hosts`.

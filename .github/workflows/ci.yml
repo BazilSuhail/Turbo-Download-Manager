@@ -1,4 +1,4 @@
-# CI: builds the app on every push and pull request, on Windows, Linux and macOS.
+# CI: builds the app on every push and pull request, on Windows and Linux.
 # Release packaging lives in release.yml.
 
 name: CI
@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04, macos-latest]
+        os: [windows-latest, ubuntu-22.04]
     steps:
       - uses: actions/checkout@v4
 

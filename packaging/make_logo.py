@@ -5,7 +5,7 @@ Run from the project root after changing the logo:
     python packaging/make_logo.py
 
 Writes:
-  packaging/icons/      32, 128, 256 and 512 px PNG, icon.ico, icon.icns
+  packaging/icons/      32, 128, 256 and 512 px PNG, icon.ico
   packaging/windows/    installer bitmaps (24-bit BMP on a dark background)
   extension/icons/      toolbar icons, 16, 32, 48 and 128 px
   assets/               raw RGBA for the window icon (64 px) and header mark (32 px)
@@ -53,7 +53,6 @@ def main() -> None:
         name = "icon.png" if px == 512 else f"{px}x{px}.png"
         sized(master, px).save(icons / name)
     big.save(icons / "icon.ico", format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (256, 256)])
-    big.save(icons / "icon.icns", format="ICNS", sizes=[(16, 16), (32, 32), (128, 128), (256, 256), (512, 512)])
 
     windows = ROOT / "packaging" / "windows"
     for name, (w, h, logo_px) in BITMAPS.items():

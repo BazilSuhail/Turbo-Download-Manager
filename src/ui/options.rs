@@ -1121,7 +1121,7 @@ mod tests {
         update(&mut s, Message::CaptureBrowser(1, false));
         assert!(!s.general.capture_browsers[1].1);
         update(&mut s, Message::CaptureBrowser(999, false));
-        assert_eq!(s.general.capture_browsers.len(), 7);
+        assert_eq!(s.general.capture_browsers.len(), 6);
     }
 
     #[test]

@@ -61,8 +61,7 @@ pub struct DownloadList {
 
 /// The per-user directory for everything we keep: settings, the download
 /// list, the IPC endpoint and the native-host manifests. That is
-/// `%APPDATA%\tdm`, `~/.config/tdm` or
-/// `~/Library/Application Support/tdm`; `./tdm` only when the OS
+/// `%APPDATA%\tdm` or `~/.config/tdm`; `./tdm` only when the OS
 /// reports no config directory at all (no `HOME`).
 pub fn app_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("tdm")
