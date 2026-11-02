@@ -1,11 +1,15 @@
-# Release: push a tag such as v0.1.0 and this builds the installers for
+# Release: push a tag such as v1.1.0 and this builds the installers for
 # Windows, Linux and macOS, then publishes a GitHub release.
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+#   node scripts/bump-version.mjs 1.1.0
+#   git commit -am "chore: release v1.1.0"
+#   git tag v1.1.0 && git push origin main v1.1.0
 #
-# The tag must match `version` in Cargo.toml. Tags with a hyphen (v0.2.0-beta.1)
-# are published as pre-releases. The release title and description come from
-# Cargo.toml, and the notes list every commit since the previous tag.
+# The tag must match the version in Cargo.toml, the extension manifest and the
+# Linux AppStream file; the check-version job stops the release if they differ.
+# Tags with a hyphen (v1.2.0-beta.1) are published as pre-releases. The release
+# title and description come from Cargo.toml, and the notes list every commit
+# since the previous tag. See docs/RELEASING.md.
 
 name: Release
 
@@ -35,6 +39,15 @@ jobs:
           cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           if [ "$tag" != "$cargo_version" ]; then
             echo "Tag v$tag does not match Cargo.toml version $cargo_version." >&2
+            exit 1
+          fi
+          ext_version=$(node -p "require('./extension/manifest.json').version")
+          if [ "$tag" != "$ext_version" ]; then
+            echo "Tag v$tag does not match extension/manifest.json version $ext_version." >&2
+            exit 1
+          fi
+          if ! grep -q "<release version=\"$tag\"" packaging/linux/app.tdm.metainfo.xml; then
+            echo "packaging/linux/app.tdm.metainfo.xml has no <release version=\"$tag\"> entry." >&2
             exit 1
           fi
           if [[ "$tag" == *-* ]]; then pre=true; else pre=false; fi

@@ -1,6 +1,6 @@
 [package]
 name = "tdm"
-version = "0.2.0"
+version = "1.0.0"
 authors = ["Bazil Suhail"]
 edition = "2024"
 description = "Turbo Download Manager: a fast, segmented download manager with browser capture"

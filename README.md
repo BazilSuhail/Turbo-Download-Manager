@@ -635,8 +635,9 @@ For a manual check of the browser extension, follow [`extension/selftest.md`](ex
 - **CI** (`.github/workflows/ci.yml`) builds the app in release mode on every push and pull request,
   on Windows, Ubuntu 22.04 and macOS.
 - **Release** (`.github/workflows/release.yml`) runs when you push a tag that starts with `v`, such as
-  `v0.2.0`. The tag must match `version` in `Cargo.toml`, or the release stops. Tags with a hyphen
-  (such as `v0.2.0-beta.1`) are published as pre-releases.
+  `v1.0.0`. The tag must match `version` in `Cargo.toml`, or the release stops. Tags with a hyphen
+  (such as `v1.1.0-beta.1`) are published as pre-releases. See [docs/RELEASING.md](docs/RELEASING.md)
+  for the full step-by-step guide.
 
 Each release builds these installers and publishes them as a GitHub release:
 
