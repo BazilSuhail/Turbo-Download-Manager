@@ -2340,17 +2340,17 @@ impl App {
         // Each dialog: its content, what dismisses it, its maximum width, and
         // whether its content scrolls.
         let dialog = if self.type_prompt.is_some() {
-            Some((self.type_dialog(&p), Message::TypeKeep, 560.0, false))
+            Some((self.type_dialog(&p), Message::TypeKeep, 560.0, true))
         } else if self.grab.is_some() {
-            Some((self.grab_dialog(&p), Message::GrabClose, 560.0, false))
+            Some((self.grab_dialog(&p), Message::GrabClose, 560.0, true))
         } else if !self.prompts.is_empty() {
             Some((self.capture_dialog(&p), Message::CaptureCancel, 560.0, true))
         } else if self.verify.is_some() {
-            Some((self.verify_dialog(&p), Message::CloseVerify, 560.0, false))
+            Some((self.verify_dialog(&p), Message::CloseVerify, 560.0, true))
         } else if self.batch.is_some() {
-            Some((self.batch_dialog(&p), Message::BatchClose, 560.0, false))
+            Some((self.batch_dialog(&p), Message::BatchClose, 560.0, true))
         } else if self.confirm_delete.is_some() {
-            Some((self.delete_dialog(&p), Message::CancelDelete, 480.0, false))
+            Some((self.delete_dialog(&p), Message::CancelDelete, 480.0, true))
         } else if self.settings_open {
             Some((self.options_dialog(), Message::SettingsOpen(false), 720.0, false))
         } else if self.browser_guide {
@@ -3027,7 +3027,14 @@ impl App {
         // screen. It fills up to `max_w`, then stays centred. A scrolling
         // dialog takes the window's height, so its content scrolls inside it.
         let content: Element<'a, Message> = if scroll {
-            scrollable(content).height(Length::Fill).into()
+            // Shrink, not Fill: a Fill child makes the whole card fill the window.
+            // The centred wrapper already caps the card at the window height, so a
+            // tall dialog scrolls inside it and a short one fits its content.
+            // The bar's spacing keeps it beside the content, not over it.
+            scrollable(content)
+                .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().spacing(4)))
+                .height(Length::Shrink)
+                .into()
         } else {
             content
         };
@@ -3054,13 +3061,19 @@ impl App {
             ]
             .spacing(8)
             .align_y(Alignment::Center),
-            text(entry.name.clone()).size(13).font(bold()).wrapping(text::Wrapping::WordOrGlyph),
+            tip_long(
+                text(middle_ellipsis(&entry.name, 48)).size(13).font(bold()).wrapping(text::Wrapping::None),
+                entry.name.clone(),
+            ),
             text(format!("The content is {}.", t.kind.label())).size(13).wrapping(text::Wrapping::WordOrGlyph),
         ]
         .spacing(14)
         .max_width(440);
         if let Some(ct) = &t.content_type {
-            body = body.push(text(format!("The server said it was {ct}.")).size(12).color(p.muted));
+            body = body.push(tip_long(
+                text(format!("The server said it was {}.", middle_ellipsis(ct, 36))).size(12).color(p.muted),
+                ct.clone(),
+            ));
         }
         if entry.scanning {
             body = body.push(text("Renaming is available once the virus scan finishes.").size(12).color(p.muted));
@@ -3105,7 +3118,12 @@ impl App {
             let finished = entry.snapshot.status == Status::Finished;
             return column![
                 row![glyph(Icon::Delete, 20.0, p.danger), text("Delete download").size(16).font(bold())].spacing(8).align_y(Alignment::Center),
-                text(format!("Remove \u{201c}{}\u{201d} from the list?", entry.name)).size(13).wrapping(text::Wrapping::WordOrGlyph),
+                tip_long(
+                    text(format!("Remove \u{201c}{}\u{201d} from the list?", middle_ellipsis(&entry.name, 34)))
+                        .size(13)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                    entry.name.clone(),
+                ),
                 checkbox(confirm.also_delete_file)
                     .label(if finished {
                         "Also delete the file from disk"
@@ -3130,7 +3148,10 @@ impl App {
         let typed_ok_now = typed_ok(n, &confirm.typed);
         let mut names = column![].spacing(3);
         for e in entries.iter().take(5) {
-            names = names.push(text(middle_ellipsis(&e.name, 56)).size(13).wrapping(text::Wrapping::None));
+            names = names.push(tip_long(
+                text(middle_ellipsis(&e.name, 52)).size(13).wrapping(text::Wrapping::None),
+                e.name.clone(),
+            ));
         }
         if entries.len() > 5 {
             names = names.push(text(format!("and {} more", entries.len() - 5)).size(12).color(p.muted));
@@ -3192,20 +3213,37 @@ impl App {
 
     fn batch_dialog(&self, p: &Palette) -> Element<'_, Message> {
         let Some(b) = &self.batch else { return space(Length::Shrink, Length::Shrink).into() };
-        let (summary, colour, ready) = match &b.links {
-            Ok(v) if v.is_empty() => ("One link per line. Use [001-120] or [a-z] for ranges.".to_owned(), p.muted, false),
-            Ok(v) if v.len() == 1 => (format!("1 link: {}", middle_ellipsis(&v[0], 40)), p.muted, true),
-            Ok(v) => (
-                format!(
-                    "{} links: {}  \u{2026}  {}",
-                    v.len(),
-                    middle_ellipsis(&v[0], 40),
-                    middle_ellipsis(&v[v.len() - 1], 40)
-                ),
-                p.muted,
-                true,
-            ),
-            Err(e) => (e.to_string(), p.danger, false),
+        // `summary` is what shows; `full` is the same text untruncated, for the tooltip.
+        let failed = b.links.is_err();
+        let (summary, full, colour, ready) = match &b.links {
+            Ok(v) if v.is_empty() => {
+                let s = "One link per line. Use [001-120] or [a-z] for ranges.".to_owned();
+                (s.clone(), s, p.muted, false)
+            }
+            Ok(v) if v.len() == 1 => (format!("1 link: {}", middle_ellipsis(&v[0], 40)), format!("1 link: {}", v[0]), p.muted, true),
+            Ok(v) => {
+                let last = &v[v.len() - 1];
+                (
+                    format!(
+                        "{} links: {}  \u{2026}  {}",
+                        v.len(),
+                        middle_ellipsis(&v[0], 26),
+                        middle_ellipsis(last, 26)
+                    ),
+                    format!("{} links: {}  \u{2026}  {}", v.len(), v[0], last),
+                    p.muted,
+                    true,
+                )
+            }
+            Err(e) => {
+                let s = e.to_string();
+                (s.clone(), s, p.danger, false)
+            }
+        };
+        let summary_line: Element<'_, Message> = if failed {
+            text(summary).size(12).color(colour).wrapping(text::Wrapping::WordOrGlyph).into()
+        } else {
+            tip_long(text(summary).size(12).color(colour).wrapping(text::Wrapping::None), full)
         };
         let mut add = button(text("Add all").size(13).font(bold())).padding([7, 18]).style(theme::accent);
         if ready {
@@ -3230,7 +3268,7 @@ impl App {
                 .height(70)
                 .size(13)
                 .padding(10),
-            text(summary).size(12).color(colour),
+            summary_line,
             row![
                 space(Length::Fill, Length::Shrink),
                 button(text("Cancel").size(13)).padding([7, 18]).style(theme::flat(false)).on_press(Message::BatchClose),
@@ -3282,7 +3320,10 @@ impl App {
         };
         column![
             row![glyph(Icon::Shield, 20.0, p.accent), text("Verify checksum").size(16).font(bold())].spacing(8).align_y(Alignment::Center),
-            text(v.name.clone()).size(13).color(p.muted).wrapping(text::Wrapping::WordOrGlyph),
+            tip_long(
+                text(middle_ellipsis(&v.name, 56)).size(13).color(p.muted).wrapping(text::Wrapping::None),
+                v.name.clone(),
+            ),
             digest,
             text_input("Paste the published SHA-256 or MD5 to compare", &v.expected)
                 .on_input(Message::VerifyExpected)
@@ -3357,12 +3398,18 @@ impl App {
             row![glyph(Icon::Add, 20.0, p.accent), text("Download file").size(16).font(bold())]
                 .spacing(8)
                 .align_y(Alignment::Center),
-            text(name).size(15).font(bold()).wrapping(text::Wrapping::WordOrGlyph),
-            text(middle_ellipsis(&item.url, 90)).size(11).color(p.muted).wrapping(text::Wrapping::WordOrGlyph),
+            tip_long(
+                text(middle_ellipsis(&name, 48)).size(15).font(bold()).wrapping(text::Wrapping::None),
+                name,
+            ),
+            tip_long(
+                text(middle_ellipsis(&item.url, 72)).size(11).color(p.muted).wrapping(text::Wrapping::None),
+                item.url.clone(),
+            ),
             column![
                 text(format!("Size: {size}")).size(12).color(p.muted),
-                tip(
-                    text(format!("Save to: {}", middle_ellipsis(&folder, 60))).size(12).color(p.muted).wrapping(text::Wrapping::WordOrGlyph),
+                tip_long(
+                    text(format!("Save to: {}", middle_ellipsis(&folder, 52))).size(12).color(p.muted).wrapping(text::Wrapping::None),
                     folder.clone(),
                 ),
             ]
@@ -3397,7 +3444,7 @@ impl App {
             (None, Some(typed)) => {
                 let cleaned = tdm::native_host::sanitize_filename(typed.trim());
                 if cleaned != typed.trim() {
-                    (format!("Will be saved as {cleaned}.{ext}"), p.muted)
+                    (format!("Will be saved as {}.{ext}", middle_ellipsis(&cleaned, 44)), p.muted)
                 } else {
                     (String::new(), p.muted)
                 }
@@ -3417,8 +3464,8 @@ impl App {
         .spacing(6)
         .align_y(Alignment::Center);
         let location = row![
-            tip(
-                text(format!("Location: {}", middle_ellipsis(&folder, 60))).size(12).color(p.muted).wrapping(text::Wrapping::WordOrGlyph),
+            tip_long(
+                text(format!("Location: {}", middle_ellipsis(&folder, 44))).size(12).color(p.muted).wrapping(text::Wrapping::None),
                 folder.clone(),
             ),
             space(Length::Fill, Length::Shrink),
@@ -3432,7 +3479,10 @@ impl App {
                 .align_y(Alignment::Center),
             name_row,
             text(hint).size(12).color(hint_colour).wrapping(text::Wrapping::WordOrGlyph),
-            text(middle_ellipsis(&item.url, 90)).size(11).color(p.muted).wrapping(text::Wrapping::WordOrGlyph),
+            tip_long(
+                text(middle_ellipsis(&item.url, 72)).size(11).color(p.muted).wrapping(text::Wrapping::None),
+                item.url.clone(),
+            ),
             column![text(format!("Size: {size}")).size(12).color(p.muted), location].spacing(4),
             text(if more > 0 { format!("{more} more waiting") } else { String::new() }).size(11).color(p.muted),
             row![
@@ -3479,7 +3529,13 @@ impl App {
                 .align_y(Alignment::Center),
                 // The folder path gets its own full-width line, so it can wrap
                 // without running into the status pill.
-                text(dir.display().to_string()).size(11).font(iced::Font::MONOSPACE).color(p.muted).wrapping(text::Wrapping::WordOrGlyph),
+                {
+                    let dir_s = dir.display().to_string();
+                    tip_long(
+                        text(middle_ellipsis(&dir_s, 68)).size(11).font(iced::Font::MONOSPACE).color(p.muted).wrapping(text::Wrapping::WordOrGlyph),
+                        dir_s,
+                    )
+                },
                 row![
                     button(text("Copy path").size(12))
                         .padding([6, 10])
@@ -3784,6 +3840,22 @@ fn tip<'a>(content: impl Into<Element<'a, Message>>, label: impl text::IntoFragm
     tooltip(
         content,
         container(text(label).size(12)).padding([4, 8]).style(theme::card),
+        tooltip::Position::Bottom,
+    )
+    .gap(4)
+    .snap_within_viewport(true)
+    .into()
+}
+
+/// A tooltip for a full value that the content shows shortened. The text
+/// wraps inside a 460px box, so a long path or name cannot run off the screen.
+fn tip_long<'a>(content: impl Into<Element<'a, Message>>, full: String) -> Element<'a, Message> {
+    tooltip(
+        content,
+        container(text(full).size(12).wrapping(text::Wrapping::WordOrGlyph))
+            .padding([4, 8])
+            .max_width(460)
+            .style(theme::card),
         tooltip::Position::Bottom,
     )
     .gap(4)

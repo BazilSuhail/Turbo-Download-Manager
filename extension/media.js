@@ -19,7 +19,13 @@
   const MIN_W = 120; // smaller elements are icons/previews, not something to save
   const MIN_H = 60;
   const MISS_RETRY_MS = 2000;
-  const LABEL = "⬇ TDM";
+  const LABEL = "Download with TDM";
+  // Images are offered only when large enough to be a picture worth saving.
+  const IMG_MIN_W = 160;
+  const IMG_MIN_H = 120;
+  // The TDM logo, shown on the button. It is an extension resource, so the
+  // manifest lists it under web_accessible_resources.
+  const ICON = api.runtime.getURL("icons/icon32.png");
 
   const CSS = `
     :host { all: initial; }
@@ -36,6 +42,7 @@
       padding: 7px 11px; white-space: nowrap; transition: filter .15s, background .15s, opacity .15s;
     }
     .go { background: linear-gradient(135deg, #FF7A1A, #FFB347); color: #1c1a19; }
+    .go img { width: 14px; height: 14px; margin-right: 6px; vertical-align: -3px; border-radius: 3px; }
     .go:hover { filter: brightness(1.08); }
     .go[aria-busy="true"] { opacity: .75; cursor: progress; }
     .go.ok { background: #2fbf71; color: #fff; }
@@ -78,7 +85,6 @@
   const go = document.createElement("button");
   go.type = "button";
   go.className = "go";
-  go.textContent = LABEL;
   go.setAttribute("aria-live", "polite");
   const close = document.createElement("button");
   close.type = "button";
@@ -88,6 +94,19 @@
   close.setAttribute("aria-label", close.title);
   pill.append(go, close);
   root.append(pill);
+
+  // The button text, with the TDM logo in front of it.
+  function setGo(text) {
+    const icon = document.createElement("img");
+    icon.src = ICON;
+    icon.alt = "";
+    icon.width = 14;
+    icon.height = 14;
+    const label = document.createElement("span");
+    label.textContent = text;
+    go.replaceChildren(icon, label);
+  }
+  setGo(LABEL);
 
   // ------------------------------------------------------------------ state
 
@@ -130,6 +149,11 @@
   // An element's own http(s) URL, else (for blob:/data: players) the stream
   // the background saw on the network for this tab, else nothing.
   async function urlFor(el) {
+    if (el.tagName === "IMG") {
+      // A picture is saved from its own address; only web links qualify.
+      const src = el.currentSrc || el.src || "";
+      return /^https?:/i.test(src) ? src : "";
+    }
     const direct = sourcesOf(el)[0];
     if (direct) return direct;
     if (!isStreamed(el)) return "";
@@ -154,9 +178,10 @@
   }
 
   function mediaAt(x, y) {
-    for (const el of document.querySelectorAll("video, audio")) {
+    for (const el of document.querySelectorAll("video, audio, img")) {
       const r = el.getBoundingClientRect();
-      if (r.width < MIN_W || r.height < MIN_H) continue;
+      const [minW, minH] = el.tagName === "IMG" ? [IMG_MIN_W, IMG_MIN_H] : [MIN_W, MIN_H];
+      if (r.width < minW || r.height < minH) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return el;
     }
     return null;
@@ -229,18 +254,18 @@
   function feedback(cls, text) {
     clearTimeout(resetTimer);
     go.className = `go ${cls}`.trim();
-    go.textContent = text;
+    setGo(text);
     go.removeAttribute("aria-busy");
     resetTimer = setTimeout(() => {
       go.className = "go";
-      go.textContent = LABEL;
+      setGo(LABEL);
     }, 2500);
   }
 
   go.addEventListener("click", async () => {
     if (!currentUrl || go.getAttribute("aria-busy")) return;
     go.setAttribute("aria-busy", "true");
-    go.textContent = "Sending…";
+    setGo("Sending…");
     let reply = null;
     try {
       reply = await api.runtime.sendMessage({ cmd: "downloadMedia", url: currentUrl });
