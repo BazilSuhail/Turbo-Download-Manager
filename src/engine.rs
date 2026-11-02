@@ -255,6 +255,9 @@ pub struct Download {
     /// from the Connection page.
     attempts: u32,
     timeout: Duration,
+    /// Alternative URLs for the same file, tried in order when a segment keeps
+    /// failing on the current one. The primary URL is always tried first.
+    mirrors: Vec<String>,
 }
 
 impl Download {
@@ -271,7 +274,25 @@ impl Download {
             proxy: None,
             attempts: MAX_ATTEMPTS,
             timeout: DEFAULT_TIMEOUT,
+            mirrors: Vec::new(),
         }
+    }
+
+    /// Mirror URLs for the same file. When a segment fails on one URL, its
+    /// retries move on to the next, so a dead or slow CDN node does not stall
+    /// the whole download. Mirrors are not probed, so the file is still
+    /// checked against the primary's size and, if set, the SHA-256 at the end.
+    pub fn set_mirrors(&mut self, mirrors: Vec<String>) {
+        self.mirrors = mirrors
+            .into_iter()
+            .map(|m| m.trim().to_owned())
+            .filter(|m| !m.is_empty() && *m != self.url)
+            .collect();
+    }
+
+    /// The mirror URLs set with [`Download::set_mirrors`].
+    pub fn mirrors(&self) -> &[String] {
+        &self.mirrors
     }
 
     /// Retries per segment and the socket timeout, as set on the Connection
@@ -488,7 +509,9 @@ impl Download {
             tasks.spawn(
                 Worker {
                     client: client.clone(),
-                    url: fetch_url.clone(),
+                    urls: std::iter::once(fetch_url.clone())
+                        .chain(self.mirrors.iter().cloned())
+                        .collect(),
                     path: self.dest.clone(),
                     index,
                     ranged,
@@ -910,7 +933,9 @@ fn split_largest(segments: &mut Vec<Segment>) -> Option<usize> {
 
 struct Worker {
     client: reqwest::Client,
-    url: String,
+    /// The primary URL first, then any mirrors. A transient failure moves the
+    /// worker to the next entry before it retries.
+    urls: Vec<String>,
     path: PathBuf,
     index: usize,
     ranged: bool,
@@ -929,11 +954,15 @@ impl Worker {
     /// Fetch one segment, retrying from the last written byte on transient errors.
     async fn run(self) -> Result<(), Error> {
         let mut attempt = 0;
+        // Index into `urls`. Starts at the primary and advances on each
+        // transient failure, wrapping around the mirror list.
+        let mut current = 0;
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            match self.fetch_once().await {
+            let url = self.urls[current].clone();
+            match self.fetch_once(&url).await {
                 Ok(()) => return Ok(()),
                 // A server that ignores Range, or answers with the wrong one,
                 // will not start honouring it on retry. Retrying would just
@@ -952,6 +981,9 @@ impl Worker {
                     if attempt >= self.attempts {
                         return Err(e);
                     }
+                    // Switch to the next mirror before retrying, so a bad node
+                    // is not hit again on every attempt.
+                    current = (current + 1) % self.urls.len();
                     tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
                 }
             }
@@ -962,8 +994,8 @@ impl Worker {
     ///
     /// The shape matches the HTTP path: write at the true offset, honour the
     /// shared speed limit, stop early if the coordinator takes our tail.
-    async fn fetch_ftp(&self, segment: &Segment, from: u64) -> Result<(), Error> {
-        let ftp = crate::ftp::FtpDownload::parse(&self.url)?;
+    async fn fetch_ftp(&self, url: &str, segment: &Segment, from: u64) -> Result<(), Error> {
+        let ftp = crate::ftp::FtpDownload::parse(url)?;
         let mut file = OpenOptions::new().write(true).open(&self.path).await?;
         file.seek(std::io::SeekFrom::Start(from)).await?;
 
@@ -994,16 +1026,16 @@ impl Worker {
         Ok(())
     }
 
-    async fn fetch_once(&self) -> Result<(), Error> {
+    async fn fetch_once(&self, url: &str) -> Result<(), Error> {
         let segment = self.segments.lock().expect("segments lock")[self.index].clone();
         if segment.complete {
             return Ok(());
         }
         let from = if self.ranged { segment.resume_offset() } else { 0 };
         if self.is_ftp {
-            return self.fetch_ftp(&segment, from).await;
+            return self.fetch_ftp(url, &segment, from).await;
         }
-        let mut request = self.client.get(&self.url);
+        let mut request = self.client.get(url);
         for (name, value) in &self.headers {
             request = request.header(name, value);
         }

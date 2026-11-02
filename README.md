@@ -51,12 +51,24 @@
     <td><b>Downloads</b></td>
     <td>
       Multi-connection HTTP/HTTPS, pause and resume (state kept in a <code>.tdmstate</code> sidecar),
-      FTP, and HLS/DASH media manifests saved as playable files.
+      FTP, and HLS/DASH media manifests saved as playable files. Add <b>mirror links</b> in the batch
+      dialog: a segment that keeps failing moves on to them.
     </td>
   </tr>
   <tr>
     <td><b>Queue and scheduling</b></td>
-    <td>Max simultaneous downloads, a scheduler with start and stop times, and a global speed limit.</td>
+    <td>
+      Max simultaneous downloads, a scheduler with start and stop times, a global speed limit, and
+      time-of-day speed windows (for example, a cap overnight) that override it while they are open.
+      When the queue is done, TDM can stay open, close, or shut the PC down after 60 seconds.
+    </td>
+  </tr>
+  <tr>
+    <td><b>Default folder</b></td>
+    <td>
+      The folder chip in the top bar shows where new downloads go. Click it, or use the
+      <b>Folder</b> menu, to choose another one. <b>Open download folder</b> opens it in Explorer.
+    </td>
   </tr>
   <tr>
     <td><b>Organising</b></td>
@@ -68,15 +80,16 @@
   <tr>
     <td><b>Safety</b></td>
     <td>
-      Verify SHA-256 against a published hash. Existing files are never overwritten: a name clash
-      becomes <code>name (2).ext</code>. Deleting a download keeps its file unless you tick the box.
+      Verify SHA-256 or MD5 against a published hash (the pasted value's length picks which).
+      Existing files are never overwritten: a name clash becomes <code>name (2).ext</code>.
+      Deleting a download keeps its file unless you tick the box.
     </td>
   </tr>
   <tr>
     <td><b>Browser capture</b></td>
     <td>
       Takes over downloads from Chrome, Edge, Brave, Vivaldi, Opera and Firefox, asks what to do
-      with each one, and starts TDM by itself if it is closed.
+      with each one, brings the TDM window to the front, and starts TDM by itself if it is closed.
     </td>
   </tr>
   <tr>
@@ -87,7 +100,8 @@
     <td><b>Interface</b></td>
     <td>
       TDM Dark (default) and TDM Light with an animated toggle, download cards with progress bars,
-      a live speed graph, toast notifications, and no redraws while idle.
+      a live speed graph, toast notifications, and no redraws while idle. The sidebar widens with
+      the window. Buttons are one solid colour, with white text on the accent in dark mode.
     </td>
   </tr>
   <tr>
@@ -95,6 +109,47 @@
     <td>The Windows system proxy, or <code>HTTPS_PROXY</code>, <code>HTTP_PROXY</code> and <code>ALL_PROXY</code> elsewhere.</td>
   </tr>
 </table>
+
+<details>
+<summary><b>How to add the browser extension (click to expand)</b></summary>
+
+<br>
+
+The extension lets your browser send downloads and video links to TDM. Do this once per browser.
+
+1. **Build the extension folders.** `cargo build` does this automatically and creates
+   `extension/dist/chrome` and `extension/dist/firefox`. If they are missing, run this in the project folder:
+
+   ```sh
+   node extension/build.mjs
+   ```
+
+   Node.js 20 or newer must be installed for this step.
+
+2. **Start TDM.** In the sidebar, under **BROWSERS**, click **Add**.
+
+3. **Pick your browser** and check its folder path in the list. Use **Copy path** to copy it,
+   or **Open folder** to find it in Explorer.
+
+4. **Click *Add to Chrome*** (or Edge, Brave, Vivaldi, Opera). TDM copies the path and opens the
+   extensions page.
+
+5. **Load the extension** on that page:
+   - Turn on **Developer mode** (top-right).
+   - Click **Load unpacked**.
+   - Press <kbd>Ctrl</kbd>+<kbd>V</kbd>, then click **Select Folder**.
+
+6. **Check the connection.** The browser's status in TDM changes to **Connected**.
+
+**Firefox:** open `about:debugging#/runtime/this-firefox`, click **Load Temporary Add-on**, and pick
+`extension/dist/firefox/manifest.json`. Firefox removes temporary add-ons when it restarts, so load it again.
+
+**Private windows:** open TDM's **Details** for the extension and turn on **Allow in Incognito**.
+
+**Not connected?** Reload the extension on its extensions page, then restart the browser. See
+[Troubleshooting](#troubleshooting) for more.
+
+</details>
 
 ---
 
@@ -139,6 +194,26 @@ at the time of writing; check the vendor's site for current pricing and features
 > open source, and runs on macOS and Linux as well as Windows.
 
 ---
+
+## Architecture
+
+TDM is one Rust crate that builds a single `tdm` binary. The GUI runs on the
+[iced](https://iced.rs) toolkit, and the download work runs on Tokio.
+
+| Layer | Where | What it does |
+|---|---|---|
+| Engine | `src/engine.rs` | Probes a URL, splits it into byte ranges, fetches them on concurrent workers that write at their true offsets, and checkpoints progress to a `.tdmstate` sidecar. One shared speed limiter caps the combined rate of all downloads. |
+| Protocols | `src/ftp.rs`, `src/media.rs` | FTP with ranged `REST`/`RETR`. HLS and DASH manifests are expanded into segment lists before transfer. |
+| Batch and crawl | `src/batch.rs`, `src/grabber.rs` | Expands `[001-120]`-style patterns, and collects linked files from one host. |
+| Scheduling | `src/scheduler.rs`, `src/model.rs` | Queue start and stop windows, and time-of-day speed windows. |
+| Post-download | `src/checksum.rs`, `src/scan.rs` | One pass computes SHA-256 and MD5. Defender or ClamAV can scan the finished file. |
+| Persistence | `src/store.rs` | `settings.json` and `downloads.json` in the per-user config folder, written to a temp file and then renamed. |
+| Browser bridge | `src/ipc.rs`, `src/native_host.rs`, `src/register.rs` | A loopback TCP link between the browser's native-messaging host and the running app, with a per-run token. The host writes the browser manifests and, on Windows, the registry keys. |
+| Interface | `src/main.rs`, `src/ui/` | The iced window, the menu, the Preferences dialog and the TDM Dark and Light themes. |
+| Extension | `extension/` | A Manifest V3 extension that hands downloads and page media to TDM. |
+
+State is plain JSON, so it is easy to inspect and back up. There is no
+database to run.
 
 ## Quick start
 

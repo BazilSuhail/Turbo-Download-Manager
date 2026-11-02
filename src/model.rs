@@ -498,6 +498,71 @@ impl Default for ProxySettings {
     }
 }
 
+/// What TDM does once its queue has no running or waiting downloads left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AfterQueue {
+    /// Keep running.
+    #[default]
+    DoNothing,
+    /// Quit TDM.
+    CloseApp,
+    /// Quit TDM and shut the computer down in 60 seconds (Windows and Linux).
+    PowerOff,
+}
+
+impl AfterQueue {
+    pub const ALL: [AfterQueue; 3] = [AfterQueue::DoNothing, AfterQueue::CloseApp, AfterQueue::PowerOff];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            AfterQueue::DoNothing => "Keep TDM open",
+            AfterQueue::CloseApp => "Close TDM",
+            AfterQueue::PowerOff => "Close TDM and shut down the PC",
+        }
+    }
+}
+
+impl std::fmt::Display for AfterQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.title())
+    }
+}
+
+/// A time-of-day bandwidth cap. While the clock is inside `start..end` the
+/// window's `limit` replaces the global one. A window whose `start` is later
+/// than its `end` wraps past midnight, so 22:00–07:00 covers the night.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedWindow {
+    pub start: crate::scheduler::TimeOfDay,
+    pub end: crate::scheduler::TimeOfDay,
+    /// Bytes per second inside the window; `None` means unlimited there.
+    pub limit: Option<u64>,
+}
+
+impl SpeedWindow {
+    /// Whether `now` falls inside the window. `start == end` is an empty window.
+    pub fn contains(&self, now: crate::scheduler::TimeOfDay) -> bool {
+        let start = self.start.minutes_since_midnight();
+        let end = self.end.minutes_since_midnight();
+        let t = now.minutes_since_midnight();
+        if start <= end {
+            start <= t && t < end
+        } else {
+            t >= start || t < end
+        }
+    }
+}
+
+/// The cap in force at `now`: the first window that contains the time, or
+/// the global limit when none does.
+pub fn effective_limit(
+    global: Option<u64>,
+    windows: &[SpeedWindow],
+    now: crate::scheduler::TimeOfDay,
+) -> Option<u64> {
+    windows.iter().find(|w| w.contains(now)).map_or(global, |w| w.limit)
+}
+
 /// Application settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -512,6 +577,12 @@ pub struct Settings {
     pub max_segments: u32,
     /// Global cap in bytes/second; `None` means unlimited.
     pub speed_limit: Option<u64>,
+    /// Time-of-day caps that override `speed_limit` while they are open.
+    #[serde(default)]
+    pub speed_windows: Vec<SpeedWindow>,
+    /// What to do when the queue runs out of work.
+    #[serde(default)]
+    pub after_queue: AfterQueue,
     pub categories: Vec<Category>,
     pub columns: Vec<ColumnSpec>,
     /// Whether the category panel is expanded in the main window.
@@ -591,6 +662,8 @@ impl Default for Settings {
             max_active: 3,
             max_segments: 8,
             speed_limit: None,
+            speed_windows: Vec::new(),
+            after_queue: AfterQueue::default(),
             columns: ColumnSpec::defaults(),
             show_categories: true,
             options_tab: OptionsTab::default(),

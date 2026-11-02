@@ -82,7 +82,18 @@ enum Message {
     CopyLink(u64),
     Verify(u64),
     VerifyExpected(String),
-    VerifyDone(u64, Result<String, String>),
+    VerifyDone(u64, Result<tdm::checksum::Digests, String>),
+    BatchMirrors(text_editor::Action),
+    /// Drop the always-on-top pin set by a browser hand-off.
+    ReleaseLevel(window::Id),
+    /// The window was resized to this width, in logical pixels.
+    Resized(f32),
+    /// Copy the command that builds the browser extension folders.
+    CopyBuildCommand,
+    /// Open the folder picker to change the default download folder.
+    ChangeDownloadFolder,
+    /// The folder picker finished; `None` if the user cancelled.
+    DownloadFolderPicked(Option<std::path::PathBuf>),
     CloseVerify,
     BatchEdit(text_editor::Action),
     BatchAdd,
@@ -114,6 +125,10 @@ enum Message {
     CaptureQueue,
     CaptureCancel,
     AddToBrowser(tdm::register::Browser),
+    /// Copy the folder to load unpacked to the clipboard.
+    CopyExtensionPath(tdm::register::Browser),
+    /// Open the folder to load unpacked in the file manager.
+    OpenExtensionFolder(tdm::register::Browser),
     ToastAction(u64),
     DismissToast(u64),
     Key(keyboard::Event),
@@ -135,6 +150,8 @@ struct Grab {
 
 struct Batch {
     content: text_editor::Content,
+    /// Optional mirror URLs, one per line, given to every link in the batch.
+    mirrors: text_editor::Content,
     /// The expansion of `content`, kept current on every edit so the view
     /// does not re-expand ten thousand links per frame.
     links: Result<Vec<String>, batch::Error>,
@@ -145,7 +162,7 @@ struct Verify {
     name: String,
     expected: String,
     /// `None` while hashing.
-    digest: Option<Result<String, String>>,
+    digest: Option<Result<tdm::checksum::Digests, String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +226,11 @@ struct App {
     grab: Option<Grab>,
     /// Browser downloads waiting for Download now or Add to queue.
     prompts: VecDeque<Incoming>,
+    /// Set once the queue starts a download, cleared when the after-queue
+    /// action runs, so that action fires once per run of the queue.
+    queue_busy: bool,
+    /// Current window width, so the sidebar can grow with the window.
+    window_width: f32,
     open_menu: Option<usize>,
     settings_open: bool,
     settings: Settings,
@@ -362,6 +384,8 @@ impl App {
             browser_guide: false,
             grab: None,
             prompts: VecDeque::new(),
+            queue_busy: false,
+            window_width: 900.0,
             open_menu: None,
             settings_open: false,
             theme_anim: Animation::new(settings.light_theme)
@@ -427,6 +451,7 @@ impl App {
         handle.set_limiter(Arc::clone(&self.limiter));
         handle.set_proxy(self.settings.proxy.resolved());
         handle.set_limits(self.settings.connection.retries, self.settings.connection.timeout_secs);
+        handle.set_mirrors(rec.mirrors.clone());
         let mut snapshot = handle.snapshot();
         snapshot.status = if rec.complete { Status::Finished } else { status };
         snapshot.total = rec.total;
@@ -449,6 +474,11 @@ impl App {
 
     /// Add a link typed, pasted, expanded from a batch or offered by a toast.
     fn add_link(&mut self, url: String) {
+        self.add_link_mirrored(url, Vec::new());
+    }
+
+    /// Queue `url` with optional mirror URLs for the same file.
+    fn add_link_mirrored(&mut self, url: String, mirrors: Vec<String>) {
         // A manifest URL saved under its own name would leave the user with a
         // .m3u8 text file instead of a video.
         let name = tdm::media::container_name(&tdm::native_host::filename_from_url(&url));
@@ -456,7 +486,7 @@ impl App {
         let category_id = self.settings.category_for(&name).map(|c| c.id);
         let status = self.added_status();
         self.push(
-            DownloadRecord { url, dest, category_id, headers: Vec::new(), total: None, complete: false },
+            DownloadRecord { url, dest, category_id, headers: Vec::new(), mirrors, total: None, complete: false },
             status,
         );
     }
@@ -479,7 +509,15 @@ impl App {
             dest.push(tdm::native_host::sanitize_filename(&segment));
         }
         let dest = self.free_dest(dest);
-        let record = DownloadRecord { url: url.to_owned(), dest, category_id: None, headers: Vec::new(), total: None, complete: false };
+        let record = DownloadRecord {
+            url: url.to_owned(),
+            dest,
+            category_id: None,
+            headers: Vec::new(),
+            mirrors: Vec::new(),
+            total: None,
+            complete: false,
+        };
         self.push(record, Status::Queued);
     }
 
@@ -503,6 +541,7 @@ impl App {
                     dest: e.handle.dest().to_owned(),
                     category_id: e.category_id,
                     headers: e.headers.clone(),
+                    mirrors: e.handle.mirrors().to_vec(),
                     total: e.snapshot.total,
                     complete: e.snapshot.status == Status::Finished,
                 })
@@ -578,6 +617,9 @@ impl App {
                 async move { handle.run().await.map_err(|e| e.to_string()) },
                 move |r| Message::Finished(id, r),
             ));
+        }
+        if !tasks.is_empty() {
+            self.queue_busy = true;
         }
         Task::batch(tasks)
     }
@@ -778,7 +820,7 @@ impl App {
                 // run on the thread that draws the window.
                 Task::perform(
                     async move {
-                        match tokio::task::spawn_blocking(move || tdm::checksum::sha256_file(&path)).await {
+                        match tokio::task::spawn_blocking(move || tdm::checksum::digests_file(&path)).await {
                             Ok(Ok(d)) => Ok(d),
                             Ok(Err(e)) => Err(e.to_string()),
                             Err(e) => Err(e.to_string()),
@@ -787,6 +829,35 @@ impl App {
                     move |r| Message::VerifyDone(id, r),
                 )
             }
+            Message::ReleaseLevel(id) => window::set_level(id, window::Level::Normal),
+            Message::Resized(width) => {
+                self.window_width = width;
+                Task::none()
+            }
+            Message::CopyBuildCommand => iced::clipboard::write(build_command()),
+            Message::ChangeDownloadFolder => {
+                let start = self.settings.download_dir.clone();
+                // The native dialog runs off the UI thread, so the window
+                // keeps drawing while it is open.
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Choose the default download folder")
+                            .set_directory(&start)
+                            .pick_folder()
+                            .await
+                            .map(|folder| folder.path().to_path_buf())
+                    },
+                    Message::DownloadFolderPicked,
+                )
+            }
+            Message::DownloadFolderPicked(Some(dir)) => {
+                self.toast(ToastKind::Success, format!("New downloads go to {}", dir.display()));
+                self.settings.download_dir = dir;
+                self.save();
+                Task::none()
+            }
+            Message::DownloadFolderPicked(None) => Task::none(),
             Message::VerifyExpected(s) => {
                 if let Some(v) = &mut self.verify {
                     v.expected = s;
@@ -814,11 +885,18 @@ impl App {
                 }
                 Task::none()
             }
+            Message::BatchMirrors(action) => {
+                if let Some(b) = &mut self.batch {
+                    b.mirrors.perform(action);
+                }
+                Task::none()
+            }
             Message::BatchAdd => {
-                let Some(Batch { links: Ok(links), .. }) = self.batch.take() else { return Task::none() };
+                let Some(Batch { links: Ok(links), mirrors, .. }) = self.batch.take() else { return Task::none() };
                 let n = links.len();
+                let mirrors = parse_mirrors(&mirrors.text());
                 for url in links {
-                    self.add_link(url);
+                    self.add_link_mirrored(url, mirrors.clone());
                 }
                 self.save();
                 self.toast(ToastKind::Success, format!("Added {n} download{}", plural(n)));
@@ -838,6 +916,9 @@ impl App {
                 Task::none()
             }
             Message::Shutdown => self.shutdown(),
+            Message::Options(tdm::ui::options::Message::BrowseDownloadDir) => {
+                self.update(Message::ChangeDownloadFolder)
+            }
             Message::Options(m) => {
                 let was_autostart = self.settings.general.launch_on_startup;
                 tdm::ui::options::update(&mut self.settings, m);
@@ -1013,6 +1094,16 @@ impl App {
                 self.browser_guide = false;
                 Task::none()
             }
+            Message::CopyExtensionPath(browser) => {
+                iced::clipboard::write(browser.extension_dir().display().to_string())
+            }
+            Message::OpenExtensionFolder(browser) => {
+                let dir = browser.extension_dir();
+                if let Err(e) = open::that_detached(&dir) {
+                    self.toast(ToastKind::Error, format!("Could not open {}: {e}", dir.display()));
+                }
+                Task::none()
+            }
             Message::AddToBrowser(browser) => {
                 let dir = browser.extension_dir();
                 if !dir.join("manifest.json").is_file() {
@@ -1057,7 +1148,15 @@ impl App {
         let name = capture_name(&item);
         let dest = self.free_dest(self.settings.destination_for(&name));
         let category_id = self.settings.category_for(&name).map(|c| c.id);
-        let rec = DownloadRecord { url: item.url, dest, category_id, headers: item.headers, total: item.size, complete: false };
+        let rec = DownloadRecord {
+            url: item.url,
+            dest,
+            category_id,
+            headers: item.headers,
+            mirrors: Vec::new(),
+            total: item.size,
+            complete: false,
+        };
         self.push(rec, if start { Status::Queued } else { Status::Paused });
         self.save();
         if start { self.start_ready() } else { Task::none() }
@@ -1108,6 +1207,17 @@ impl App {
         if self.spark.len() == SPARK_LEN {
             self.spark.pop_front();
         }
+        // The queue has run dry: nothing running and nothing waiting. Paused
+        // downloads do not count, since the user stopped those on purpose.
+        if self.queue_busy && self.count(Status::Running) == 0 && self.count(Status::Queued) == 0 {
+            self.queue_busy = false;
+            tasks.push(self.after_queue());
+        }
+        // Apply the time-of-day cap on every tick, so the limit changes at a
+        // window edge without waiting for the user to touch a setting.
+        let now = tdm::scheduler::local_now().1;
+        let cap = tdm::model::effective_limit(self.settings.speed_limit, &self.settings.speed_windows, now);
+        self.limiter.set(cap);
         self.spark.push_back(self.downloads.iter().map(|e| e.speed).sum());
 
         // Past the schedule's stop time, running downloads come to a halt —
@@ -1192,7 +1302,11 @@ impl App {
             Cmd::Find => iced::widget::operation::focus(SEARCH_INPUT),
             Cmd::PasteUrl => iced::clipboard::read().map(Message::PasteUrl),
             Cmd::BatchAdd => {
-                self.batch = Some(Batch { content: text_editor::Content::new(), links: Ok(Vec::new()) });
+                self.batch = Some(Batch {
+                    content: text_editor::Content::new(),
+                    mirrors: text_editor::Content::new(),
+                    links: Ok(Vec::new()),
+                });
                 self.open_overlay();
                 Task::none()
             }
@@ -1241,6 +1355,14 @@ impl App {
                 _ => Task::none(),
             },
             Cmd::Options => self.update(Message::SettingsOpen(true)),
+            Cmd::ChangeDownloadFolder => self.update(Message::ChangeDownloadFolder),
+            Cmd::OpenDownloadFolder => {
+                let dir = self.settings.download_dir.clone();
+                if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| open::that_detached(&dir)) {
+                    self.toast(ToastKind::Error, format!("Could not open {}: {e}", dir.display()));
+                }
+                Task::none()
+            }
             Cmd::Scheduler => {
                 // The queue schedule lives on the Downloads page.
                 self.settings.options_tab = OptionsTab::Downloads;
@@ -1302,6 +1424,7 @@ impl App {
             // Closing the window must not drop in-flight progress.
             window::close_requests().map(|_| Message::Shutdown),
             keyboard::listen().map(Message::Key),
+            window::resize_events().map(|(_, size)| Message::Resized(size.width)),
         ];
         if self.animating() {
             subs.push(window::frames().map(Message::Frame));
@@ -1316,6 +1439,26 @@ impl App {
     /// Each engine checkpoints its own segments when it stops, so pausing is
     /// what makes the resume data current; quitting without it discards up to
     /// a tick's worth of transfer on every running download.
+    /// Run the user's after-queue choice. Called once, when the queue goes idle.
+    fn after_queue(&mut self) -> Task<Message> {
+        match self.settings.after_queue {
+            tdm::model::AfterQueue::DoNothing => Task::none(),
+            tdm::model::AfterQueue::CloseApp => self.shutdown(),
+            tdm::model::AfterQueue::PowerOff => {
+                let started = power_off();
+                if started {
+                    // Quitting first is fine: the OS waits out the 60 seconds.
+                    self.shutdown()
+                } else {
+                    // Do not quit if the shutdown command failed; the user
+                    // would lose the window with nothing happening.
+                    self.toast(ToastKind::Error, "Could not start the shutdown. The queue is done.");
+                    Task::none()
+                }
+            }
+        }
+    }
+
     fn shutdown(&mut self) -> Task<Message> {
         for entry in &self.downloads {
             entry.handle.pause();
@@ -1421,6 +1564,18 @@ impl App {
         .align_y(Alignment::Center);
 
         let link_bar = row![
+            // Where new downloads are saved. Click to choose another folder.
+            button(
+                row![
+                    glyph(Icon::Folder, 14.0, p.accent),
+                    text(folder_label(&self.settings.download_dir)).size(12).font(iced::Font::MONOSPACE),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([8, 10])
+            .style(theme::flat(false))
+            .on_press(Message::ChangeDownloadFolder),
             text_input("Paste a link and press Enter", &self.url)
                 .id(URL_INPUT)
                 .on_input(Message::UrlChanged)
@@ -1521,6 +1676,12 @@ impl App {
         container(area).height(Length::Fill).into()
     }
 
+    /// The sidebar is wider on bigger windows: about a quarter of the window,
+    /// never narrower than 230px (so labels and counts fit) or wider than 340px.
+    fn sidebar_width(&self) -> f32 {
+        (self.window_width * 0.25).clamp(230.0, 340.0)
+    }
+
     fn sidebar(&self, p: &Palette) -> Element<'_, Message> {
         let count = |f: Filter| {
             self.downloads
@@ -1599,7 +1760,7 @@ impl App {
         }
 
         container(scrollable(col).height(Length::Fill))
-            .width(186)
+            .width(self.sidebar_width())
             .height(Length::Fill)
             .padding([4, 8])
             .style(theme::surface)
@@ -1817,7 +1978,9 @@ impl App {
             }),
         )
         .on_press(dismiss);
-        let card = container(content).padding(20).style(theme::card);
+        // Cap the card so a wide window cannot stretch a dialog across the
+        // screen. It fills up to 480px, then stays centred.
+        let card = container(content).padding(20).width(Length::Fill).max_width(480).style(theme::card);
         let card = float(card).scale(1.0 + 0.04 * (1.0 - t));
         stack![
             opaque(backdrop),
@@ -1876,6 +2039,15 @@ impl App {
                 .height(140)
                 .size(13)
                 .padding(10),
+            text("Mirror links (optional, one per line). If a connection keeps failing, TDM tries these.")
+                .size(12)
+                .color(p.muted),
+            text_editor(&b.mirrors)
+                .placeholder("https://mirror.example.com/same/file.zip")
+                .on_action(Message::BatchMirrors)
+                .height(70)
+                .size(13)
+                .padding(10),
             text(summary).size(12).color(colour),
             row![
                 space(Length::Fill, Length::Shrink),
@@ -1893,19 +2065,24 @@ impl App {
         let Some(v) = &self.verify else { return space(Length::Shrink, Length::Shrink).into() };
         let digest: Element<'_, Message> = match &v.digest {
             None => column![
-                text("Computing SHA-256\u{2026}").size(12).color(p.muted),
+                text("Computing SHA-256 and MD5\u{2026}").size(12).color(p.muted),
                 progress_bar(0.0..=1.0, 1.0)
                     .girth(4)
                     .style(theme::progress(None, Some((self.now.saturating_duration_since(self.epoch).as_secs_f32() / 1.2).fract()))),
             ]
             .spacing(6)
             .into(),
-            Some(Ok(d)) => text(d.clone()).size(12).font(iced::Font::MONOSPACE).into(),
+            Some(Ok(d)) => column![
+                text(format!("SHA-256  {}", d.sha256)).size(12).font(iced::Font::MONOSPACE),
+                text(format!("MD5      {}", d.md5)).size(12).font(iced::Font::MONOSPACE),
+            ]
+            .spacing(4)
+            .into(),
             Some(Err(e)) => text(format!("Could not read the file: {e}")).size(12).color(p.danger).into(),
         };
         let verdict: Element<'_, Message> = match &v.digest {
             Some(Ok(d)) if !v.expected.trim().is_empty() => {
-                let ok = tdm::checksum::matches(d, &v.expected);
+                let ok = tdm::checksum::matches_any(d, &v.expected);
                 let (icon, label, c) = if ok {
                     (Icon::Check, "Match \u{2014} the file is intact", p.success)
                 } else {
@@ -1919,10 +2096,10 @@ impl App {
             _ => space(Length::Shrink, Length::Shrink).into(),
         };
         column![
-            row![glyph(Icon::Shield, 20.0, p.accent), text("Verify SHA-256").size(16).font(bold())].spacing(8).align_y(Alignment::Center),
+            row![glyph(Icon::Shield, 20.0, p.accent), text("Verify checksum").size(16).font(bold())].spacing(8).align_y(Alignment::Center),
             text(v.name.clone()).size(13).color(p.muted),
             digest,
-            text_input("Paste the published SHA-256 to compare", &v.expected)
+            text_input("Paste the published SHA-256 or MD5 to compare", &v.expected)
                 .on_input(Message::VerifyExpected)
                 .style(theme::input)
                 .size(12)
@@ -2023,7 +2200,9 @@ impl App {
         }
         for &b in &self.browsers {
             let (status, tint) = if connected { ("Connected", p.success) } else { ("Not added yet", p.muted) };
-            list = list.push(
+            let dir = b.extension_dir();
+            let built = dir.join("manifest.json").is_file();
+            let mut block = column![
                 row![
                     text(b.label()).size(14).font(bold()).width(Length::Fill),
                     container(text(status).size(11).color(tint)).padding([2, 8]).style(theme::pill(tint)),
@@ -2034,7 +2213,38 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
-            );
+                // The folder path gets its own full-width line, so it can wrap
+                // without running into the status pill.
+                text(dir.display().to_string()).size(11).font(iced::Font::MONOSPACE).color(p.muted),
+                row![
+                    button(text("Copy path").size(12))
+                        .padding([6, 10])
+                        .style(theme::flat(false))
+                        .on_press(Message::CopyExtensionPath(b)),
+                    button(text("Open folder").size(12))
+                        .padding([6, 10])
+                        .style(theme::flat(false))
+                        .on_press(Message::OpenExtensionFolder(b)),
+                ]
+                .spacing(8),
+            ]
+            .spacing(6);
+            if !built {
+                block = block.push(
+                    column![
+                        text("This folder is not built yet. Run the build once, then reopen this page.")
+                            .size(12)
+                            .color(p.danger),
+                        button(text("Copy build command").size(12))
+                            .padding([6, 10])
+                            .style(theme::flat(false))
+                            .on_press(Message::CopyBuildCommand),
+                        text(build_command()).size(11).font(iced::Font::MONOSPACE).color(p.muted),
+                    ]
+                    .spacing(4),
+                );
+            }
+            list = list.push(block);
         }
         let step = |n: &'static str, title: &'static str, detail: &'static str| {
             row![
@@ -2142,14 +2352,120 @@ impl App {
     }
 }
 
-/// Un-minimise, raise and focus the window; also flash it in case the OS
-/// refuses the focus change.
+/// Ask the OS to shut down in 60 seconds, so the user can still cancel with
+/// `shutdown /a` (Windows) or `shutdown -c` (Linux). Returns whether the
+/// command was started.
+fn power_off() -> bool {
+    #[cfg(windows)]
+    let result = std::process::Command::new("shutdown")
+        .args(["/s", "/t", "60", "/c", "Turbo Download Manager finished its queue."])
+        .spawn();
+    #[cfg(unix)]
+    let result = std::process::Command::new("shutdown").args(["-h", "+1"]).spawn();
+    result.is_ok()
+}
+
+/// The web and FTP links from a mirror box, one per line. Anything else on a
+/// line (a stray word, a blank) is dropped rather than queued as a bad mirror.
+fn parse_mirrors(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            l.starts_with("http://") || l.starts_with("https://") || l.starts_with("ftp://")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The download folder as shown in the top bar: the full path when it is
+/// short, otherwise its last characters with a leading ellipsis.
+fn folder_label(path: &std::path::Path) -> String {
+    const MAX: usize = 36;
+    let full = path.display().to_string();
+    let count = full.chars().count();
+    if count <= MAX {
+        full
+    } else {
+        let tail: String = full.chars().skip(count - (MAX - 1)).collect();
+        format!("\u{2026}{tail}")
+    }
+}
+
+/// The command that builds the extension folders in `extension/dist`.
+fn build_command() -> String {
+    let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extension").join("build.mjs");
+    format!("node \"{}\"", script.display())
+}
+
+/// Make `window` the foreground window on Windows.
+///
+/// Windows only lets the process that owns the foreground window hand it on.
+/// Attaching this thread's input to the current foreground thread makes the
+/// request count as coming from that thread, which is the standard way to
+/// bring a background window forward. Runs on the UI thread, which owns the
+/// window.
+#[cfg(windows)]
+fn force_foreground(window: &dyn iced::window::Window) {
+    use raw_window_handle::RawWindowHandle;
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetForegroundWindow() -> *mut c_void;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
+        fn GetCurrentThreadId() -> u32;
+        fn AttachThreadInput(thread: u32, attach_to: u32, attach: i32) -> i32;
+        fn ShowWindow(hwnd: *mut c_void, command: i32) -> i32;
+        fn BringWindowToTop(hwnd: *mut c_void) -> i32;
+        fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(win) = handle.as_raw() else { return };
+    let hwnd = win.hwnd.get() as *mut c_void;
+
+    // SAFETY: every call takes the window's own HWND, or thread ids that
+    // come from the system. The input attachment is undone before returning.
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let foreground_thread = GetWindowThreadProcessId(foreground, std::ptr::null_mut());
+        let this_thread = GetCurrentThreadId();
+        let attached = foreground_thread != 0 && foreground_thread != this_thread
+            && AttachThreadInput(this_thread, foreground_thread, 1) != 0;
+        ShowWindow(hwnd, SW_RESTORE);
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+        if attached {
+            AttachThreadInput(this_thread, foreground_thread, 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn force_foreground(_window: &dyn iced::window::Window) {}
+
+/// Bring the window up in front of whatever the user is doing, as IDM does
+/// when a download starts in the browser.
+///
+/// Windows refuses focus changes from a background process, so `gain_focus`
+/// alone only makes the taskbar button blink. Pinning the window above the
+/// others for a moment is the reliable way to get it on screen. It is then
+/// released so the window behaves normally again.
 fn raise_window() -> Task<Message> {
     window::latest().then(|id| match id {
         Some(id) => Task::batch([
             window::minimize(id, false),
+            window::set_level(id, window::Level::AlwaysOnTop),
             window::gain_focus(id),
-            window::request_user_attention(id, Some(window::UserAttention::Informational)),
+            // The Windows call that really moves the window to the front.
+            window::run(id, |w| force_foreground(w)).then(|_| Task::none()),
+            window::request_user_attention(id, Some(window::UserAttention::Critical)),
+            Task::perform(
+                async { tokio::time::sleep(std::time::Duration::from_millis(1500)).await },
+                move |_| Message::ReleaseLevel(id),
+            ),
         ]),
         None => Task::none(),
     })

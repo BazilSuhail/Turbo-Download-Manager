@@ -36,6 +36,9 @@ pub struct DownloadRecord {
     /// User-Agent).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
+    /// Alternative URLs for the same file, tried when a segment keeps failing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
     /// Total size once known, so the list can render before the first probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
@@ -180,6 +183,7 @@ mod tests {
                 dest: PathBuf::from("D:\\dl\\Compressed\\a.zip"),
                 category_id: Some(7),
                 headers: vec![("Referer".into(), "https://example.test/".into())],
+                mirrors: vec!["https://mirror.example.test/a.zip".into()],
                 total: Some(1234),
                 complete: false,
             }],

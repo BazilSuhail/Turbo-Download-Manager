@@ -1,0 +1,206 @@
+# Release: push a tag such as v0.1.0 and this builds the installers for
+# Windows, Linux and macOS, then publishes a GitHub release.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag must match `version` in Cargo.toml. Tags with a hyphen (v0.2.0-beta.1)
+# are published as pre-releases. The release title and description come from
+# Cargo.toml, and the notes list every commit since the previous tag.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Check tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "Tag v$tag does not match Cargo.toml version $cargo_version." >&2
+            exit 1
+          fi
+          if [[ "$tag" == *-* ]]; then pre=true; else pre=false; fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            formats: nsis,wix
+            # Installers from cargo-packager, both written to target/release.
+            globs: target/release/*-setup.exe target/release/*.msi
+          - name: linux
+            os: ubuntu-22.04
+            formats: deb,appimage
+            globs: target/release/*.deb target/release/*.AppImage target/generate-rpm/*.rpm
+          - name: macos
+            os: macos-latest
+            formats: app,dmg
+            globs: target/release/*.dmg
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install packaging tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager${{ runner.os == 'Linux' && ',cargo-generate-rpm' || '' }}
+
+      # build.rs also builds the browser extension (extension/dist) with Node.
+      - name: Build the app
+        run: cargo build --release
+
+      - name: Package installers
+        shell: bash
+        run: cargo packager --release --formats ${{ matrix.formats }}
+
+      - name: Build the .rpm package
+        if: runner.os == 'Linux'
+        run: cargo generate-rpm
+
+      - name: Collect installers
+        shell: bash
+        run: |
+          shopt -s nullglob
+          mkdir -p dist
+          for pattern in ${{ matrix.globs }}; do
+            for file in $pattern; do
+              cp "$file" dist/
+            done
+          done
+          if [ -z "$(ls -A dist)" ]; then
+            echo "No installers were produced for ${{ matrix.name }}." >&2
+            exit 1
+          fi
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          path: release
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        working-directory: release
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Title and description from Cargo.toml
+        id: meta
+        shell: bash
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          product=$(grep -m1 '^product-name' Cargo.toml | cut -d'"' -f2)
+          summary=$(grep -m1 '^description' Cargo.toml | cut -d'"' -f2)
+          details=$(grep -m1 '^long-description' Cargo.toml | cut -d'"' -f2)
+          echo "title=$product v$VERSION" >> "$GITHUB_OUTPUT"
+
+          previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          if [ -n "$previous" ]; then
+            changes=$(git log --no-merges --pretty='- %s (%h)' "$previous..$GITHUB_REF_NAME")
+            range="Changes since $previous"
+          else
+            changes=$(git log --no-merges --pretty='- %s (%h)' "$GITHUB_REF_NAME")
+            range="Changes in this first release"
+          fi
+
+          {
+            echo "# $product v$VERSION"
+            echo
+            echo "$summary"
+            echo
+            echo "$details"
+            echo
+            echo "## Downloads"
+            echo
+            echo "| File | What it is |"
+            echo "|---|---|"
+            for file in release/*; do
+              name=$(basename "$file")
+              case "$name" in
+                *-setup.exe) what="Windows installer (NSIS, per user, no admin prompt)" ;;
+                *.msi)       what="Windows installer (MSI)" ;;
+                *.deb)       what="Debian / Ubuntu package" ;;
+                *.rpm)       what="Fedora / openSUSE package" ;;
+                *.AppImage)  what="Linux portable app (run directly)" ;;
+                *.dmg)       what="macOS disk image" ;;
+                SHA256SUMS.txt) what="SHA-256 checksums for every file" ;;
+                *)           what="" ;;
+              esac
+              echo "| $name | $what |"
+            done
+            echo
+            echo "## $range"
+            echo
+            echo "$changes"
+            echo
+            echo "## Verify your download"
+            echo
+            echo 'Compare the file with `SHA256SUMS.txt`, for example on Windows: `certutil -hashfile <file> SHA256`.'
+          } > notes.md
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.meta.outputs.title }}
+          tag_name: ${{ github.ref_name }}
+          body_path: notes.md
+          files: release/*
+          prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.check-version.outputs.prerelease != 'true' }}
+          fail_on_unmatched_files: true

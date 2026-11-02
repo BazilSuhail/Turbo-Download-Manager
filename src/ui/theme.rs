@@ -56,7 +56,8 @@ impl Palette {
             muted: rgb(0xB8AA9E),
             accent: rgb(0xFF7A1A),
             accent2: rgb(0xFFB347),
-            on_accent: rgb(0x1A0F08),
+            // White text on the orange buttons in dark mode.
+            on_accent: rgb(0xFFFFFF),
             success: rgb(0x52C98F),
             warning: rgb(0xFFC857),
             danger: rgb(0xFF6B5E),
@@ -250,18 +251,16 @@ pub fn side_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button:
     }
 }
 
+/// The primary button: one solid colour in every state (no gradient). Only
+/// the shadow and the disabled fill change.
 pub fn accent(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::of(theme);
     let (bg, shadow) = match status {
-        button::Status::Disabled => (alpha(p.muted, 0.3).into(), Color::TRANSPARENT),
-        button::Status::Hovered => (
-            Palette { accent: p.accent2, accent2: p.accent, ..p }.flame(),
-            alpha(p.accent, 0.45),
-        ),
-        _ => (p.flame(), alpha(p.accent, 0.25)),
+        button::Status::Disabled => (alpha(p.muted, 0.3), Color::TRANSPARENT),
+        _ => (p.accent, alpha(p.accent, 0.25)),
     };
     button::Style {
-        background: Some(bg),
+        background: Some(bg.into()),
         text_color: p.on_accent,
         border: Border { radius: 8.0.into(), ..Default::default() },
         shadow: Shadow { color: shadow, offset: Vector::new(0.0, 2.0), blur_radius: 10.0 },

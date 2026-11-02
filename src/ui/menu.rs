@@ -24,6 +24,8 @@ pub enum Cmd {
     DeleteCompleted,
     Scheduler,
     Options,
+    ChangeDownloadFolder,
+    OpenDownloadFolder,
     ToggleSidebar,
     ToggleTheme,
     Find,
@@ -97,6 +99,13 @@ pub const MENU_BAR: &[Menu] = &[
         ],
     },
     Menu {
+        title: "Folder",
+        items: &[
+            cmd("Change default download folder\u{2026}", Cmd::ChangeDownloadFolder),
+            cmd("Open download folder", Cmd::OpenDownloadFolder),
+        ],
+    },
+    Menu {
         title: "View",
         items: &[
             cmd("Show or hide sidebar", Cmd::ToggleSidebar),
@@ -130,7 +139,7 @@ mod tests {
     #[test]
     fn top_level_menus_are_in_order() {
         let titles: Vec<_> = MENU_BAR.iter().map(|m| m.title).collect();
-        assert_eq!(titles, ["File", "Downloads", "View", "Help"]);
+        assert_eq!(titles, ["File", "Downloads", "Folder", "View", "Help"]);
     }
 
     #[test]

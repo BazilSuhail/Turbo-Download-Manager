@@ -44,6 +44,8 @@ pub enum Message {
 
     // Save to
     DownloadDir(String),
+    /// Open the native folder picker (handled by the app).
+    BrowseDownloadDir,
     TempDir(String),
     RememberLastPath(bool),
     UseServerFileDate(bool),
@@ -67,6 +69,17 @@ pub enum Message {
     WarnBeforeStopping(bool),
     Retries(u32),
     TimeoutSecs(u32),
+
+    /// What happens when the queue runs out of work.
+    AfterQueueChoice(model::AfterQueue),
+
+    // Speed windows (time-of-day caps)
+    AddSpeedWindow,
+    RemoveSpeedWindow(usize),
+    SpeedWindowStart(usize, u32),
+    SpeedWindowEnd(usize, u32),
+    /// KB/s; 0 means unlimited inside the window.
+    SpeedWindowKbps(usize, u32),
 
     // Proxy / Socks
     ProxyMode(ProxyMode),
@@ -126,6 +139,8 @@ pub fn update(s: &mut Settings, message: Message) {
         ResetExceptionHosts => s.exception_hosts = Settings::default().exception_hosts,
 
         DownloadDir(v) => s.download_dir = v.into(),
+        // The app opens the folder picker; nothing changes here.
+        BrowseDownloadDir => {}
         TempDir(v) => s.save_to.temp_dir = v.into(),
         RememberLastPath(v) => s.save_to.remember_last_path = v,
         UseServerFileDate(v) => s.save_to.use_server_file_date = v,
@@ -147,6 +162,35 @@ pub fn update(s: &mut Settings, message: Message) {
         WarnBeforeStopping(v) => s.connection.warn_before_stopping = v,
         Retries(v) => s.connection.retries = clamp(v, model::RETRIES),
         TimeoutSecs(v) => s.connection.timeout_secs = clamp(v, model::TIMEOUT_SECS),
+
+        AfterQueueChoice(v) => s.after_queue = v,
+
+        AddSpeedWindow => s.speed_windows.push(model::SpeedWindow {
+            start: TimeOfDay { hour: 22, minute: 0 },
+            end: TimeOfDay { hour: 7, minute: 0 },
+            limit: Some(512 * 1024),
+        }),
+        RemoveSpeedWindow(i) => {
+            if i < s.speed_windows.len() {
+                s.speed_windows.remove(i);
+            }
+        }
+        SpeedWindowStart(i, h) => {
+            if let Some(w) = s.speed_windows.get_mut(i) {
+                w.start = TimeOfDay { hour: clamp(h, 0..=23) as u8, minute: 0 };
+            }
+        }
+        SpeedWindowEnd(i, h) => {
+            if let Some(w) = s.speed_windows.get_mut(i) {
+                w.end = TimeOfDay { hour: clamp(h, 0..=23) as u8, minute: 0 };
+            }
+        }
+        SpeedWindowKbps(i, k) => {
+            if let Some(w) = s.speed_windows.get_mut(i) {
+                let k = clamp(k, 0..=SPEED_KBPS_MAX);
+                w.limit = (k > 0).then(|| u64::from(k) * 1024);
+            }
+        }
 
         ProxyMode(v) => s.proxy.mode = v,
         PacUrl(v) => s.proxy.pac_url = v,
@@ -413,7 +457,14 @@ fn save_to(s: &Settings) -> Element<'_, Message> {
         "",
         Message::DownloadDir,
     ));
-    col = col.push(dead_button("Pick the download folder", "Browse"));
+    col = col.push(
+        row![
+            text("Pick the download folder with the native dialog").size(13).style(theme::muted).width(Length::Fill),
+            button(text("Browse").size(13)).padding([4, 12]).style(theme::flat(false)).on_press(Message::BrowseDownloadDir),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    );
     col = col.push(check(
         "Remember the last folder I saved to",
         s.save_to.remember_last_path,
@@ -661,7 +712,80 @@ fn connection(s: &Settings) -> Element<'_, Message> {
         })
         .padding(iced::Padding::default().left(16.0)),
     );
+
+    // Time-of-day caps. Each row is one window; the first open window wins.
+    col = col.push(space(8.0));
+    col = col.push(
+        row![
+            text("When the queue is done").size(13).width(Length::Fixed(LABEL_W)),
+            pick_list(&model::AfterQueue::ALL[..], Some(s.after_queue), Message::AfterQueueChoice)
+                .text_size(13)
+                .padding(6),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    );
+    col = col.push(space(8.0));
+    col = col.push(text("Speed windows").size(13));
+    col = col.push(note(
+        "While a window is open its limit replaces the global one. A window whose start is \
+         later than its end runs past midnight. 0 KB/s means unlimited inside the window.",
+    ));
+    for (i, w) in s.speed_windows.iter().enumerate() {
+        col = col.push(speed_window_row(i, w));
+    }
+    col = col.push(
+        button(text("Add speed window").size(13))
+            .padding([4, 12])
+            .style(theme::flat(false))
+            .on_press(Message::AddSpeedWindow),
+    );
     col.into()
+}
+
+/// The largest per-window cap offered in the UI, in KB/s (about 1 GB/s).
+const SPEED_KBPS_MAX: u32 = 1_000_000;
+
+fn speed_window_row(index: usize, w: &model::SpeedWindow) -> Element<'static, Message> {
+    let kbps = w.limit.map_or(0, |b| (b / 1024) as u32);
+    row![
+        mini_stepper("From hour", u32::from(w.start.hour), 0..=23, move |h| Message::SpeedWindowStart(index, h)),
+        mini_stepper("To hour", u32::from(w.end.hour), 0..=23, move |h| Message::SpeedWindowEnd(index, h)),
+        mini_stepper("KB/s", kbps, 0..=SPEED_KBPS_MAX, move |k| Message::SpeedWindowKbps(index, k)),
+        button(text("Remove").size(12))
+            .padding([3, 10])
+            .style(theme::flat(false))
+            .on_press(Message::RemoveSpeedWindow(index)),
+    ]
+    .spacing(10)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// A labelled `-` / value / `+` control whose change message is built by a
+/// closure, so a row can bind its own index. [`stepper_row`] takes a plain
+/// function, which cannot do that.
+fn mini_stepper(
+    label: &'static str,
+    value: u32,
+    range: std::ops::RangeInclusive<u32>,
+    on_change: impl Fn(u32) -> Message + 'static,
+) -> Element<'static, Message> {
+    let (lo, hi) = (*range.start(), *range.end());
+    let value = value.clamp(lo, hi);
+    let minus = button(text("-").size(13)).padding([2, 8]).style(theme::flat(false));
+    let minus = if value > lo { minus.on_press(on_change(value - 1)) } else { minus };
+    let plus = button(text("+").size(13)).padding([2, 8]).style(theme::flat(false));
+    let plus = if value < hi { plus.on_press(on_change(value + 1)) } else { plus };
+    row![
+        text(label).size(12).style(theme::muted),
+        minus,
+        container(text(value.to_string()).size(13)).center_x(Length::Fixed(64.0)),
+        plus,
+    ]
+    .spacing(4)
+    .align_y(iced::Alignment::Center)
+    .into()
 }
 
 fn proxy(s: &Settings) -> Element<'_, Message> {
