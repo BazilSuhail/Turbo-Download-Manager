@@ -108,8 +108,11 @@ jobs:
         run: |
           mkdir -p dist
           # find + NUL-separated paths, so product names with spaces are copied intact.
-          find target/release target/generate-rpm -maxdepth 1 -type f \
+          # Search all of target/. Packagers write installers into different
+          # subfolders (WiX puts the .msi under target/release/wix/...), so depth is not limited.
+          find target -type f \
             \( -name '*-setup.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) \
+            -not -path '*/deps/*' -not -path '*/build/*' \
             -print0 | xargs -0 -r -I{} cp "{}" dist/
           if [ -z "$(ls -A dist)" ]; then
             echo "No installers were produced for ${{ matrix.name }}." >&2

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/tdm-logo.png" alt="Turbo Download Manager logo" width="140">
+    <img src="assets/tdm-logo.png" alt="Turbo Download Manager logo" width="140px">
 </p>
 
 <h1 align="center">Turbo Download Manager (TDM)</h1>
@@ -15,6 +15,17 @@
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-lightgrey?style=flat-square">
   <img alt="Browsers" src="https://img.shields.io/badge/browsers-Chrome%20%7C%20Edge%20%7C%20Brave%20%7C%20Firefox-blue?style=flat-square">
   <img alt="Status" src="https://img.shields.io/badge/status-pre--release-yellow?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square"></a>
+</p>
+
+> [!IMPORTANT]
+> Before you contribute, read the [contributing guide](CONTRIBUTING.md). It explains how to report bugs, set up the project, and open a pull request.
+
+<p align="center">
+  <img src="docs/TDM.png" alt="Turbo Download Manager logo" width="100%">
 </p>
 
 ---
@@ -188,7 +199,7 @@ The extension lets your browser send downloads and video links to TDM. Do this o
 3. **Pick your browser** and check its folder path in the list. Use **Copy path** to copy it,
    or **Open folder** to find it in Explorer.
 
-4. **Click *Add to Chrome*** (or Edge, Brave, Vivaldi, Opera). TDM copies the path and opens the
+4. **Click _Add to Chrome_** (or Edge, Brave, Vivaldi, Opera). TDM copies the path and opens the
    extensions page.
 
 5. **Load the extension** on that page:
@@ -257,17 +268,17 @@ at the time of writing; check the vendor's site for current pricing and features
 TDM is one Rust crate that builds a single `tdm` binary. The GUI runs on the
 [iced](https://iced.rs) toolkit, and the download work runs on Tokio.
 
-| Layer | Where | What it does |
-|---|---|---|
-| Engine | `src/engine.rs` | Probes a URL, splits it into byte ranges, fetches them on concurrent workers that write at their true offsets, and checkpoints progress to a `.tdmstate` sidecar. One shared speed limiter caps the combined rate of all downloads. |
-| Protocols | `src/ftp.rs`, `src/media.rs` | FTP with ranged `REST`/`RETR`. HLS and DASH manifests are expanded into segment lists before transfer. |
-| Batch and crawl | `src/batch.rs`, `src/grabber.rs` | Expands `[001-120]`-style patterns, and collects linked files from one host. |
-| Scheduling | `src/scheduler.rs`, `src/model.rs` | Queue start and stop windows, and time-of-day speed windows. |
-| Post-download | `src/checksum.rs`, `src/scan.rs`, `src/filetype.rs` | One pass computes SHA-256 and MD5. Defender or ClamAV can scan the finished file. The file-type check sniffs the file's first and last bytes against its name. |
-| Persistence | `src/store.rs` | `settings.json` and `downloads.json` in the per-user config folder, written to a temp file and then renamed. |
-| Browser bridge | `src/ipc.rs`, `src/native_host.rs`, `src/register.rs` | A loopback TCP link between the browser's native-messaging host and the running app, with a per-run token. The host writes the browser manifests and, on Windows, the registry keys. |
-| Interface | `src/main.rs`, `src/ui/` | The iced window, the menu, the Preferences dialog and the TDM Dark and Light themes. |
-| Extension | `extension/` | A Manifest V3 extension that hands downloads and page media to TDM. |
+| Layer           | Where                                                 | What it does                                                                                                                                                                                                                        |
+| --------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Engine          | `src/engine.rs`                                       | Probes a URL, splits it into byte ranges, fetches them on concurrent workers that write at their true offsets, and checkpoints progress to a `.tdmstate` sidecar. One shared speed limiter caps the combined rate of all downloads. |
+| Protocols       | `src/ftp.rs`, `src/media.rs`                          | FTP with ranged `REST`/`RETR`. HLS and DASH manifests are expanded into segment lists before transfer.                                                                                                                              |
+| Batch and crawl | `src/batch.rs`, `src/grabber.rs`                      | Expands `[001-120]`-style patterns, and collects linked files from one host.                                                                                                                                                        |
+| Scheduling      | `src/scheduler.rs`, `src/model.rs`                    | Queue start and stop windows, and time-of-day speed windows.                                                                                                                                                                        |
+| Post-download   | `src/checksum.rs`, `src/scan.rs`, `src/filetype.rs`   | One pass computes SHA-256 and MD5. Defender or ClamAV can scan the finished file. The file-type check sniffs the file's first and last bytes against its name.                                                                      |
+| Persistence     | `src/store.rs`                                        | `settings.json` and `downloads.json` in the per-user config folder, written to a temp file and then renamed.                                                                                                                        |
+| Browser bridge  | `src/ipc.rs`, `src/native_host.rs`, `src/register.rs` | A loopback TCP link between the browser's native-messaging host and the running app, with a per-run token. The host writes the browser manifests and, on Windows, the registry keys.                                                |
+| Interface       | `src/main.rs`, `src/ui/`                              | The iced window, the menu, the Preferences dialog and the TDM Dark and Light themes.                                                                                                                                                |
+| Extension       | `extension/`                                          | A Manifest V3 extension that hands downloads and page media to TDM.                                                                                                                                                                 |
 
 State is plain JSON, so it is easy to inspect and back up. There is no
 database to run.
@@ -711,11 +722,11 @@ Each release builds these installers and publishes them as a GitHub release:
 
 ## Contributing
 
-Issues and pull requests are welcome.
+Issues and pull requests are welcome. The full guide, including the pull request checklist, is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 1. Fork the repository and create a branch from `main`.
-2. Run `cargo test`, `cargo clippy --all-targets` and `node --test extension/` before you push.
-3. Keep changes focused, and describe the behaviour you changed in the pull request.
+2. Run `cargo test`, `cargo clippy --all-targets` and the extension tests before you push.
+3. Follow the commit message style and the checklist in the guide, and describe the behaviour you changed in the pull request.
 
 By contributing you agree that your work is licensed under the same terms as the project (see [Licence](#licence)).
 
