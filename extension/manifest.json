@@ -4,7 +4,7 @@
   "short_name": "TDM",
   "version": "1.1.0",
   "description": "Hands browser downloads and page media to the Turbo Download Manager desktop application over native messaging.",
-  "author": "Bazil Suhail and Abdullah Masood",
+  "author": "Entity Studios",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4MV0wkRZ7GQLBhwcdCL3SHW4G7mukaPIWrsAa4e7BmpJfNxWwEKHJgebtCNG/EBHDDw4TwMKulBhfptNj+dmCSGsnVpotiO64JcJGsKF/meFmRPtaRwL84fo8c8dWHgqAJ9BoCbBmyLza3/pRVKMbgS6WmKmXrX/+7CtS9VV0ZwFO8/3tWLTsH5UVPHFFNSMzNQNohiweQou43A/brEezx4EMIQbnxcFBFFqnJOG4Pzn/llTleNn/iEpaJrtEYTQyZA1KNCasdzdxWvi1GB2lVi/ILRbOzC1W9mYAV+KFB6K8K3xyWNha1YQM0/PnuGtdvnr+Tjst/xBmVJfpfVChQIDAQAB",
   "background": {
     "service_worker": "background.js",

@@ -1,6 +1,6 @@
 # Third-party notices
 
-Copyright (c) 2026 Bazil Suhail and Abdullah Masood.
+Copyright (c) 2026 Entity Studios.
 
 Turbo Download Manager (TDM) is built on the open-source Rust crates below. This list covers the direct dependencies declared in `Cargo.toml`, with the licence each crate declares in its `Cargo.toml` (checked against the crate sources in the Cargo registry). Each crate's own licence file, shipped in its package, governs that crate. Transitive dependencies are not listed here; they are covered by `Cargo.lock`.
 

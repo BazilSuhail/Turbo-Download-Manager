@@ -626,8 +626,8 @@ By contributing you agree that your work is licensed under the same terms as the
     <th align="left">Name</th>
     <th align="left">Role</th>
   </tr>
-  <tr><td>Bazil Suhail</td><td>Maintainer</td></tr>
-  <tr><td>Abdullah Masood</td><td>Maintainer</td></tr>
+  <tr><td>Bazil Suhail</td><td>Author and maintainer</td></tr>
+  <tr><td>Entity Studios</td><td>Publisher</td></tr>
 </table>
 
 ---
