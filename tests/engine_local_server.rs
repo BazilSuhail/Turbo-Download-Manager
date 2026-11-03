@@ -1,4 +1,9 @@
 //! Integration tests against a local HTTP server. No network access required.
+//!
+//! The timing baseline is `#[ignore]`d so normal test runs skip it. To measure
+//! the median of five 256 MiB downloads against tdm-labserver's fast scenario:
+//!
+//! `cargo test --release --test engine_local_server -- --ignored --nocapture`
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -31,6 +36,9 @@ struct Options {
     /// Answer 404 to every ranged request that starts at or after this offset:
     /// a permanent failure for the ranges in the back half.
     fail_from: Option<usize>,
+    /// Send a strong ETag with every answer. Without one the server gives no
+    /// validator, and a download never resumes against it.
+    etag: bool,
 }
 
 /// Serve `body` on a random local port and return its URL.
@@ -90,6 +98,9 @@ async fn serve(body: Arc<Vec<u8>>, options: Options) -> String {
                         (start, end)
                     };
                     headers.push_str(&format!("Content-Range: bytes {rs}-{re}/{total}\r\n"));
+                }
+                if options.etag {
+                    headers.push_str("ETag: \"v1\"\r\n");
                 }
                 headers.push_str("\r\n");
                 if sock.write_all(headers.as_bytes()).await.is_err() {
@@ -217,17 +228,26 @@ async fn a_segment_that_fails_for_good_does_not_stop_the_others() {
     );
 }
 
-/// Baseline timing, not a correctness test. Run with
-/// `cargo test --release --test engine_local_server -- --ignored --nocapture baseline`.
+/// Baseline timing, not a correctness test: five downloads of 256 MiB from the
+/// tdm-labserver `fast` scenario, 8 segments each, then the median is printed.
+/// The server is in-process on 127.0.0.1, so no network is used.
+///
+/// Run with `cargo test --release --test engine_local_server -- --ignored --nocapture`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn baseline_256_mib_fast_download_five_runs() {
-    let body = Arc::new(sample_body(256 * 1024 * 1024));
-    let url = serve(Arc::clone(&body), Options { honour_range: true, ..Default::default() }).await;
+async fn baseline_256_mib_fast_download_median_of_five() {
+    let lab = tdm_labserver::start(tdm_labserver::LabConfig {
+        size_bytes: 256 * 1024 * 1024,
+        scenario: tdm_labserver::Scenario::Fast,
+        port: 0,
+        path: "/file.bin".to_owned(),
+    })
+    .await
+    .expect("start lab server");
     let mut times = Vec::new();
     for run in 1..=5 {
         let dest = temp_file(&format!("baseline-{run}.bin"));
-        let download = Download::new(url.clone(), &dest, 8);
+        let download = Download::new(lab.url.clone(), &dest, 8);
         let started = std::time::Instant::now();
         download.run().await.expect("download");
         let secs = started.elapsed().as_secs_f64();
@@ -236,8 +256,9 @@ async fn baseline_256_mib_fast_download_five_runs() {
         times.push(secs);
         let _ = std::fs::remove_file(&dest);
     }
-    let mean = times.iter().sum::<f64>() / times.len() as f64;
-    println!("baseline mean over 5 runs: {mean:.3} s (256 MiB, in-process server, 8 segments)");
+    lab.shutdown().await.expect("stop lab server");
+    times.sort_by(f64::total_cmp);
+    println!("baseline median of 5 runs: {:.3} s (256 MiB, tdm-labserver fast, 8 segments)", times[2]);
 }
 
 /// Distinct non-probe byte ranges the server was asked for.
@@ -279,6 +300,7 @@ async fn pause_saves_progress_and_resume_completes_the_file() {
         Options {
             honour_range: true,
             chunk_delay: Some(Duration::from_millis(40)),
+            etag: true,
             ..Default::default()
         },
     )
@@ -639,6 +661,37 @@ async fn dropped_connection_is_retried_and_file_is_complete() {
 
 /// A server that sends no length leaves nothing to `set_len` to, so a fresh
 /// download over an older, longer file used to keep that file's tail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_file_without_validators_is_not_resumed() {
+    // The server sends no ETag or Last-Modified, and the file was replaced by
+    // one of the same size. The sidecar says every byte is done, so resuming it
+    // would keep the old bytes. With no validator the download starts afresh.
+    let old = vec![b'o'; 100_000];
+    let new = sample_body(100_000);
+    let url = serve(
+        Arc::new(new.clone()),
+        Options { honour_range: true, ..Default::default() },
+    )
+    .await;
+    let dest = temp_file("no_validator.bin");
+    std::fs::write(&dest, &old).expect("write old file");
+    let state = serde_json::json!({
+        "url": url.clone(),
+        "total": old.len(),
+        "ranged": true,
+        "validators": { "etag": null, "last_modified": null },
+        "segments": [{
+            "start": 0, "end": old.len() - 1, "done": old.len(),
+            "complete": true, "failed": false
+        }]
+    });
+    std::fs::write(dest.with_file_name("no_validator.bin.tdmstate"), state.to_string())
+        .expect("write sidecar");
+
+    Download::new(url, &dest, 1).run().await.expect("download");
+    assert!(std::fs::read(&dest).expect("read output") == new, "old bytes were kept");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fresh_download_of_unknown_length_does_not_keep_an_old_tail() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

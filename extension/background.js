@@ -17,6 +17,7 @@
 
 import {
   basename,
+  belowMinSize,
   checkIncognitoAccess,
   httpUrl,
   normalizeExtension,
@@ -121,10 +122,11 @@ async function requestWithTimeout(message, ms) {
 }
 
 async function cachedLists() {
-  const s = await api.storage.session.get(["captureExtensions", "exceptionHosts"]);
+  const s = await api.storage.session.get(["captureExtensions", "exceptionHosts", "captureMinSize"]);
   return {
     captureExtensions: s.captureExtensions || [],
     exceptionHosts: s.exceptionHosts || [],
+    captureMinSize: s.captureMinSize || 0,
   };
 }
 
@@ -180,6 +182,8 @@ async function openAndHandshake() {
   const lists = {
     captureExtensions: ready.enabled === false ? [] : (ready.captureExtensions || []).map(normalizeExtension),
     exceptionHosts: (ready.exceptionHosts || []).map(normalizeHost),
+    // Bytes, from the app's "skip downloads smaller than" setting; 0 is off.
+    captureMinSize: ready.captureMinSize > 0 ? ready.captureMinSize : 0,
   };
   await api.storage.session.set({
     connected: true,
@@ -256,6 +260,10 @@ async function decide(item) {
 
     const lists = await ensureHost();
     if (!shouldCapture(url, filename, lists)) return false;
+    // The options page may override the app's floor; a number there wins, KiB.
+    const { captureMinKib } = await api.storage.local.get("captureMinKib");
+    const minBytes = typeof captureMinKib === "number" ? captureMinKib * 1024 : lists.captureMinSize;
+    if (belowMinSize(item.totalBytes, minBytes)) return false;
 
     const reply = await requestWithTimeout(
       await downloadMessage(raw, {

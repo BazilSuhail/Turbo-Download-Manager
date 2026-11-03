@@ -1,16 +1,18 @@
-//! On-disk state: settings and the download list.
+//! On-disk state: settings, the download list and learned host limits.
 //!
 //! Plain JSON files rather than the registry or a database: portable across
 //! platforms, easy to back up, and hand-editable. Per-download resume state is
 //! not here; it lives in the `.tdmstate` sidecar written by `engine`, next to
 //! the data it describes, so the two always fail or survive together.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tdm_store::{LoadOutcome, SyncMode};
 
+use crate::hosts::{HostLimits, HostRecord};
 use crate::model::Settings;
 
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +73,7 @@ pub fn app_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("tdm")
 }
 
-/// Where our state lives. One directory, two files.
+/// Where our state lives: settings, the download list and learned host limits.
 pub struct Store {
     dir: PathBuf,
 }
@@ -112,6 +114,50 @@ impl Store {
     pub fn save_list(&self, list: &DownloadList) -> Result<(), Error> {
         save(&self.list_path(), list)
     }
+
+    pub fn hosts_path(&self) -> PathBuf {
+        self.dir.join("hosts.json")
+    }
+
+    /// Learned per-host connection limits. A missing file means none yet.
+    pub fn load_hosts(&self) -> Result<HostLimits, Error> {
+        let map: BTreeMap<String, HostRecord> = load(&self.hosts_path())?;
+        Ok(HostLimits::from_map(map))
+    }
+
+    pub fn save_hosts(&self, limits: &HostLimits) -> Result<(), Error> {
+        save(&self.hosts_path(), &limits.to_map())
+    }
+}
+
+/// The entry in `list` that a new download of `url` would duplicate, if any.
+///
+/// Two rules, either one enough: the URLs agree on scheme, host, path and query
+/// (the fragment is ignored), or the file names agree and so do the sizes
+/// wherever both are known.
+pub fn find_duplicate<'a>(
+    list: &'a [DownloadRecord],
+    url: &str,
+    file_name: &str,
+    size: Option<u64>,
+) -> Option<&'a DownloadRecord> {
+    let wanted = normalize_url(url);
+    list.iter().find(|r| {
+        let same_url = wanted.is_some() && normalize_url(&r.url) == wanted;
+        let same_name = r.dest.file_name() == Some(std::ffi::OsStr::new(file_name));
+        let same_size = match (size, r.total) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        same_url || (same_name && same_size)
+    })
+}
+
+/// The URL without its fragment, so two links that differ only after `#` compare equal.
+fn normalize_url(url: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(url).ok()?;
+    parsed.set_fragment(None);
+    Some(parsed.as_str().to_owned())
 }
 
 /// The main file, else its backup, else defaults. A corrupt file is an error
@@ -165,6 +211,17 @@ mod tests {
         assert_eq!(loaded.max_segments, 16);
         assert_eq!(loaded.speed_limit, Some(1024 * 1024));
         assert_eq!(loaded.categories.len(), settings.categories.len());
+    }
+
+    #[test]
+    fn host_limits_round_trip_and_missing_file_is_empty() {
+        let store = temp_store("hosts");
+        assert_eq!(store.load_hosts().unwrap(), HostLimits::new());
+
+        let mut limits = HostLimits::new();
+        limits.on_refused("files.example.test", 5);
+        store.save_hosts(&limits).unwrap();
+        assert_eq!(store.load_hosts().unwrap(), limits);
     }
 
     #[test]
@@ -272,5 +329,58 @@ mod tests {
         bytes.extend(serde_json::to_vec(&settings).unwrap());
         std::fs::write(store.settings_path(), bytes).unwrap();
         assert_eq!(store.load_settings().expect("loads").max_segments, 12);
+    }
+
+    fn record(url: &str, name: &str, total: Option<u64>) -> DownloadRecord {
+        DownloadRecord {
+            url: url.into(),
+            dest: PathBuf::from("D:\\dl").join(name),
+            category_id: None,
+            headers: vec![],
+            mirrors: vec![],
+            total,
+            complete: false,
+            kind: None,
+            content_type: None,
+        }
+    }
+
+    #[test]
+    fn the_same_url_is_a_duplicate_whatever_the_fragment() {
+        let list = [record("https://example.test/a.zip?x=1", "a.zip", Some(10))];
+        let hit = find_duplicate(&list, "https://example.test/a.zip?x=1#top", "other.bin", None);
+        assert_eq!(hit.map(|r| r.url.as_str()), Some("https://example.test/a.zip?x=1"));
+    }
+
+    #[test]
+    fn a_different_query_is_not_the_same_url() {
+        let list = [record("https://example.test/get?id=1", "a.zip", Some(10))];
+        // Name and size differ as well, so only the URL rule could match.
+        assert!(find_duplicate(&list, "https://example.test/get?id=2", "b.zip", Some(20)).is_none());
+    }
+
+    #[test]
+    fn a_different_query_with_the_same_name_and_size_matches_by_name_and_size() {
+        let list = [record("https://example.test/get?id=1", "a.zip", Some(10))];
+        assert!(find_duplicate(&list, "https://example.test/get?id=2", "a.zip", Some(10)).is_some());
+    }
+
+    #[test]
+    fn the_same_name_and_size_is_a_duplicate_from_another_url() {
+        let list = [record("https://a.test/a.zip", "a.zip", Some(10))];
+        assert!(find_duplicate(&list, "https://b.test/mirror/a.zip", "a.zip", Some(10)).is_some());
+        assert!(find_duplicate(&list, "https://b.test/mirror/a.zip", "a.zip", Some(11)).is_none());
+    }
+
+    #[test]
+    fn an_unknown_size_does_not_block_a_name_match() {
+        let list = [record("https://a.test/a.zip", "a.zip", None)];
+        assert!(find_duplicate(&list, "https://b.test/a.zip", "a.zip", Some(10)).is_some());
+        assert!(find_duplicate(&list, "https://b.test/a.zip", "a.zip", None).is_some());
+    }
+
+    #[test]
+    fn an_empty_list_has_no_duplicates() {
+        assert!(find_duplicate(&[], "https://a.test/a.zip", "a.zip", Some(1)).is_none());
     }
 }

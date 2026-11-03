@@ -63,7 +63,7 @@ pub fn links_in(text: &str) -> Vec<String> {
     for token in text.split(|c: char| c.is_whitespace() || "<>\"'`".contains(c)) {
         let token = token.trim_start_matches(|c: char| "([{".contains(c));
         let lower = token.to_ascii_lowercase();
-        let Some(scheme) = ["https://", "http://", "ftp://"].into_iter().find(|s| lower.starts_with(s)) else {
+        let Some(scheme) = ["https://", "http://", "ftps://", "ftp://"].into_iter().find(|s| lower.starts_with(s)) else {
             continue;
         };
         let link = trim_trailing(token);

@@ -2,6 +2,7 @@
 
 pub mod checksum;
 pub mod engine;
+pub mod extract;
 pub mod filetype;
 pub mod ftp;
 pub mod grabber;

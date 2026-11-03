@@ -16,6 +16,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::task::JoinSet;
 
 use crate::filetype;
+use crate::model::ProxySettings;
 use crate::planner;
 
 /// Splitting a range with less than this left is not worth another connection.
@@ -41,6 +42,9 @@ const MAX_ATTEMPTS: u32 = 3;
 /// default rather than reqwest's (which is no timeout at all).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const TICK: Duration = Duration::from_millis(500);
+
+/// Time allowed to fetch a PAC script over HTTP(S) before the download goes direct.
+const PAC_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -75,12 +79,38 @@ pub enum Error {
     ValidatorChanged,
     #[error("the disk is full: free some space, then resume")]
     DiskFull,
+    #[error("the connection stalled: no data arrived within the timeout")]
+    Stalled,
 }
 
 /// A reqwest failure that happened on the wire rather than in the request
 /// itself: timeouts, connect failures, send failures and broken bodies.
 fn network_failure(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
+}
+
+/// Whether a failed segment says the host will not take another connection: a
+/// 503 refusal, or a connection the peer explicitly refused. Other network
+/// failures (timeouts, resets, dropped bodies) are blips, not a limit, so they
+/// do not lower a host's cap.
+fn host_refused(e: &Error) -> bool {
+    match e {
+        Error::Status(503) => true,
+        Error::Http(h) => connection_refused(h),
+        _ => false,
+    }
+}
+
+/// Whether the failure's cause chain holds an OS "connection refused".
+fn connection_refused(e: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return io.kind() == std::io::ErrorKind::ConnectionRefused;
+        }
+        source = err.source();
+    }
+    false
 }
 
 impl Error {
@@ -91,7 +121,7 @@ impl Error {
         match self {
             Error::Http(e) => network_failure(e),
             Error::Status(code) => matches!(code, 408 | 429 | 500..=599),
-            Error::ShortRead { .. } => true,
+            Error::ShortRead { .. } | Error::Stalled => true,
             Error::Ftp(e) => matches!(
                 e,
                 crate::ftp::FtpError::Timeout
@@ -322,7 +352,7 @@ impl Limiter {
 /// `http` and `https` are separate because the Proxy settings have a tick per
 /// protocol. FTP is not here: our FTP is raw sockets, which a plain
 /// HTTP proxy cannot carry.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ProxyConfig {
     /// Scheme, host and port of the proxy itself, e.g. `http://proxy.lan:3128`.
     pub url: String,
@@ -331,6 +361,18 @@ pub struct ProxyConfig {
     /// Sent as Basic credentials. Empty `user` means no authentication.
     pub user: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("url", &self.url)
+            .field("http", &self.http)
+            .field("https", &self.https)
+            .field("user", &self.user)
+            .field("password", &if self.password.is_empty() { "" } else { "<redacted>" })
+            .finish()
+    }
 }
 
 /// Handle for one download. Cheap to clone; clones share progress and the stop flag.
@@ -347,7 +389,9 @@ pub struct Download {
     shared: Arc<Mutex<Snapshot>>,
     rate: Arc<Limiter>,
     headers: Arc<Mutex<Vec<(String, String)>>>,
-    proxy: Option<ProxyConfig>,
+    /// The proxy choice from the settings. Manual and system proxies resolve to
+    /// a fixed [`ProxyConfig`]; a PAC script is evaluated per URL on each run.
+    proxy: ProxySettings,
     /// Attempts per segment, and the per-request socket timeout. Both come
     /// from the Connection page.
     attempts: u32,
@@ -371,7 +415,7 @@ impl Download {
             shared: Arc::new(Mutex::new(Snapshot::default())),
             rate: Arc::new(Limiter::new(None)),
             headers: Arc::new(Mutex::new(Vec::new())),
-            proxy: None,
+            proxy: ProxySettings::default(),
             attempts: MAX_ATTEMPTS,
             timeout: DEFAULT_TIMEOUT,
             mirrors: Vec::new(),
@@ -421,9 +465,9 @@ impl Download {
         self.timeout = Duration::from_secs(u64::from(timeout_secs.max(1)));
     }
 
-    /// Route this download through a proxy. Takes effect on the next `run`,
-    /// since the HTTP client is built there.
-    pub fn set_proxy(&mut self, proxy: Option<ProxyConfig>) {
+    /// Route this download through the proxy the settings choose. Takes effect
+    /// on the next `run`, since the HTTP client is built there.
+    pub fn set_proxy(&mut self, proxy: ProxySettings) {
         self.proxy = proxy;
     }
 
@@ -547,14 +591,23 @@ impl Download {
                 s.status = Status::Paused;
                 s.paused_reason = Some(Error::DiskFull.to_string());
             }
-            Ok(()) => {
+            Ok(()) => match self.check_server_hash().await {
+                // A file that is not the one the server described stays on
+                // disk, but is not reported as finished.
+                Err(reason) => {
+                    let mut s = self.shared.lock().expect("snapshot lock");
+                    s.status = Status::Failed;
+                    s.error = Some(reason);
+                }
                 // Sniffed before Finished is published, so the UI never sees a
                 // finished download without its kind.
-                let kind = self.sniff_finished().await;
-                let mut s = self.shared.lock().expect("snapshot lock");
-                s.kind = kind;
-                s.status = Status::Finished;
-            }
+                Ok(()) => {
+                    let kind = self.sniff_finished().await;
+                    let mut s = self.shared.lock().expect("snapshot lock");
+                    s.kind = kind;
+                    s.status = Status::Finished;
+                }
+            },
             Err(e) => {
                 let mut s = self.shared.lock().expect("snapshot lock");
                 s.status = Status::Failed;
@@ -581,21 +634,108 @@ impl Download {
             .ok()
     }
 
-    /// The HTTP client for this download, with the given redirect policy. The
-    /// proxy and timeout are the same for every policy.
-    fn build_client(&self, redirect: reqwest::redirect::Policy) -> Result<reqwest::Client, Error> {
+    /// Hash the finished file with the digest the server announced, if it
+    /// announced one. `Err` carries the reason the download must fail.
+    async fn check_server_hash(&self) -> Result<(), String> {
+        let expected = self.shared.lock().expect("snapshot lock").server_hash.clone();
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let path = self.dest.clone();
+        tokio::task::spawn_blocking(move || verify_server_hash(&path, &expected))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    /// The proxy for this run's URL. A PAC script is fetched and evaluated; if
+    /// that fails, the reason is logged and the download goes direct.
+    async fn resolve_proxy(&self) -> Option<ProxyConfig> {
+        let Some(location) = self.proxy.pac_location() else {
+            return match self.proxy.resolved() {
+                Ok(p) => p,
+                Err(e) => {
+                    let host = crate::hosts::HostLimits::host_key(&self.url);
+                    tracing::warn!(%host, "proxy settings unusable ({e}), going direct");
+                    None
+                }
+            };
+        };
+        match self.pac_proxy(location).await {
+            Ok(proxy) => proxy,
+            Err(reason) => {
+                let host = crate::hosts::HostLimits::host_key(&self.url);
+                tracing::warn!(%host, %reason, "PAC proxy unusable, going direct");
+                None
+            }
+        }
+    }
+
+    /// Fetch the PAC script at `location` (an http(s) URL, a file:// URL or a
+    /// local path) and ask it how to reach this download's URL.
+    async fn pac_proxy(&self, location: &str) -> Result<Option<ProxyConfig>, String> {
+        let remote = reqwest::Url::parse(location)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"));
+        let script = match remote {
+            Some(remote) => {
+                // Direct, not through a proxy: the script is what picks the proxy.
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(PAC_FETCH_TIMEOUT)
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                client
+                    .get(remote)
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| format!("fetching the PAC script: {e}"))?
+                    .text()
+                    .await
+                    .map_err(|e| format!("reading the PAC script: {e}"))?
+            }
+            None => {
+                let path = reqwest::Url::parse(location)
+                    .ok()
+                    .filter(|u| u.scheme() == "file")
+                    .and_then(|u| u.to_file_path().ok())
+                    .unwrap_or_else(|| PathBuf::from(location));
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|e| format!("reading the PAC script {}: {e}", path.display()))?
+            }
+        };
+        // QuickJS is synchronous and can run long, so it stays off the async workers.
+        let proxy = self.proxy.clone();
+        let url = self.url.clone();
+        tokio::task::spawn_blocking(move || {
+            proxy.resolve_pac(&url, &script).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    /// The HTTP client for this download, with the given redirect policy and
+    /// proxy. The timeout is the same for every policy.
+    fn build_client(
+        &self,
+        redirect: reqwest::redirect::Policy,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<reqwest::Client, Error> {
         let mut builder = reqwest::Client::builder()
             .user_agent(concat!("TDM/", env!("CARGO_PKG_VERSION")))
-            // Applies to the whole request including the body, so it bounds a
-            // stalled transfer, not just a slow handshake.
-            .timeout(self.timeout)
+            // No whole-request limit: a large segment on a slow link may take far
+            // longer than `timeout` to finish. These bound the connect phase and
+            // each socket read, so a stalled connection still fails.
+            .connect_timeout(self.timeout)
+            .read_timeout(self.timeout)
             .redirect(redirect)
             // Keep one idle connection per segment so a segment's next request
             // reuses its socket instead of paying a new TCP (and TLS) handshake.
             .pool_max_idle_per_host(self.max_segments as usize)
             // Send each small request at once instead of waiting to fill a packet.
             .tcp_nodelay(true);
-        if let Some(p) = &self.proxy {
+        if let Some(p) = proxy {
             let wanted = [
                 p.http.then(|| reqwest::Proxy::http(&p.url)),
                 p.https.then(|| reqwest::Proxy::https(&p.url)),
@@ -624,7 +764,8 @@ impl Download {
         } else {
             reqwest::redirect::Policy::none()
         };
-        let client = self.build_client(policy)?;
+        let proxy = self.resolve_proxy().await;
+        let client = self.build_client(policy, proxy.as_ref())?;
 
         let configured = self.headers.lock().expect("headers lock").clone();
         let host = crate::hosts::HostLimits::host_key(&self.url);
@@ -638,7 +779,8 @@ impl Download {
         // FTP takes a different probe and a different fetch, but the same
         // segment planner: `REST` gives us a start offset, and the segment end
         // is enforced by closing the data socket, so a range is a range.
-        let is_ftp = self.url.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("ftp://"));
+        let is_ftp = self.url.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("ftp://"))
+            || self.url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("ftps://"));
 
         // Probe on every run, including a resume. It resolves the redirect
         // chain and re-confirms the size and range support. Resuming against a
@@ -674,8 +816,12 @@ impl Download {
         let on_disk = tokio::fs::metadata(&self.dest).await.ok().map(|m| m.len());
         // A sidecar written for another version of the file describes bytes the
         // server no longer has, so it is never resumed.
+        // Without an ETag or Last-Modified there is no way to tell that the file
+        // is still the same, so a sidecar is never resumed.
+        let has_validator = validators.etag.is_some() || validators.last_modified.is_some();
         let resumed = saved.filter(|s| {
-            s.ranged == ranged
+            has_validator
+                && s.ranged == ranged
                 && s.total == total
                 && s.validators == validators
                 && on_disk.is_some()
@@ -745,6 +891,8 @@ impl Download {
                 index,
                 ranged,
                 if_range: validators.if_range().map(str::to_owned),
+                validators: validators.clone(),
+                timeout: self.timeout,
                 segments: Arc::clone(&segments),
                 stop: Arc::clone(&self.stop),
                 rate: Arc::clone(&self.rate),
@@ -797,6 +945,11 @@ impl Download {
                     // very slow link gains nothing from more sockets.
                     let progressing = done_now > last_total_done;
                     last_total_done = done_now;
+                    // Bytes arriving on `live` connections is the host working
+                    // at that count, which is what clears a learned cap.
+                    if progressing && let Some(limits) = &self.hosts {
+                        limits.lock().expect("host limits").on_working(&host, live as u32);
+                    }
                     // Connections that have run a while but move far slower
                     // than the rest are split first, so their tails move to
                     // new connections.
@@ -825,9 +978,6 @@ impl Download {
                         && room > 0
                         && last_ramp.elapsed() >= RAMP_INTERVAL
                     {
-                        if let Some(limits) = &self.hosts {
-                            limits.lock().expect("host limits").on_working(&host, live as u32);
-                        }
                         // Double the pool (1, 2, 4, 8 ...).
                         let want = live.min(room);
                         let mut added = 0;
@@ -867,11 +1017,9 @@ impl Download {
                         }
                     }
                     Some(Ok((index, Err(e)))) => {
-                        // A refusal (503) or a connection that could not be
-                        // made tells us the host's limit: `live` connections were open.
-                        if matches!(e, Error::Status(503))
-                            || matches!(&e, Error::Http(h) if h.is_connect())
-                        {
+                        // A refusal or a dropped connection tells us the host's
+                        // limit: `live` connections, this one included, were open.
+                        if host_refused(&e) {
                             if let Some(limits) = &self.hosts {
                                 limits.lock().expect("host limits").on_refused(&host, live as u32);
                             }
@@ -901,10 +1049,13 @@ impl Download {
             }
         }
 
-        self.publish(&segments, total, ranged, &validators, &mut last_saved).await?;
+        // A failed final checkpoint must not hide an earlier real error: a full
+        // disk reported here would mask the failure that actually happened first.
+        let published = self.publish(&segments, total, ranged, &validators, &mut last_saved).await;
         if let Some(e) = first_error {
             return Err(e);
         }
+        published?;
         let all_done = segments.lock().expect("segments lock").iter().all(|s| s.complete);
         if all_done {
             let _ = tokio::fs::remove_file(self.state_path()).await;
@@ -1141,7 +1292,22 @@ async fn probe(
         }
 
         let validators = Validators::from_headers(resp.headers());
-        let server_hash = crate::serverhash::from_headers(resp.headers());
+        // A digest only describes the whole file: a 200, or a 206 that covers
+        // bytes 0 to total-1. A partial answer's digest is ignored.
+        let whole_file = match status {
+            200 => true,
+            206 => resp
+                .headers()
+                .get("Content-Range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range)
+                .is_some_and(|(start, end, total)| {
+                    start == 0 && total.is_some_and(|t| end.checked_add(1) == Some(t))
+                }),
+            _ => false,
+        };
+        let server_hash =
+            if whole_file { crate::serverhash::from_headers(resp.headers()) } else { None };
         return match status {
             206 => {
                 let total = resp
@@ -1306,6 +1472,10 @@ struct Worker {
     ranged: bool,
     /// Sent as `If-Range` on every ranged request. `None` when the server gave no validator.
     if_range: Option<String>,
+    /// The validators from the probe. Every 206 must still carry them.
+    validators: Validators,
+    /// Socket and per-read stall timeout, from the Connection page.
+    timeout: Duration,
     segments: Arc<Mutex<Vec<Segment>>>,
     stop: Arc<AtomicBool>,
     rate: Arc<Limiter>,
@@ -1329,6 +1499,8 @@ impl Worker {
                 return Ok(());
             }
             let url = self.urls[current].clone();
+            // Bytes written by this attempt. A non-ranged attempt restarts at zero.
+            let before = if self.ranged { self.done() } else { 0 };
             match self.fetch_once(&url).await {
                 Ok(()) => return Ok(()),
                 // A server that ignores Range, or answers with the wrong one,
@@ -1349,6 +1521,11 @@ impl Worker {
                     return Err(Error::Status(code));
                 }
                 Err(e) => {
+                    // An attempt that wrote bytes was progress, so the budget
+                    // counts consecutive attempts without progress only.
+                    if self.done() > before {
+                        attempt = 0;
+                    }
                     attempt += 1;
                     if attempt >= self.attempts {
                         return Err(e);
@@ -1360,6 +1537,11 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Bytes this segment has written so far.
+    fn done(&self) -> u64 {
+        self.segments.lock().expect("segments lock")[self.index].done
     }
 
     /// Fetch this segment over FTP.
@@ -1465,11 +1647,26 @@ impl Worker {
             if start != from || end != segment.end || total_disagrees {
                 return Err(Error::RangeMismatch { want, got: raw });
             }
+            // The range is right, but the bytes must also come from the version
+            // we probed. A changed validator, or none where we had one, means the
+            // file was replaced: the caller starts over rather than mix versions.
+            let now = Validators::from_headers(resp.headers());
+            let etag_changed = self.validators.etag.is_some() && now.etag != self.validators.etag;
+            let modified_changed = self.validators.last_modified.is_some()
+                && now.last_modified != self.validators.last_modified;
+            if etag_changed || modified_changed {
+                return Err(Error::ValidatorChanged);
+            }
         }
 
         let mut pos = from;
         let mut body = resp.bytes_stream();
-        while let Some(chunk) = body.next().await {
+        // The limit is per read, not per body: a read that waits longer than
+        // the timeout is a stall, however large the segment is.
+        while let Some(chunk) = tokio::time::timeout(self.timeout, body.next())
+            .await
+            .map_err(|_| Error::Stalled)?
+        {
             if self.stop.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -1589,6 +1786,24 @@ fn is_disk_full(e: &std::io::Error) -> bool {
 /// A write failure as an engine error: a full disk pauses, anything else is an I/O error.
 fn write_error(e: std::io::Error) -> Error {
     if is_disk_full(&e) { Error::DiskFull } else { Error::Io(e) }
+}
+
+/// Hash the file at `path` with the algorithm the server announced and compare
+/// it with the announced digest.
+fn verify_server_hash(
+    path: &Path,
+    expected: &crate::serverhash::ExpectedHash,
+) -> Result<(), String> {
+    let actual = crate::checksum::hash_file(path, expected.algo)
+        .map_err(|e| format!("could not read the file to check its server hash: {e}"))?;
+    if crate::serverhash::matches(expected, &actual) {
+        Ok(())
+    } else {
+        Err(format!(
+            "server hash mismatch: the file is not the {:?} digest the server announced",
+            expected.algo
+        ))
+    }
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -2251,6 +2466,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn only_a_503_or_a_refused_connection_counts_against_a_host() {
+        // A timeout is a slow host, not a full one, so it must not lower the cap.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let silent_url = format!("http://{}/", silent.local_addr().expect("addr"));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let timeout = client.get(&silent_url).send().await.expect_err("should time out");
+        assert!(!host_refused(&Error::Http(timeout)));
+        drop(silent);
+
+        // A port nothing listens on: the peer explicitly refused.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let closed_url = format!("http://{}/", closed.local_addr().expect("addr"));
+        drop(closed);
+        let refused = reqwest::Client::new().get(&closed_url).send().await.expect_err("refused");
+        assert!(host_refused(&Error::Http(refused)));
+
+        assert!(host_refused(&Error::Status(503)));
+        assert!(!host_refused(&Error::Status(500)));
+        assert!(!host_refused(&Error::Stalled));
+    }
+
     #[test]
     fn a_full_disk_error_is_recognised_by_its_os_code() {
         let full = if cfg!(windows) { 112 } else { 28 };
@@ -2281,6 +2521,29 @@ mod tests {
         assert_eq!(snap.status, Status::Paused);
         assert!(snap.paused_reason.is_some(), "the UI needs a reason to show");
         assert!(!dest.exists(), "nothing was allocated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_must_match_the_digest_the_server_announced() {
+        use crate::serverhash::{ExpectedHash, HashAlgo};
+        let dir = scratch("server-hash");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("abc.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        // MD5 of "abc", as raw bytes.
+        let md5 = |last: u8| ExpectedHash {
+            algo: HashAlgo::Md5,
+            bytes: vec![
+                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1,
+                0x7f, last,
+            ],
+        };
+
+        assert!(verify_server_hash(&path, &md5(0x72)).is_ok());
+        let reason = verify_server_hash(&path, &md5(0x73)).unwrap_err();
+        assert!(reason.contains("server hash mismatch"), "got {reason}");
+        assert!(path.exists(), "a file that fails the check is kept for the user");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

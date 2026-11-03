@@ -51,6 +51,8 @@ pub enum PacError {
     Script(String),
     #[error("PAC script did not return within {0:?}")]
     Timeout(Duration),
+    #[error(transparent)]
+    Proxy(#[from] ProxyError),
 }
 
 /// Why a proxy URL was refused.
@@ -149,20 +151,30 @@ fn parse_pac_result(answer: &str) -> PacDecision {
 }
 
 /// Check a proxy URL: scheme must be http, https, socks5 or socks5h, a host and
-/// a port must be present, and no credentials may be embedded.
+/// an explicit port must be present, and no credentials may be embedded.
 pub fn parse_proxy_url(s: &str) -> Result<reqwest::Url, ProxyError> {
     let url = reqwest::Url::parse(s).map_err(|e| ProxyError::Malformed(e.to_string()))?;
     match url.scheme() {
         "http" | "https" | "socks5" | "socks5h" => {}
         other => return Err(ProxyError::Scheme(other.to_string())),
     }
-    if url.host_str().is_none_or(str::is_empty) || url.port_or_known_default().is_none() {
+    if url.host_str().is_none_or(str::is_empty) || !has_explicit_port(s) {
         return Err(ProxyError::MissingHostOrPort);
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(ProxyError::Credentials);
     }
     Ok(url)
+}
+
+/// Whether the authority of `s` names a port. `Url` drops a default port such
+/// as `:80` from its own form, so the text itself is checked.
+fn has_explicit_port(s: &str) -> bool {
+    let rest = s.split_once("://").map_or(s, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    let after_host = host_port.rsplit_once(']').map_or(host_port, |(_, t)| t);
+    after_host.rsplit_once(':').is_some_and(|(_, port)| !port.is_empty())
 }
 
 #[cfg(test)]
@@ -256,5 +268,14 @@ mod tests {
         );
         assert!(parse_proxy_url("http://h:3128").is_ok());
         assert!(parse_proxy_url("socks5h://s.test:1080").is_ok());
+    }
+
+    #[test]
+    fn a_proxy_without_an_explicit_port_is_refused_not_defaulted() {
+        assert_eq!(parse_proxy_url("http://h").unwrap_err(), ProxyError::MissingHostOrPort);
+        // Written out, the default port is still a port the user named.
+        assert!(parse_proxy_url("http://h:80").is_ok());
+        let no_port = r#"function FindProxyForURL(u, h) { return "PROXY h"; }"#;
+        assert_eq!(pac_decide(no_port, "https://example.com/").unwrap(), PacDecision::Direct);
     }
 }

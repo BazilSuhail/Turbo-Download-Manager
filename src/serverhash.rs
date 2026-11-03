@@ -2,8 +2,8 @@
 //! headers, and hash the downloaded bytes with the same algorithm.
 //!
 //! Header priority: `Digest` (RFC 3230), then `Content-MD5`, then `x-goog-hash`.
-//! Within `Digest`, the first entry with a supported algorithm and a valid
-//! digest length wins. A malformed entry or header is skipped, and the next
+//! Within `Digest`, the strongest entry with a supported algorithm and a valid
+//! digest length wins (sha-512, sha-256, sha, md5). A malformed entry or header is skipped, and the next
 //! source is tried. `x-goog-hash` `crc32c=` is ignored.
 
 use crc32fast::Hasher as Crc32Hasher;
@@ -45,7 +45,10 @@ pub struct ExpectedHash {
 /// The expected hash from the response headers, or `None` when no header
 /// names a supported algorithm with a valid digest.
 pub fn from_headers(headers: &HeaderMap) -> Option<ExpectedHash> {
-    let digest = values(headers, "digest").find_map(parse_digest_header);
+    let digest = values(headers, "digest")
+        .flat_map(|v| v.split(','))
+        .filter_map(parse_digest_entry)
+        .max_by_key(|h| strength(h.algo));
     digest
         .or_else(|| values(headers, "content-md5").find_map(|v| expected(HashAlgo::Md5, v)))
         .or_else(|| {
@@ -67,19 +70,28 @@ fn values<'a>(headers: &'a HeaderMap, name: &'static str) -> impl Iterator<Item 
     headers.get_all(name).iter().filter_map(|v| v.to_str().ok())
 }
 
-/// RFC 3230: `algo=base64`, comma-separated. `sha` means SHA-1.
-fn parse_digest_header(value: &str) -> Option<ExpectedHash> {
-    value.split(',').find_map(|entry| {
-        let (name, b64) = entry.trim().split_once('=')?;
-        let algo = match name.trim().to_ascii_lowercase().as_str() {
-            "sha-256" => HashAlgo::Sha256,
-            "sha-512" => HashAlgo::Sha512,
-            "sha" => HashAlgo::Sha1,
-            "md5" => HashAlgo::Md5,
-            _ => return None,
-        };
-        expected(algo, b64)
-    })
+/// One RFC 3230 entry: `algo=base64`. `sha` means SHA-1.
+fn parse_digest_entry(entry: &str) -> Option<ExpectedHash> {
+    let (name, b64) = entry.trim().split_once('=')?;
+    let algo = match name.trim().to_ascii_lowercase().as_str() {
+        "sha-256" => HashAlgo::Sha256,
+        "sha-512" => HashAlgo::Sha512,
+        "sha" => HashAlgo::Sha1,
+        "md5" => HashAlgo::Md5,
+        _ => return None,
+    };
+    expected(algo, b64)
+}
+
+/// How much a digest algorithm is worth when several are announced.
+fn strength(algo: HashAlgo) -> u8 {
+    match algo {
+        HashAlgo::Sha512 => 4,
+        HashAlgo::Sha256 => 3,
+        HashAlgo::Sha1 => 2,
+        HashAlgo::Md5 => 1,
+        HashAlgo::Crc32 => 0,
+    }
 }
 
 /// Decode base64 text as a digest of `algo`. The length must match exactly.
@@ -318,6 +330,22 @@ mod tests {
             format!("sha-256=!!!, md5={}", b64_of_hex(MD5_ABC)),
         )]);
         assert_eq!(from_headers(&m).unwrap().algo, HashAlgo::Md5);
+    }
+
+    #[test]
+    fn digest_prefers_the_strongest_announced_algorithm() {
+        let md5 = b64_of_hex(MD5_ABC);
+        let sha1 = b64_of_hex(SHA1_ABC);
+        let sha256 = b64_of_hex(SHA256_ABC);
+        // Listed weakest first: the strongest still wins.
+        let m = headers(&[("digest", format!("md5={md5}, sha={sha1}, sha-256={sha256}"))]);
+        assert_eq!(from_headers(&m).unwrap().algo, HashAlgo::Sha256);
+        // Across several Digest headers too.
+        let m = headers(&[
+            ("digest", format!("md5={md5}")),
+            ("digest", format!("sha={sha1}")),
+        ]);
+        assert_eq!(from_headers(&m).unwrap().algo, HashAlgo::Sha1);
     }
 
     #[test]

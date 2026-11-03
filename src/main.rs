@@ -31,9 +31,11 @@ use iced::{window, Alignment, Color, Element, Length, Radians, Subscription, Tas
 
 use tdm::engine::Limiter;
 use tdm::filetype::{self, Kind, Verdict};
+use tdm::hosts::HostLimits;
 use tdm::ipc::{Advert, Incoming, Inbox};
-use tdm::model::{AUTO_RETRY_MAX, OptionsTab, Settings, WindowGeometry};
-use tdm::store::{DownloadList, DownloadRecord, Store};
+use tdm::model::{AUTO_RETRY_MAX, OptionsTab, ProxySettings, Settings, WindowGeometry};
+use tdm::secrets;
+use tdm::store::{find_duplicate, DownloadList, DownloadRecord, Store};
 use tdm::ui::assets::{self, Icon};
 use tdm::ui::fit::middle_ellipsis;
 use tdm::ui::menu::{Cmd, Item, MENU_BAR};
@@ -168,6 +170,10 @@ enum Message {
     CaptureStart,
     CaptureQueue,
     CaptureCancel,
+    /// Open the folder of the file this capture would duplicate.
+    CaptureOpenExisting,
+    /// Download a capture again although it duplicates a list entry.
+    CaptureAgain,
     /// The file-name field of a media prompt changed: the new stem.
     CaptureName(String),
     /// Open the folder picker for the front media prompt's save folder.
@@ -400,6 +406,9 @@ struct App {
     /// One limiter shared by every download, so a speed cap bounds their
     /// combined rate rather than each one independently.
     limiter: Arc<Limiter>,
+    /// Learned connection limits per host, shared by every download and saved
+    /// when one finishes or fails.
+    hosts: Arc<Mutex<HostLimits>>,
     /// Downloads handed over by a browser, drained on the next tick.
     inbox: Inbox,
     /// Capture rules published to a connecting extension.
@@ -593,13 +602,43 @@ fn rename_to_free_name(from: &std::path::Path, want: &std::path::Path, others: &
     Err(format!("no free name near {}", file_name_of(want)))
 }
 
-/// Copy a state file that failed to parse aside, before the next save
-/// replaces it with this session's defaults.
-fn keep_aside(path: &std::path::Path) {
-    let mut bad = path.as_os_str().to_owned();
-    bad.push(".corrupt");
-    if let Err(e) = std::fs::copy(path, &bad) {
-        tracing::warn!("could not keep a copy of {}: {e}", path.display());
+const PROXY_PASSWORD_KEY: &str = "proxy/password";
+
+/// Puts the proxy password back in memory from the OS keychain. The settings
+/// file holds only a reference to it. On any failure the reference is left
+/// as it is, so a locked keychain at boot does not lose the stored password.
+fn restore_proxy_password(proxy: &mut ProxySettings) {
+    let Some(key) = secrets::parse_reference(&proxy.password_ref) else { return };
+    match secrets::load(key) {
+        Ok(secret) => proxy.password = secret,
+        Err(e) => tracing::warn!("the proxy password could not be read from the keychain ({e})"),
+    }
+}
+
+/// Moves the proxy password into the OS keychain and leaves only a reference
+/// in `proxy`, which is the copy written to disk. The keychain is touched only
+/// when the user changed the password this session: an empty password that was
+/// never loaded (keychain locked at boot) keeps its reference. On any keychain
+/// error the reference stays as it was. When no keychain answers, the password
+/// stays out of the file and the warning is logged once per session.
+fn keep_proxy_password(proxy: &mut ProxySettings) {
+    static SESSION_ONLY_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if proxy.password.is_empty() {
+        if proxy.password_cleared {
+            match secrets::delete(PROXY_PASSWORD_KEY) {
+                Ok(()) | Err(secrets::SecretError::NotFound) => proxy.password_ref.clear(),
+                Err(e) => tracing::warn!("could not clear the proxy password in the keychain ({e})"),
+            }
+        }
+        return;
+    }
+    match secrets::store(PROXY_PASSWORD_KEY, &proxy.password) {
+        Ok(()) => proxy.password_ref = secrets::reference(PROXY_PASSWORD_KEY),
+        Err(e) => {
+            if !SESSION_ONLY_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("the proxy password is kept for this session only ({e})");
+            }
+        }
     }
 }
 
@@ -612,14 +651,21 @@ impl App {
     fn boot() -> (Self, Task<Message>) {
         let store = Store::default_location();
         // A corrupt settings file must not silently reset the user's
-        // categories, so report it and fall back for this run only.
-        let settings = match store.load_settings() {
+        // categories, so report it and fall back for this run only. The store
+        // has already moved the unreadable file aside.
+        let mut settings = match store.load_settings() {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("settings could not be loaded ({e}); using defaults for this session");
-                // Every exit saves settings, so keep the unreadable file now.
-                keep_aside(&store.settings_path());
                 Settings::default()
+            }
+        };
+        restore_proxy_password(&mut settings.proxy);
+        let hosts = match store.load_hosts() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("host limits could not be loaded ({e}); starting with none learned");
+                HostLimits::new()
             }
         };
         let limiter = Arc::new(Limiter::new(settings.speed_limit));
@@ -672,6 +718,7 @@ impl App {
             overlay_anim: Animation::new(true),
             store,
             limiter,
+            hosts: Arc::new(Mutex::new(hosts)),
             inbox,
             advert,
             capture_ready,
@@ -696,11 +743,7 @@ impl App {
                     app.push(rec, Status::Paused);
                 }
             }
-            // The next save would otherwise replace the whole list with an empty one.
-            Err(e) => {
-                tracing::warn!("the download list could not be loaded ({e})");
-                keep_aside(&app.store.list_path());
-            }
+            Err(e) => tracing::warn!("the download list could not be loaded ({e}); starting empty"),
         }
         // Idempotent, and slow enough (registry, files) to keep off the UI
         // thread. Failure only means the browser cannot reach us yet.
@@ -731,7 +774,8 @@ impl App {
             handle.set_header("User-Agent", self.settings.downloads.user_agent.clone());
         }
         handle.set_limiter(Arc::clone(&self.limiter));
-        handle.set_proxy(self.settings.proxy.resolved());
+        handle.set_host_limits(Arc::clone(&self.hosts));
+        handle.set_proxy(self.settings.proxy.clone());
         handle.set_limits(self.settings.connection.retries, self.settings.connection.timeout_secs);
         handle.set_mirrors(rec.mirrors.clone());
         let mut snapshot = handle.snapshot();
@@ -858,8 +902,17 @@ impl App {
     }
 
     fn save_settings(&self) {
-        if let Err(e) = self.store.save_settings(&self.settings) {
+        let mut settings = self.settings.clone();
+        keep_proxy_password(&mut settings.proxy);
+        if let Err(e) = self.store.save_settings(&settings) {
             tracing::error!("could not save settings: {e}");
+        }
+    }
+
+    fn save_hosts(&self) {
+        let limits = self.hosts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(e) = self.store.save_hosts(&limits) {
+            tracing::error!("could not save host limits: {e}");
         }
     }
 
@@ -1490,7 +1543,7 @@ impl App {
                 }
                 // The proxy is read when a download builds its HTTP client, so
                 // this reaches anything not already running.
-                let proxy = self.settings.proxy.resolved();
+                let proxy = self.settings.proxy.clone();
                 let (retries, timeout) =
                     (self.settings.connection.retries, self.settings.connection.timeout_secs);
                 for e in &mut self.downloads {
@@ -1556,6 +1609,9 @@ impl App {
                         }
                         _ => {}
                     }
+                    if matches!(self.downloads[ix].snapshot.status, Status::Finished | Status::Failed) {
+                        self.save_hosts();
+                    }
                     let finished = self.downloads[ix].snapshot.status == Status::Finished;
                     if finished && !self.focused && self.settings.downloads.flash_on_complete {
                         flash = window::latest().then(|id| match id {
@@ -1578,6 +1634,17 @@ impl App {
                     }
                     if finished {
                         self.check_file_type(ix);
+                        let archive = self.downloads[ix].handle.dest().to_owned();
+                        if self.settings.downloads.extract_archives && tdm::extract::is_archive(&archive) {
+                            // Unpacking can take a while: run it off the UI thread and log the outcome.
+                            std::thread::spawn(move || {
+                                let dir = archive.parent().map(|p| p.to_owned()).unwrap_or_default();
+                                match tdm::extract::extract(&archive, &dir, &tdm::extract::Limits::default()) {
+                                    Ok(done) => tracing::info!(files = done.files.len(), "archive extracted: {}", archive.display()),
+                                    Err(e) => tracing::warn!("archive not extracted ({}): {e}", archive.display()),
+                                }
+                            });
+                        }
                     }
                 }
                 self.save();
@@ -1683,8 +1750,19 @@ impl App {
                 }
                 iced::widget::operation::focus(URL_INPUT)
             }
-            Message::CaptureStart => self.accept_capture(true),
-            Message::CaptureQueue => self.accept_capture(false),
+            Message::CaptureStart => self.accept_capture(true, false),
+            Message::CaptureQueue => self.accept_capture(false, false),
+            Message::CaptureAgain => self.accept_capture(true, true),
+            Message::CaptureOpenExisting => {
+                let existing = self.prompts.front().and_then(|item| self.existing_download(item));
+                self.pop_prompt();
+                if let Some(dir) = existing.as_deref().and_then(|p| p.parent()) {
+                    if let Err(err) = open::that_detached(dir) {
+                        self.toast(ToastKind::Error, format!("Could not open the folder: {err}"));
+                    }
+                }
+                Task::none()
+            }
             Message::CaptureCancel => {
                 self.pop_prompt();
                 Task::none()
@@ -1846,8 +1924,13 @@ impl App {
     }
 
     /// Add the front browser download, started now or left paused in the queue.
-    fn accept_capture(&mut self, start: bool) -> Task<Message> {
+    /// A download the list already has waits in its dialog unless `force` is set
+    /// by "Download again".
+    fn accept_capture(&mut self, start: bool, force: bool) -> Task<Message> {
         let Some(default) = self.prompts.front().map(capture_name) else { return Task::none() };
+        if !force && self.prompts.front().is_some_and(|item| self.existing_download(item).is_some()) {
+            return Task::none();
+        }
         // Only an edited name or a picked folder changes the path; otherwise
         // the path is the one every other download gets.
         let custom = self.prompt_name.is_some() || self.prompt_dir.is_some();
@@ -1881,6 +1964,27 @@ impl App {
         self.push(rec, if start { Status::Queued } else { Status::Paused });
         self.save();
         if start { self.start_ready() } else { Task::none() }
+    }
+
+    /// The file of a list entry that `item` would duplicate, if any.
+    fn existing_download(&self, item: &Incoming) -> Option<PathBuf> {
+        let name = capture_name(item);
+        let records: Vec<DownloadRecord> = self
+            .downloads
+            .iter()
+            .map(|e| DownloadRecord {
+                url: e.handle.url().to_owned(),
+                dest: e.handle.dest().to_owned(),
+                category_id: None,
+                headers: Vec::new(),
+                mirrors: Vec::new(),
+                total: e.snapshot.total,
+                complete: false,
+                kind: None,
+                content_type: None,
+            })
+            .collect();
+        find_duplicate(&records, &item.url, &name, item.size).map(|r| r.dest.clone())
     }
 
     /// Remove the front browser download, and forget the edits made to its prompt.
@@ -3410,6 +3514,9 @@ impl App {
     fn capture_dialog(&self, p: &Palette) -> Element<'_, Message> {
         let Some(item) = self.prompts.front() else { return space(Length::Shrink, Length::Shrink).into() };
         let name = capture_name(item);
+        if let Some(existing) = self.existing_download(item) {
+            return self.duplicate_dialog(p, item, &existing);
+        }
         if is_media_name(&name) {
             return self.media_capture_dialog(p, item, &name);
         }
@@ -3442,6 +3549,39 @@ impl App {
                 button(text("Cancel").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureCancel),
                 button(text("Add to queue").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureQueue),
                 button(text("Download now").size(13)).padding([7, 16]).style(theme::accent).on_press(Message::CaptureStart),
+            ]
+            .spacing(8),
+        ]
+        .spacing(10)
+        .max_width(520)
+        .into()
+    }
+
+    /// The prompt for a download the list already has: where the file is, and
+    /// whether to open its folder, download it again, or drop the offer.
+    fn duplicate_dialog(&self, p: &Palette, item: &Incoming, existing: &std::path::Path) -> Element<'_, Message> {
+        let name = capture_name(item);
+        let folder = existing.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        let more = self.prompts.len() - 1;
+        column![
+            row![glyph(Icon::Shield, 20.0, p.warning), text("Already downloaded").size(16).font(bold())]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            tip_long(
+                text(middle_ellipsis(&name, 48)).size(15).font(bold()).wrapping(text::Wrapping::None),
+                name,
+            ),
+            text("This file is already in your downloads.").size(13).wrapping(text::Wrapping::WordOrGlyph),
+            tip_long(
+                text(format!("Saved in: {}", middle_ellipsis(&folder, 52))).size(12).color(p.muted).wrapping(text::Wrapping::None),
+                folder,
+            ),
+            text(if more > 0 { format!("{more} more waiting") } else { String::new() }).size(11).color(p.muted),
+            row![
+                space(Length::Fill, Length::Shrink),
+                button(text("Cancel").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureCancel),
+                button(text("Open folder").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureOpenExisting),
+                button(text("Download again").size(13)).padding([7, 16]).style(theme::accent).on_press(Message::CaptureAgain),
             ]
             .spacing(8),
         ]
@@ -3724,7 +3864,7 @@ fn parse_mirrors(text: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|l| {
             let l = l.to_ascii_lowercase();
-            l.starts_with("http://") || l.starts_with("https://") || l.starts_with("ftp://")
+            l.starts_with("http://") || l.starts_with("https://") || l.starts_with("ftp://") || l.starts_with("ftps://")
         })
         .map(str::to_owned)
         .collect()
@@ -4264,6 +4404,7 @@ mod tests {
             settings,
             store: Store::at(std::env::temp_dir().join("tdm-ui-tests")),
             limiter,
+            hosts: Arc::new(Mutex::new(HostLimits::new())),
             inbox: Arc::new(Mutex::new(Vec::new())),
             advert,
             capture_ready: false,

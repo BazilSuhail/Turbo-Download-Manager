@@ -205,7 +205,10 @@ pub fn update(s: &mut Settings, message: Message) {
             }
         }
         ProxyUser(v) => s.proxy.user = v,
-        ProxyPassword(v) => s.proxy.password = v,
+        ProxyPassword(v) => {
+            s.proxy.password_cleared = v.is_empty();
+            s.proxy.password = v;
+        }
         ProxyUseHttp(v) => s.proxy.use_http = v,
         ProxyUseHttps(v) => s.proxy.use_https = v,
         ProxyUseFtp(v) => s.proxy.use_ftp = v,
@@ -866,8 +869,8 @@ fn proxy(s: &Settings) -> Element<'_, Message> {
             .align_y(iced::Alignment::Center),
         );
         col = col.push(note(
-            "The password is kept for this session only — it is never written to \
-             the settings file.",
+            "The password is kept in the OS keychain. If no keychain is \
+             available, it is kept for this session only.",
         ));
         col = col.push(text("Use the proxy for:").size(13));
         col = col.push(check("http", p.use_http, Message::ProxyUseHttp));

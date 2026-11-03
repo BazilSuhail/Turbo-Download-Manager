@@ -57,6 +57,28 @@ async function refresh(cmd = "status", extra = {}) {
 $("reconnect").addEventListener("click", () => refresh("reconnect"));
 $("enabled").addEventListener("change", (e) => refresh("setEnabled", { value: e.target.checked }));
 
+// Optional override of the app's minimum size, in KiB. Empty removes it, so the
+// app's own setting applies again.
+const MIN_KIB_KEY = "captureMinKib";
+api.storage.local
+  .get(MIN_KIB_KEY)
+  .then((v) => {
+    if (typeof v[MIN_KIB_KEY] === "number") $("captureMinKib").value = v[MIN_KIB_KEY];
+  })
+  .catch(() => null);
+$("captureMinKib").addEventListener("change", (e) => {
+  const text = e.target.value.trim();
+  const kib = Number(text);
+  if (text === "" || !Number.isFinite(kib)) {
+    e.target.value = "";
+    api.storage.local.remove(MIN_KIB_KEY).catch(() => null);
+  } else {
+    const floored = Math.max(0, Math.floor(kib));
+    e.target.value = floored;
+    api.storage.local.set({ [MIN_KIB_KEY]: floored }).catch(() => null);
+  }
+});
+
 // permissions.request needs a user gesture, so it lives here, not in the
 // background, and must be the first await (Firefox drops the gesture after one).
 $("grantCookies").addEventListener("click", async () => {

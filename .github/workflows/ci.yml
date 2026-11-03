@@ -1,5 +1,8 @@
-# CI: builds the app on every push and pull request, on Windows and Linux.
-# Release packaging lives in release.yml.
+# CI is paused while the phases are being completed.
+#
+# On every push and pull request this workflow only prints a message. It does not
+# build, test or release anything. The full Windows and Linux build is kept below,
+# commented out. To turn it back on: uncomment the block and delete the placeholder job.
 
 name: CI
 
@@ -10,35 +13,56 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-22.04]
+  paused:
+    name: CI paused
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - run: echo "CI build is paused until all phases are complete. Nothing was built."
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      # build.rs runs extension/build.mjs with Node.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Linux GUI libraries
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
-            libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --release
+# --- Full build (paused, uncomment to re-enable) ---
+#
+# # CI: builds the app on every push and pull request, on Windows and Linux.
+# # Release packaging lives in release.yml.
+#
+# name: CI
+#
+# on:
+#   push:
+#   pull_request:
+#
+# permissions:
+#   contents: read
+#
+# env:
+#   CARGO_TERM_COLOR: always
+#
+# jobs:
+#   build:
+#     name: Build (${{ matrix.os }})
+#     runs-on: ${{ matrix.os }}
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         os: [windows-latest, ubuntu-22.04]
+#     steps:
+#       - uses: actions/checkout@v4
+#
+#       - uses: dtolnay/rust-toolchain@stable
+#
+#       # build.rs runs extension/build.mjs with Node.
+#       - uses: actions/setup-node@v4
+#         with:
+#           node-version: "20"
+#
+#       - name: Linux GUI libraries
+#         if: runner.os == 'Linux'
+#         run: |
+#           sudo apt-get update
+#           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+#             libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev
+#
+#       - uses: Swatinem/rust-cache@v2
+#
+#       - name: Build
+#         run: cargo build --release

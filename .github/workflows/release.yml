@@ -1,238 +1,252 @@
-# Release: push a tag such as v1.1.0 and this builds the installers for
-# Windows and Linux, then publishes a GitHub release.
+# Release is paused while the phases are being completed.
 #
-#   node scripts/bump-version.mjs 1.1.0
-#   git commit -am "chore: release v1.1.0"
-#   git tag v1.1.0 && git push origin main v1.1.0
-#
-# The tag must match the version in Cargo.toml, the extension manifest and the
-# Linux AppStream file; the check-version job stops the release if they differ.
-# Tags with a hyphen (v1.2.0-beta.1) are published as pre-releases. The release
-# title and description come from Cargo.toml, and the notes list every commit
-# since the previous tag. See docs/RELEASING.md.
+# Pushes and tags no longer build or publish anything. This workflow only prints a
+# message when it is started by hand (Actions tab > Release > Run workflow).
+# The full release pipeline is kept below, commented out. To turn it back on:
+# uncomment the block, delete the placeholder job, and restore the tag trigger.
 
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
-  contents: write
-
-env:
-  CARGO_TERM_COLOR: always
+  contents: read
 
 jobs:
-  check-version:
-    name: Check tag matches Cargo.toml
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.check.outputs.version }}
-      prerelease: ${{ steps.check.outputs.prerelease }}
+  paused:
+    name: Release paused
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - id: check
-        shell: bash
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "$tag" != "$cargo_version" ]; then
-            echo "Tag v$tag does not match Cargo.toml version $cargo_version." >&2
-            exit 1
-          fi
-          ext_version=$(node -p "require('./extension/manifest.json').version")
-          if [ "$tag" != "$ext_version" ]; then
-            echo "Tag v$tag does not match extension/manifest.json version $ext_version." >&2
-            exit 1
-          fi
-          if ! grep -q "<release version=\"$tag\"" packaging/linux/app.tdm.metainfo.xml; then
-            echo "packaging/linux/app.tdm.metainfo.xml has no <release version=\"$tag\"> entry." >&2
-            exit 1
-          fi
-          if [[ "$tag" == *-* ]]; then pre=true; else pre=false; fi
-          echo "version=$tag" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+      - run: echo "Release is paused until all phases are complete. Nothing was built or published."
 
-  build:
-    name: Build ${{ matrix.name }}
-    needs: check-version
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: windows
-            os: windows-latest
-            formats: nsis,wix
-          - name: linux
-            os: ubuntu-22.04
-            formats: deb,appimage
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Linux GUI libraries
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
-            libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install packaging tools
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-packager${{ runner.os == 'Linux' && ',cargo-generate-rpm' || '' }}
-
-      # build.rs also builds the browser extension (extension/dist) with Node.
-      - name: Build the app
-        run: cargo build --release
-
-      - name: Package installers
-        shell: bash
-        run: cargo packager --release --formats ${{ matrix.formats }}
-
-      - name: Build the .rpm package
-        if: runner.os == 'Linux'
-        run: cargo generate-rpm
-
-      - name: Collect installers
-        shell: bash
-        run: |
-          mkdir -p dist
-          # find + NUL-separated paths, so product names with spaces are copied intact.
-          # Search all of target/. Packagers write installers into different
-          # subfolders (WiX puts the .msi under target/release/wix/...), so depth is not limited.
-          find target -type f \
-            \( -name '*-setup.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) \
-            -not -path '*/deps/*' -not -path '*/build/*' \
-            -print0 | xargs -0 -r -I{} cp "{}" dist/
-          if [ -z "$(ls -A dist)" ]; then
-            echo "No installers were produced for ${{ matrix.name }}." >&2
-            exit 1
-          fi
-          ls -la dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: installers-${{ matrix.name }}
-          path: dist/*
-          if-no-files-found: error
-
-  publish:
-    name: Publish GitHub release
-    needs: [check-version, build]
-    # Publish whatever builds succeeded. A platform whose build failed is listed
-    # in the release notes instead of blocking the whole release. Skipped only if
-    # the version check failed or the run was cancelled.
-    if: ${{ always() && needs.check-version.result == 'success' && needs.build.result != 'cancelled' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: installers-*
-          path: release
-          merge-multiple: true
-
-      - name: Require at least one installer
-        shell: bash
-        run: |
-          if [ -z "$(ls -A release 2>/dev/null)" ]; then
-            echo "No platform produced an installer, so there is nothing to publish." >&2
-            exit 1
-          fi
-          ls -la release
-
-      - name: Checksums
-        shell: bash
-        working-directory: release
-        run: sha256sum * > SHA256SUMS.txt
-
-      - name: Title and description from Cargo.toml
-        id: meta
-        shell: bash
-        env:
-          VERSION: ${{ needs.check-version.outputs.version }}
-        run: |
-          product=$(grep -m1 '^product-name' Cargo.toml | cut -d'"' -f2)
-          summary=$(grep -m1 '^description' Cargo.toml | cut -d'"' -f2)
-          details=$(grep -m1 '^long-description' Cargo.toml | cut -d'"' -f2)
-          echo "title=$product v$VERSION" >> "$GITHUB_OUTPUT"
-
-          # Platforms whose installers are missing, so the notes can say so.
-          missing=""
-          ls release/*-setup.exe release/*.msi >/dev/null 2>&1 || missing="$missing Windows,"
-          ls release/*.deb release/*.AppImage release/*.rpm >/dev/null 2>&1 || missing="$missing Linux,"
-          missing="${missing%,}"
-          echo "missing=${missing# }" >> "$GITHUB_OUTPUT"
-
-          previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
-          if [ -n "$previous" ]; then
-            changes=$(git log --no-merges --pretty='- %s (%h)' "$previous..$GITHUB_REF_NAME")
-            range="Changes since $previous"
-          else
-            changes=$(git log --no-merges --pretty='- %s (%h)' "$GITHUB_REF_NAME")
-            range="Changes in this first release"
-          fi
-
-          {
-            echo "<p align=\"center\"><img src=\"https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/assets/tdm-logo.png\" width=\"140\" alt=\"$product logo\"></p>"
-            echo
-            echo "# $product v$VERSION"
-            echo
-            if [ -n "$missing" ]; then
-              echo "> **Not in this release:** $missing. Those builds failed. Check the Actions run for the error."
-              echo
-            fi
-            echo "$summary"
-            echo
-            echo "$details"
-            echo
-            echo "## Downloads"
-            echo
-            echo "| File | What it is |"
-            echo "|---|---|"
-            for file in release/*; do
-              name=$(basename "$file")
-              case "$name" in
-                *-setup.exe) what="Windows installer (NSIS, per user, no admin prompt)" ;;
-                *.msi)       what="Windows installer (MSI)" ;;
-                *.deb)       what="Debian / Ubuntu package" ;;
-                *.rpm)       what="Fedora / openSUSE package" ;;
-                *.AppImage)  what="Linux portable app (run directly)" ;;
-                SHA256SUMS.txt) what="SHA-256 checksums for every file" ;;
-                *)           what="" ;;
-              esac
-              echo "| $name | $what |"
-            done
-            echo
-            echo "## $range"
-            echo
-            echo "$changes"
-            echo
-            echo "## Verify your download"
-            echo
-            echo 'Compare the file with `SHA256SUMS.txt`, for example on Windows: `certutil -hashfile <file> SHA256`.'
-          } > notes.md
-
-      - name: Publish
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ steps.meta.outputs.title }}
-          tag_name: ${{ github.ref_name }}
-          body_path: notes.md
-          files: release/*
-          prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
-          make_latest: ${{ needs.check-version.outputs.prerelease != 'true' }}
-          fail_on_unmatched_files: true
+# --- Full release pipeline (paused, uncomment to re-enable) ---
+#
+# # Release: push a tag such as v1.1.0 and this builds the installers for
+# # Windows and Linux, then publishes a GitHub release.
+# #
+# #   node scripts/bump-version.mjs 1.1.0
+# #   git commit -am "chore: release v1.1.0"
+# #   git tag v1.1.0 && git push origin main v1.1.0
+# #
+# # The tag must match the version in Cargo.toml, the extension manifest and the
+# # Linux AppStream file; the check-version job stops the release if they differ.
+# # Tags with a hyphen (v1.2.0-beta.1) are published as pre-releases. The release
+# # title and description come from Cargo.toml, and the notes list every commit
+# # since the previous tag. See docs/RELEASING.md.
+#
+# name: Release
+#
+# on:
+#   push:
+#     tags: ["v*"]
+#
+# permissions:
+#   contents: write
+#
+# env:
+#   CARGO_TERM_COLOR: always
+#
+# jobs:
+#   check-version:
+#     name: Check tag matches Cargo.toml
+#     runs-on: ubuntu-latest
+#     outputs:
+#       version: ${{ steps.check.outputs.version }}
+#       prerelease: ${{ steps.check.outputs.prerelease }}
+#     steps:
+#       - uses: actions/checkout@v4
+#       - id: check
+#         shell: bash
+#         run: |
+#           tag="${GITHUB_REF_NAME#v}"
+#           cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+#           if [ "$tag" != "$cargo_version" ]; then
+#             echo "Tag v$tag does not match Cargo.toml version $cargo_version." >&2
+#             exit 1
+#           fi
+#           ext_version=$(node -p "require('./extension/manifest.json').version")
+#           if [ "$tag" != "$ext_version" ]; then
+#             echo "Tag v$tag does not match extension/manifest.json version $ext_version." >&2
+#             exit 1
+#           fi
+#           if ! grep -q "<release version=\"$tag\"" packaging/linux/app.tdm.metainfo.xml; then
+#             echo "packaging/linux/app.tdm.metainfo.xml has no <release version=\"$tag\"> entry." >&2
+#             exit 1
+#           fi
+#           if [[ "$tag" == *-* ]]; then pre=true; else pre=false; fi
+#           echo "version=$tag" >> "$GITHUB_OUTPUT"
+#           echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+#
+#   build:
+#     name: Build ${{ matrix.name }}
+#     needs: check-version
+#     runs-on: ${{ matrix.os }}
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         include:
+#           - name: windows
+#             os: windows-latest
+#             formats: nsis,wix
+#           - name: linux
+#             os: ubuntu-22.04
+#             formats: deb,appimage
+#     steps:
+#       - uses: actions/checkout@v4
+#
+#       - uses: dtolnay/rust-toolchain@stable
+#
+#       - uses: actions/setup-node@v4
+#         with:
+#           node-version: "20"
+#
+#       - name: Linux GUI libraries
+#         if: runner.os == 'Linux'
+#         run: |
+#           sudo apt-get update
+#           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+#             libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev
+#
+#       - uses: Swatinem/rust-cache@v2
+#
+#       - name: Install packaging tools
+#         uses: taiki-e/install-action@v2
+#         with:
+#           tool: cargo-packager${{ runner.os == 'Linux' && ',cargo-generate-rpm' || '' }}
+#
+#       # build.rs also builds the browser extension (extension/dist) with Node.
+#       - name: Build the app
+#         run: cargo build --release
+#
+#       - name: Package installers
+#         shell: bash
+#         run: cargo packager --release --formats ${{ matrix.formats }}
+#
+#       - name: Build the .rpm package
+#         if: runner.os == 'Linux'
+#         run: cargo generate-rpm
+#
+#       - name: Collect installers
+#         shell: bash
+#         run: |
+#           mkdir -p dist
+#           find target -type f \
+#             \( -name '*-setup.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) \
+#             -not -path '*/deps/*' -not -path '*/build/*' \
+#             -print0 | xargs -0 -r -I{} cp "{}" dist/
+#           if [ -z "$(ls -A dist)" ]; then
+#             echo "No installers were produced for ${{ matrix.name }}." >&2
+#             exit 1
+#           fi
+#           ls -la dist
+#
+#       - uses: actions/upload-artifact@v4
+#         with:
+#           name: installers-${{ matrix.name }}
+#           path: dist/*
+#           if-no-files-found: error
+#
+#   publish:
+#     name: Publish GitHub release
+#     needs: [check-version, build]
+#     if: ${{ always() && needs.check-version.result == 'success' && needs.build.result != 'cancelled' }}
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#         with:
+#           fetch-depth: 0
+#
+#       - uses: actions/download-artifact@v4
+#         with:
+#           pattern: installers-*
+#           path: release
+#           merge-multiple: true
+#
+#       - name: Require at least one installer
+#         shell: bash
+#         run: |
+#           if [ -z "$(ls -A release 2>/dev/null)" ]; then
+#             echo "No platform produced an installer, so there is nothing to publish." >&2
+#             exit 1
+#           fi
+#           ls -la release
+#
+#       - name: Checksums
+#         shell: bash
+#         working-directory: release
+#         run: sha256sum * > SHA256SUMS.txt
+#
+#       - name: Title and description from Cargo.toml
+#         id: meta
+#         shell: bash
+#         env:
+#           VERSION: ${{ needs.check-version.outputs.version }}
+#         run: |
+#           product=$(grep -m1 '^product-name' Cargo.toml | cut -d'"' -f2)
+#           summary=$(grep -m1 '^description' Cargo.toml | cut -d'"' -f2)
+#           details=$(grep -m1 '^long-description' Cargo.toml | cut -d'"' -f2)
+#           echo "title=$product v$VERSION" >> "$GITHUB_OUTPUT"
+#           missing=""
+#           ls release/*-setup.exe release/*.msi >/dev/null 2>&1 || missing="$missing Windows,"
+#           ls release/*.deb release/*.AppImage release/*.rpm >/dev/null 2>&1 || missing="$missing Linux,"
+#           missing="${missing%,}"
+#           echo "missing=${missing# }" >> "$GITHUB_OUTPUT"
+#           previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
+#           if [ -n "$previous" ]; then
+#             changes=$(git log --no-merges --pretty='- %s (%h)' "$previous..$GITHUB_REF_NAME")
+#             range="Changes since $previous"
+#           else
+#             changes=$(git log --no-merges --pretty='- %s (%h)' "$GITHUB_REF_NAME")
+#             range="Changes in this first release"
+#           fi
+#           {
+#             echo "<p align=\"center\"><img src=\"https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/assets/tdm-logo.png\" width=\"140\" alt=\"$product logo\"></p>"
+#             echo
+#             echo "# $product v$VERSION"
+#             echo
+#             if [ -n "$missing" ]; then
+#               echo "> **Not in this release:** $missing. Those builds failed. Check the Actions run for the error."
+#               echo
+#             fi
+#             echo "$summary"
+#             echo
+#             echo "$details"
+#             echo
+#             echo "## Downloads"
+#             echo
+#             echo "| File | What it is |"
+#             echo "|---|---|"
+#             for file in release/*; do
+#               name=$(basename "$file")
+#               case "$name" in
+#                 *-setup.exe) what="Windows installer (NSIS, per user, no admin prompt)" ;;
+#                 *.msi)       what="Windows installer (MSI)" ;;
+#                 *.deb)       what="Debian / Ubuntu package" ;;
+#                 *.rpm)       what="Fedora / openSUSE package" ;;
+#                 *.AppImage)  what="Linux portable app (run directly)" ;;
+#                 SHA256SUMS.txt) what="SHA-256 checksums for every file" ;;
+#                 *)           what="" ;;
+#               esac
+#               echo "| $name | $what |"
+#             done
+#             echo
+#             echo "## $range"
+#             echo
+#             echo "$changes"
+#             echo
+#             echo "## Verify your download"
+#             echo
+#             echo 'Compare the file with `SHA256SUMS.txt`, for example on Windows: `certutil -hashfile <file> SHA256`.'
+#           } > notes.md
+#
+#       - name: Publish
+#         uses: softprops/action-gh-release@v2
+#         with:
+#           name: ${{ steps.meta.outputs.title }}
+#           tag_name: ${{ github.ref_name }}
+#           body_path: notes.md
+#           files: release/*
+#           prerelease: ${{ needs.check-version.outputs.prerelease == 'true' }}
+#           make_latest: ${{ needs.check-version.outputs.prerelease != 'true' }}
+#           fail_on_unmatched_files: true

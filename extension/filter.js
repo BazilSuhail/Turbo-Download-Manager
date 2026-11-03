@@ -46,6 +46,12 @@ export function shouldCapture(url, filename, lists) {
   return lists.captureExtensions.includes(extensionOf(url, filename));
 }
 
+/// Whether a download is below the size floor and should stay with the browser.
+/// Only a known size counts: the browser reports an unknown one as -1 or 0.
+export function belowMinSize(size, minBytes) {
+  return !!minBytes && size > 0 && size < minBytes;
+}
+
 /// Firefox exposes the promise-based `browser`; Chromium only has `chrome`
 /// (promise-based in MV3 too). Prefer `browser` when both exist.
 export function pickApi(scope) {

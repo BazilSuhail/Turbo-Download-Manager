@@ -128,27 +128,45 @@ fn read_probe<T: DeserializeOwned>(path: &Path) -> Result<Probe<T>, StoreError> 
 
 /// Before a lifecycle save replaces `path`, keep the current file as the
 /// backup, but only if it is valid JSON. A corrupt main never overwrites a
-/// good backup.
+/// good backup. The copy goes to a temp file that is synced and then renamed
+/// over the backup, so a crash mid-copy leaves the previous `.bak` intact.
 fn keep_backup(path: &Path) -> Result<(), StoreError> {
     if let Ok(Probe::Value(_)) = read_probe::<serde_json::Value>(path) {
-        std::fs::copy(path, backup_path(path))?;
+        let bak = backup_path(path);
+        let tmp = with_suffix(&bak, ".tmp");
+        std::fs::copy(path, &tmp)?;
+        std::fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &bak)?;
     }
     Ok(())
 }
 
+/// Renames `path` to a `.corrupt-<secs>.bak` name that no file holds yet. The
+/// name is claimed with `create_new`, so an existing corrupt file is never
+/// overwritten.
 fn move_aside(path: &Path) -> io::Result<PathBuf> {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut aside = with_suffix(path, &format!(".corrupt-{secs}.bak"));
-    let mut n = 1;
-    while aside.exists() {
-        aside = with_suffix(path, &format!(".corrupt-{secs}-{n}.bak"));
-        n += 1;
+    let names = std::iter::once(format!(".corrupt-{secs}.bak"))
+        .chain((1u64..).map(|n| format!(".corrupt-{secs}-{n}.bak")));
+    for suffix in names {
+        let aside = with_suffix(path, &suffix);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&aside) {
+            Ok(claim) => {
+                drop(claim);
+                if let Err(e) = std::fs::rename(path, &aside) {
+                    let _ = std::fs::remove_file(&aside);
+                    return Err(e);
+                }
+                return Ok(aside);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    std::fs::rename(path, &aside)?;
-    Ok(aside)
+    unreachable!("the name sequence is infinite")
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -213,6 +231,18 @@ mod tests {
         write_json_durable(&path, &Doc { n: 2 }, SyncMode::Lifecycle).unwrap();
         let bak: Doc = serde_json::from_slice(&std::fs::read(backup_path(&path)).unwrap()).unwrap();
         assert_eq!(bak, Doc { n: 1 });
+    }
+
+    #[test]
+    fn backup_is_complete_after_repeated_lifecycle_writes_and_no_temp_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        for n in 1..=3 {
+            write_json_durable(&path, &Doc { n }, SyncMode::Lifecycle).unwrap();
+        }
+        let bak: Doc = serde_json::from_slice(&std::fs::read(backup_path(&path)).unwrap()).unwrap();
+        assert_eq!(bak, Doc { n: 2 });
+        assert!(!with_suffix(&backup_path(&path), ".tmp").exists());
     }
 
     #[test]

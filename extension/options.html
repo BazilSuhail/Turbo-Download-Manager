@@ -46,6 +46,14 @@
         </div>
         <p class="hint">With this off, nothing is intercepted; the right-click items, the popup and the video button still work.</p>
         <div class="row spread">
+          <label for="captureMinKib"><strong>Skip downloads smaller than</strong></label>
+          <span class="buttons">
+            <input id="captureMinKib" type="number" min="0" step="1" inputmode="numeric" placeholder="App setting" aria-describedby="captureMinHint" />
+            <span>KiB</span>
+          </span>
+        </div>
+        <p class="hint" id="captureMinHint">Leave empty to use the value set in the TDM app. 0 captures every size. Only applies when the browser knows the file size.</p>
+        <div class="row spread">
           <p class="hint" id="incogText">Checking private windows…</p>
           <button id="incogBtn" class="btn" type="button" hidden>Open settings</button>
         </div>

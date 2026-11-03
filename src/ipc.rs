@@ -286,13 +286,18 @@ fn dispatch(request: Request, inbox: &Inbox, advert: &Arc<Mutex<Advert>>) -> Res
         }
         Request::Hello { .. } => {
             *LAST_HELLO.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+            // Read from disk because the settings are saved on every change and
+            // the capture advert does not carry this value.
+            let min_kib = crate::store::Store::default_location()
+                .load_settings()
+                .map_or(0, |s| s.capture_min_size_kib);
             let a = advert.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Response::Ready {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 capture_extensions: a.capture_extensions.clone(),
                 exception_hosts: a.exception_hosts.clone(),
                 enabled: a.enabled,
-                capture_min_size: None,
+                capture_min_size: capture_min_size_bytes(min_kib),
             }
         }
         Request::Query { request_id, url } => {
@@ -414,8 +419,13 @@ fn offline_ready(store: &crate::store::Store) -> Response {
         capture_extensions: s.capture_extensions,
         exception_hosts: s.exception_hosts,
         enabled: true,
-        capture_min_size: None,
+        capture_min_size: capture_min_size_bytes(s.capture_min_size_kib),
     }
+}
+
+/// The browser-side size floor in bytes for a setting in KiB; `None` when off.
+fn capture_min_size_bytes(kib: u64) -> Option<u64> {
+    (kib > 0).then(|| kib.saturating_mul(1024))
 }
 
 /// Send one request, starting the GUI first if it carries a download and
@@ -876,5 +886,45 @@ mod tests {
         let reply: Response = codec.read().unwrap().unwrap();
         assert!(matches!(reply, Response::Error { .. }), "got {reply:?}");
         assert!(inbox.lock().unwrap().is_empty(), "an unauthorised request was queued");
+    }
+
+    #[test]
+    fn the_size_floor_round_trips_through_ready() {
+        let ready = |min| Response::Ready {
+            version: "1".into(),
+            capture_extensions: vec!["*".into()],
+            exception_hosts: vec![],
+            enabled: true,
+            capture_min_size: min,
+        };
+        let on = ready(capture_min_size_bytes(512));
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(json.contains("\"captureMinSize\":524288"), "{json}");
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), on);
+
+        // Off is left out of the frame, so an older extension sees no floor.
+        let off = ready(capture_min_size_bytes(0));
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(!json.contains("captureMinSize"), "{json}");
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), off);
+    }
+
+    #[test]
+    fn the_size_floor_is_kib_and_zero_means_off() {
+        assert_eq!(capture_min_size_bytes(0), None);
+        assert_eq!(capture_min_size_bytes(1), Some(1024));
+        assert_eq!(capture_min_size_bytes(u64::MAX), Some(u64::MAX), "saturates instead of wrapping");
+    }
+
+    #[test]
+    fn a_hello_frame_is_read_and_answered_with_ready() {
+        let hello: Request = serde_json::from_str(r#"{"type":"hello","version":"1.0"}"#).unwrap();
+        assert_eq!(hello, Request::Hello { version: "1.0".into() });
+        let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
+        let advert = Arc::new(Mutex::new(advert()));
+        let reply = dispatch(hello, &inbox, &advert);
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(json.contains("\"type\":\"ready\""), "{json}");
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), reply);
     }
 }

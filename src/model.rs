@@ -4,6 +4,7 @@
 //! record carrying the replayed request headers, and a column set for the
 //! main list.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -253,6 +254,9 @@ pub struct DownloadSettings {
     /// Flash the taskbar button when a download finishes while TDM is in the background.
     #[serde(default = "default_true")]
     pub flash_on_complete: bool,
+    /// Unpack zip, tar, gzip and xz archives into their folder when they finish.
+    #[serde(default = "default_true")]
+    pub extract_archives: bool,
 }
 
 impl Default for DownloadSettings {
@@ -269,6 +273,7 @@ impl Default for DownloadSettings {
             user_agent: String::new(),
             check_file_type: true,
             flash_on_complete: true,
+            extract_archives: true,
         }
     }
 }
@@ -346,7 +351,7 @@ impl ProxyMode {
 }
 
 /// Options ▸ Proxy / Socks. SOCKS is not modelled here.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxySettings {
     pub mode: ProxyMode,
@@ -355,11 +360,17 @@ pub struct ProxySettings {
     pub host: String,
     pub port: u16,
     pub user: String,
-    /// Deliberately **not** persisted: writing a credential to settings.json
-    /// in clear is not acceptable.
-    /// shortcut: session-only password, revisit when we have a keyring.
+    /// Plain-text password, in memory only. The file holds `password_ref`.
     #[serde(skip)]
     pub password: String,
+    /// Set when the user cleared the password in this session, so a save may
+    /// remove the keychain copy. Never written to disk.
+    #[serde(skip)]
+    pub password_cleared: bool,
+    /// `keychain:proxy/password` when the password is in the OS keychain.
+    /// Empty when there is no stored password or no keychain.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password_ref: String,
     pub use_http: bool,
     pub use_https: bool,
     pub use_ftp: bool,
@@ -368,43 +379,71 @@ pub struct ProxySettings {
     pub use_browser_proxy_on_error: bool,
 }
 
+/// Hides the password in logs and debug output.
+impl fmt::Debug for ProxySettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxySettings")
+            .field("mode", &self.mode)
+            .field("pac_url", &self.pac_url)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &format_args!("{}", if self.password.is_empty() { "" } else { "<redacted>" }))
+            .field("password_cleared", &self.password_cleared)
+            .field("password_ref", &self.password_ref)
+            .field("use_http", &self.use_http)
+            .field("use_https", &self.use_https)
+            .field("use_ftp", &self.use_ftp)
+            .field("ftp_passive", &self.ftp_passive)
+            .field("use_browser_proxy_on_error", &self.use_browser_proxy_on_error)
+            .finish()
+    }
+}
+
 impl ProxySettings {
-    /// The proxy the engine should apply, or `None` when none does.
+    /// The proxy the engine should apply, or `Ok(None)` when none does.
     ///
-    /// `Manual` uses the fields on the page. `System` reads the user's Windows
+    /// `Manual` uses the fields on the page and must form a valid proxy URL,
+    /// otherwise the error says why (for the settings page to show). A blank
+    /// host means no proxy. `System` reads the user's Windows
     /// proxy (what the "Get System" button copies in), and
     /// applies it to both protocols — the system setting has no per-protocol
     /// ticks. `Pac` needs the script text, which the engine fetches, so it
     /// resolves to nothing here; use [`ProxySettings::resolve_pac`] per URL.
-    pub fn resolved(&self) -> Option<crate::engine::ProxyConfig> {
+    pub fn resolved(&self) -> Result<Option<crate::engine::ProxyConfig>, crate::proxy::ProxyError> {
         match self.mode {
-            ProxyMode::None | ProxyMode::Pac => None,
+            ProxyMode::None | ProxyMode::Pac => Ok(None),
             ProxyMode::Manual => {
-                if self.host.trim().is_empty() || self.port == 0 {
-                    return None;
+                let host = self.host.trim();
+                if host.is_empty() {
+                    return Ok(None);
+                }
+                if self.port == 0 {
+                    return Err(crate::proxy::ProxyError::MissingHostOrPort);
                 }
                 // A host already carrying a scheme must not become
                 // `http://http://…`.
-                let url = if self.host.contains("://") {
-                    format!("{}:{}", self.host.trim(), self.port)
+                let url = if host.contains("://") {
+                    format!("{host}:{}", self.port)
                 } else {
-                    format!("http://{}:{}", self.host.trim(), self.port)
+                    format!("http://{host}:{}", self.port)
                 };
-                Some(crate::engine::ProxyConfig {
+                crate::proxy::parse_proxy_url(&url)?;
+                Ok(Some(crate::engine::ProxyConfig {
                     url,
                     http: self.use_http,
                     https: self.use_https,
                     user: self.user.clone(),
                     password: self.password.clone(),
-                })
+                }))
             }
-            ProxyMode::System => system_proxy().map(|url| crate::engine::ProxyConfig {
+            ProxyMode::System => Ok(system_proxy().map(|url| crate::engine::ProxyConfig {
                 url,
                 http: true,
                 https: true,
                 user: String::new(),
                 password: String::new(),
-            }),
+            })),
         }
     }
 
@@ -424,7 +463,7 @@ impl ProxySettings {
         pac_script: &str,
     ) -> Result<Option<crate::engine::ProxyConfig>, crate::proxy::PacError> {
         if self.mode != ProxyMode::Pac {
-            return Ok(self.resolved());
+            return Ok(self.resolved()?);
         }
         match crate::proxy::pac_decide(pac_script, download_url)? {
             crate::proxy::PacDecision::Direct => Ok(None),
@@ -463,7 +502,7 @@ fn system_proxy() -> Option<String> {
         .lines()
         .find_map(|l| l.split_once("REG_SZ").map(|(_, v)| v.trim()))
         .filter(|v| !v.is_empty())?;
-    Some(normalize_proxy_server(value))
+    normalize_proxy_server(value)
 }
 
 /// The conventional proxy variables, which desktop environments and shells
@@ -482,7 +521,7 @@ fn proxy_from_env(get: impl Fn(&str) -> Option<String>) -> Option<String> {
         .filter_map(get)
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
-        .map(|v| normalize_proxy_server(&v))
+        .filter_map(|v| normalize_proxy_server(&v))
         .find(|url| url.starts_with("http://") || url.starts_with("https://"))
 }
 
@@ -495,14 +534,31 @@ pub fn system_proxy_endpoint() -> Option<(String, u16)> {
     Some((host.to_owned(), port.parse().ok()?))
 }
 
-/// `host:port`, or `http=host:port;https=…`, to a proxy URL.
-fn normalize_proxy_server(value: &str) -> String {
-    let one = value
-        .split(';')
-        .find_map(|part| part.strip_prefix("http="))
-        .unwrap_or_else(|| value.split(';').next().unwrap_or(value))
-        .trim();
-    if one.contains("://") { one.to_owned() } else { format!("http://{one}") }
+/// The value for `key` in a per-protocol list such as `http=a:1;socks=b:2`.
+fn per_protocol<'a>(value: &'a str, key: &str) -> Option<&'a str> {
+    value.split(';').find_map(|part| {
+        let (k, v) = part.trim().split_once('=')?;
+        k.trim().eq_ignore_ascii_case(key).then(|| v.trim())
+    })
+}
+
+/// Turns a Windows `ProxyServer` value or an environment proxy into a proxy
+/// URL. Accepts `host:port`, a URL, and the per-protocol list Windows writes:
+/// `http=` (or `https=`) becomes `http://`, `socks=` becomes `socks5://`.
+/// Returns `None` when the result is not a usable proxy URL.
+fn normalize_proxy_server(value: &str) -> Option<String> {
+    let value = value.trim();
+    let candidate = if value.contains("://") {
+        value.to_owned()
+    } else if value.contains('=') {
+        match per_protocol(value, "http").or_else(|| per_protocol(value, "https")) {
+            Some(host) => format!("http://{host}"),
+            None => format!("socks5://{}", per_protocol(value, "socks")?),
+        }
+    } else {
+        format!("http://{value}")
+    };
+    crate::proxy::parse_proxy_url(&candidate).ok().map(|_| candidate)
 }
 
 #[cfg(test)]
@@ -537,6 +593,8 @@ impl Default for ProxySettings {
             port: 0,
             user: String::new(),
             password: String::new(),
+            password_cleared: false,
+            password_ref: String::new(),
             use_http: false,
             use_https: false,
             use_ftp: false,
@@ -665,6 +723,10 @@ pub struct Settings {
     /// Take over every file download from the browser, not only the listed types.
     #[serde(default = "default_true")]
     pub capture_all: bool,
+    /// Browser downloads of a known size below this many KiB are left to the
+    /// browser. 0 takes every size.
+    #[serde(default)]
+    pub capture_min_size_kib: u64,
     /// Command-line virus scanner run on each finished download; empty turns it off.
     #[serde(default = "default_scanner")]
     pub scanner: String,
@@ -740,6 +802,7 @@ impl Default for Settings {
             light_theme: false,
             bring_to_front_on_capture: true,
             capture_all: true,
+            capture_min_size_kib: 0,
             scanner: default_scanner(),
             window: None,
         }
@@ -928,28 +991,20 @@ mod tests {
             use_http: true,
             ..ProxySettings::default()
         };
-        let c = p.resolved().expect("a manual proxy resolves");
+        let c = p.resolved().unwrap().expect("a manual proxy resolves");
         assert_eq!(c.url, "http://proxy.lan:3128");
         assert!(c.http && !c.https);
 
         // A host that already carries a scheme must not be prefixed twice.
         p.host = "http://proxy.lan".into();
-        assert_eq!(p.resolved().unwrap().url, "http://proxy.lan:3128");
+        assert_eq!(p.resolved().unwrap().unwrap().url, "http://proxy.lan:3128");
     }
 
     #[test]
     fn an_incomplete_or_disabled_proxy_resolves_to_nothing() {
-        // No port: applying `http://host:0` would fail every request.
-        let p = ProxySettings {
-            mode: ProxyMode::Manual,
-            host: "proxy.lan".into(),
-            ..ProxySettings::default()
-        };
-        assert!(p.resolved().is_none());
-        assert!(ProxySettings { mode: ProxyMode::Manual, ..ProxySettings::default() }
-            .resolved()
-            .is_none());
-        assert!(ProxySettings::default().resolved().is_none());
+        // A blank host is a disabled proxy.
+        assert_eq!(ProxySettings { mode: ProxyMode::Manual, ..ProxySettings::default() }.resolved(), Ok(None));
+        assert_eq!(ProxySettings::default().resolved(), Ok(None));
         // PAC resolves per URL once the engine supplies the script text (see
         // `pac_resolves_per_url_once_the_script_is_supplied`); without it,
         // `resolved()` yields nothing rather than guessing a proxy.
@@ -958,7 +1013,7 @@ mod tests {
             pac_url: "http://example.test/p.pac".into(),
             ..ProxySettings::default()
         };
-        assert!(pac.resolved().is_none());
+        assert_eq!(pac.resolved(), Ok(None));
         assert_eq!(pac.pac_location(), Some("http://example.test/p.pac"));
     }
 
@@ -1002,7 +1057,7 @@ mod tests {
             use_https: true,
             ..ProxySettings::default()
         };
-        let c = p.resolved().unwrap();
+        let c = p.resolved().unwrap().unwrap();
         // Characters that would need escaping in a URL are carried as fields.
         assert_eq!(c.url, "http://proxy.lan:8080");
         assert_eq!(c.user, "u@example");
@@ -1010,13 +1065,52 @@ mod tests {
     }
 
     #[test]
+    fn a_manual_host_with_embedded_credentials_is_refused() {
+        // Credentials go in the user and password fields, never in the URL.
+        let p = ProxySettings {
+            mode: ProxyMode::Manual,
+            host: "user:pw@proxy.lan".into(),
+            port: 3128,
+            ..ProxySettings::default()
+        };
+        assert_eq!(p.resolved(), Err(crate::proxy::ProxyError::Credentials));
+        let no_port = ProxySettings { port: 0, ..p };
+        assert_eq!(no_port.resolved(), Err(crate::proxy::ProxyError::MissingHostOrPort));
+    }
+
+    #[test]
+    fn debug_output_redacts_the_password() {
+        let p = ProxySettings {
+            host: "proxy.lan".into(),
+            password: "hunter2".into(),
+            ..ProxySettings::default()
+        };
+        let text = format!("{p:?}");
+        assert!(!text.contains("hunter2"), "password leaked in {text}");
+        assert!(text.contains("<redacted>"));
+    }
+
+    #[test]
     fn a_per_protocol_system_proxy_list_reduces_to_its_http_entry() {
         assert_eq!(
             normalize_proxy_server("http=a.lan:1;https=b.lan:2"),
-            "http://a.lan:1"
+            Some("http://a.lan:1".to_owned())
         );
-        assert_eq!(normalize_proxy_server("plain.lan:8080"), "http://plain.lan:8080");
-        assert_eq!(normalize_proxy_server("http://already.lan:3"), "http://already.lan:3");
+        assert_eq!(normalize_proxy_server("plain.lan:8080"), Some("http://plain.lan:8080".to_owned()));
+        assert_eq!(normalize_proxy_server("http://already.lan:3"), Some("http://already.lan:3".to_owned()));
+    }
+
+    #[test]
+    fn a_socks_entry_maps_to_socks5_and_garbage_is_rejected() {
+        assert_eq!(
+            normalize_proxy_server("socks=127.0.0.1:1080"),
+            Some("socks5://127.0.0.1:1080".to_owned())
+        );
+        assert_eq!(normalize_proxy_server("http=h:8080"), Some("http://h:8080".to_owned()));
+        assert_eq!(normalize_proxy_server("not a proxy at all"), None);
+        assert_eq!(normalize_proxy_server("ftp=h:21"), None);
+        assert_eq!(normalize_proxy_server("socks=h"), None);
+        assert_eq!(normalize_proxy_server("h"), None);
     }
 
     #[test]
