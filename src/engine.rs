@@ -487,7 +487,12 @@ impl Download {
             // Applies to the whole request including the body, so it bounds a
             // stalled transfer, not just a slow handshake.
             .timeout(self.timeout)
-            .redirect(redirect);
+            .redirect(redirect)
+            // Keep one idle connection per segment so a segment's next request
+            // reuses its socket instead of paying a new TCP (and TLS) handshake.
+            .pool_max_idle_per_host(self.max_segments as usize)
+            // Send each small request at once instead of waiting to fill a packet.
+            .tcp_nodelay(true);
         if let Some(p) = &self.proxy {
             let wanted = [
                 p.http.then(|| reqwest::Proxy::http(&p.url)),
