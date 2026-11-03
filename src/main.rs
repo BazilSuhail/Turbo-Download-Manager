@@ -432,7 +432,29 @@ struct App {
     window_geometry: Option<WindowGeometry>,
 }
 
+/// Sends `tracing` output to `<app dir>/logs/tdm.log`, appended. Filter comes
+/// from `TDM_LOG` (default `info`). Falls back to stderr if the file cannot be
+/// opened. A second init is ignored rather than panicking.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("TDM_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let logs = tdm::store::app_dir().join("logs");
+    let file = std::fs::create_dir_all(&logs).and_then(|()| {
+        std::fs::OpenOptions::new().create(true).append(true).open(logs.join("tdm.log"))
+    });
+    let sink: Box<dyn std::io::Write + Send> = match file {
+        Ok(file) => Box::new(file),
+        Err(_) => Box::new(std::io::stderr()),
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(Mutex::new(sink))
+        .try_init();
+}
+
 fn main() -> iced::Result {
+    init_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
         println!(
@@ -577,7 +599,7 @@ fn keep_aside(path: &std::path::Path) {
     let mut bad = path.as_os_str().to_owned();
     bad.push(".corrupt");
     if let Err(e) = std::fs::copy(path, &bad) {
-        eprintln!("could not keep a copy of {}: {e}", path.display());
+        tracing::warn!("could not keep a copy of {}: {e}", path.display());
     }
 }
 
@@ -594,7 +616,7 @@ impl App {
         let settings = match store.load_settings() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("settings could not be loaded ({e}); using defaults for this session");
+                tracing::warn!("settings could not be loaded ({e}); using defaults for this session");
                 // Every exit saves settings, so keep the unreadable file now.
                 keep_aside(&store.settings_path());
                 Settings::default()
@@ -612,7 +634,7 @@ impl App {
         let capture_ready = match tdm::ipc::serve(Arc::clone(&inbox), Arc::clone(&advert)) {
             Ok(_) => true,
             Err(e) => {
-                eprintln!("browser capture unavailable: {e}");
+                tracing::warn!("browser capture unavailable: {e}");
                 false
             }
         };
@@ -676,7 +698,7 @@ impl App {
             }
             // The next save would otherwise replace the whole list with an empty one.
             Err(e) => {
-                eprintln!("the download list could not be loaded ({e})");
+                tracing::warn!("the download list could not be loaded ({e})");
                 keep_aside(&app.store.list_path());
             }
         }
@@ -684,7 +706,7 @@ impl App {
         // thread. Failure only means the browser cannot reach us yet.
         std::thread::spawn(|| {
             if let Err(e) = tdm::register::install_default() {
-                eprintln!("browser registration failed: {e}");
+                tracing::warn!("browser registration failed: {e}");
             }
         });
         (app, Task::none())
@@ -831,13 +853,13 @@ impl App {
                 .collect(),
         };
         if let Err(e) = self.store.save_list(&list) {
-            eprintln!("could not save the download list: {e}");
+            tracing::error!("could not save the download list: {e}");
         }
     }
 
     fn save_settings(&self) {
         if let Err(e) = self.store.save_settings(&self.settings) {
-            eprintln!("could not save settings: {e}");
+            tracing::error!("could not save settings: {e}");
         }
     }
 
@@ -1280,7 +1302,7 @@ impl App {
             }
             Message::DiscardedMany(failures) => {
                 for (id, e) in &failures {
-                    eprintln!("could not delete the file of download {id}: {e}");
+                    tracing::warn!("could not delete the file of download {id}: {e}");
                 }
                 match failures.as_slice() {
                     [] => {}
@@ -1483,7 +1505,7 @@ impl App {
                 Task::batch([autostart, self.start_ready()])
             }
             Message::LaunchAtLoginDone(Err(e)) => {
-                eprintln!("could not change launch at login: {e}");
+                tracing::warn!("could not change launch at login: {e}");
                 self.toast(ToastKind::Error, format!("Could not change launch at login: {e}"));
                 Task::none()
             }

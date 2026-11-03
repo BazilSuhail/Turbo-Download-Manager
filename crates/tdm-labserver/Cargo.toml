@@ -1,0 +1,20 @@
+[package]
+name = "tdm-labserver"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Deterministic HTTP lab server with fault injection for download-manager tests"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tdm-labserver"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+tokio = { version = "1.54.1", features = ["full"] }
+futures-util = "0.3.34"
+tracing = "0.1.44"

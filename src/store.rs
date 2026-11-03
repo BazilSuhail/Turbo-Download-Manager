@@ -7,7 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tdm_store::{LoadOutcome, SyncMode};
 
 use crate::model::Settings;
 
@@ -21,6 +23,8 @@ pub enum Error {
     Parse { path: PathBuf, source: serde_json::Error },
     #[error("encoding state: {0}")]
     Encode(#[from] serde_json::Error),
+    #[error(transparent)]
+    Store(#[from] tdm_store::StoreError),
 }
 
 /// One row of the saved download list. Live progress is not stored here; it is
@@ -94,55 +98,39 @@ impl Store {
     /// A corrupt file is an error rather than a silent reset, so a typo in a
     /// hand-edited config cannot quietly discard the user's categories.
     pub fn load_settings(&self) -> Result<Settings, Error> {
-        match read_json(&self.settings_path())? {
-            Some(s) => Ok(s),
-            None => Ok(Settings::default()),
-        }
+        load(&self.settings_path())
     }
 
     pub fn save_settings(&self, settings: &Settings) -> Result<(), Error> {
-        write_json(&self.settings_path(), settings)
+        save(&self.settings_path(), settings)
     }
 
     pub fn load_list(&self) -> Result<DownloadList, Error> {
-        Ok(read_json(&self.list_path())?.unwrap_or_default())
+        load(&self.list_path())
     }
 
     pub fn save_list(&self, list: &DownloadList) -> Result<(), Error> {
-        write_json(&self.list_path(), list)
+        save(&self.list_path(), list)
     }
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Error> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(Error::Read { path: path.to_owned(), source }),
-    };
-    // Notepad, PowerShell's `Set-Content -Encoding utf8` and most Windows
-    // editors put a UTF-8 BOM at the front. `serde_json` treats it as junk, so
-    // a hand-edited settings file would silently fall back to defaults and
-    // lose the user's categories on the next save.
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-    serde_json::from_slice(bytes)
-        .map(Some)
-        .map_err(|source| Error::Parse { path: path.to_owned(), source })
+/// The main file, else its backup, else defaults. A corrupt file is an error
+/// (see `tdm_store::read_json_or_backup`), never a silent reset.
+fn load<T: DeserializeOwned + Default>(path: &Path) -> Result<T, Error> {
+    Ok(match tdm_store::read_json_or_backup(path)? {
+        LoadOutcome::Main(v) | LoadOutcome::Backup(v) => v,
+        LoadOutcome::Missing => T::default(),
+    })
 }
 
-/// Write via a temporary file and a rename, so an interrupted write cannot
-/// leave a half-written state file behind.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+/// Lifecycle save: fsynced, with the previous good file kept as a backup.
+fn save<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|source| Error::Write { path: parent.to_owned(), source })?;
     }
-    let json = serde_json::to_vec_pretty(value)?;
-    // The temp name carries the pid: two instances writing at once would
-    // otherwise share one scratch file and rename a half-written blend of both
-    // over the real one.
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, json).map_err(|source| Error::Write { path: tmp.clone(), source })?;
-    std::fs::rename(&tmp, path).map_err(|source| Error::Write { path: path.to_owned(), source })
+    tdm_store::write_json_durable(path, value, SyncMode::Lifecycle)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -245,7 +233,10 @@ mod tests {
         std::fs::create_dir_all(&store.dir).unwrap();
         std::fs::write(store.settings_path(), b"{ not json").unwrap();
         let err = store.load_settings().unwrap_err();
-        assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+        assert!(
+            matches!(err, Error::Store(tdm_store::StoreError::Corrupt { .. })),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -253,13 +244,21 @@ mod tests {
         let store = temp_store("tmp");
         store.save_settings(&Settings::default()).unwrap();
         assert!(store.settings_path().exists());
-        let leftovers: Vec<_> = std::fs::read_dir(&store.dir)
+        let names: Vec<_> = std::fs::read_dir(&store.dir)
             .expect("read dir")
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert_eq!(names, ["settings.json"], "unexpected files: {names:?}");
+    }
+
+    #[test]
+    fn a_second_save_keeps_the_previous_settings_as_a_backup() {
+        let store = temp_store("backup");
+        store.save_settings(&Settings { max_segments: 4, ..Settings::default() }).unwrap();
+        store.save_settings(&Settings { max_segments: 9, ..Settings::default() }).unwrap();
+        std::fs::write(store.settings_path(), b"{ torn").unwrap();
+        assert_eq!(store.load_settings().expect("backup loads").max_segments, 4);
     }
 
     #[test]
@@ -273,16 +272,5 @@ mod tests {
         bytes.extend(serde_json::to_vec(&settings).unwrap());
         std::fs::write(store.settings_path(), bytes).unwrap();
         assert_eq!(store.load_settings().expect("loads").max_segments, 12);
-    }
-
-    #[test]
-    fn the_temp_name_is_unique_per_process() {
-        // Two instances must not share one scratch file.
-        let store = temp_store("pid");
-        let tmp = store.settings_path().with_extension(format!("{}.tmp", std::process::id()));
-        assert!(
-            tmp.to_string_lossy().contains(&std::process::id().to_string()),
-            "temp name does not identify the process"
-        );
     }
 }

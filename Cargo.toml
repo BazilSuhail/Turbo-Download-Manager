@@ -20,7 +20,7 @@ futures-util = "0.3.34"
 iced = { version = "0.14.0", default-features = false, features = ["tokio", "wgpu", "tiny-skia", "image-without-codecs", "web-colors", "thread-pool", "crisp", "svg", "x11", "wayland"] }
 open = "5.4"
 quick-xml = { version = "0.42.0", default-features = false }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "socks", "system-proxy"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.10.9"
@@ -29,6 +29,22 @@ raw-window-handle = "0.6"
 rfd = "0.15"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+# Phase 0: durable store crate, file logging.
+tdm-store = { path = "crates/tdm-store" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Phase 1: SHA-1 and CRC32 checksums (same family as sha2), PAC scripts (QuickJS, as MDM).
+sha1 = "0.10"
+crc32fast = "1.5"
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+# Phase 1: OS keychain for proxy and site secrets (src/secrets.rs). Native backends only:
+# Windows Credential Manager, macOS Keychain, Linux Secret Service (D-Bus). 3.x kept as the pinned line.
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native", "apple-native", "sync-secret-service"] }
+
+[workspace]
+# Phase 0 crates. The app stays the root package.
+members = ["crates/tdm-store", "crates/tdm-labserver", "crates/tdm-bench"]
+resolver = "3"
 
 [profile.release]
 lto = "thin"

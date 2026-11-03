@@ -28,6 +28,9 @@ struct Options {
     /// from what was asked for, while sending the bytes for the real range.
     /// Models a rewriting proxy or a broken cache.
     lie_about_range_by: u64,
+    /// Answer 404 to every ranged request that starts at or after this offset:
+    /// a permanent failure for the ranges in the back half.
+    fail_from: Option<usize>,
 }
 
 /// Serve `body` on a random local port and return its URL.
@@ -70,6 +73,12 @@ async fn serve(body: Arc<Vec<u8>>, options: Options) -> String {
                     _ => ("200 OK", 0, total - 1),
                 };
                 let is_probe = range == Some((0, 0));
+                if !is_probe && options.fail_from.is_some_and(|from| start >= from) {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                }
                 let slice = &body[start..=end];
 
                 let mut headers = format!("HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n", slice.len());
@@ -161,6 +170,74 @@ async fn segmented_download_matches_source_bytes() {
         distinct_ranges(&heads).len() >= 2,
         "this test claims to cover segmentation but only one range was requested"
     );
+}
+
+/// One range fails for good. The others must still finish, the download must
+/// end in that failure, and the bytes that did arrive must be correct.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_segment_that_fails_for_good_does_not_stop_the_others() {
+    let len = 4 * 1024 * 1024;
+    let body = Arc::new(sample_body(len));
+    // The first split hands the back half to a new connection, which is
+    // refused with a 404. The front half keeps running.
+    let url = serve(
+        Arc::clone(&body),
+        Options {
+            honour_range: true,
+            chunk_delay: Some(Duration::from_millis(10)),
+            fail_from: Some(len / 2),
+            ..Default::default()
+        },
+    )
+    .await;
+    let dest = temp_file("one-segment-fails.bin");
+
+    let download = Download::new(url, &dest, 2);
+    let result = download.run().await;
+    let snap = download.snapshot();
+
+    assert!(result.is_err(), "a range that cannot be fetched must fail the download");
+    assert_eq!(snap.status, Status::Failed);
+    assert!(
+        snap.error.as_deref().unwrap_or("").contains("404"),
+        "the final status should name the failure, got {:?}",
+        snap.error
+    );
+    assert!(
+        snap.done >= (len / 2) as u64,
+        "the other connection stopped early: done {} of {}",
+        snap.done,
+        len / 2
+    );
+    let written = std::fs::read(&dest).expect("read output");
+    assert!(written[..len / 2] == body[..len / 2], "completed bytes were corrupted");
+    assert!(
+        dest.with_file_name("one-segment-fails.bin.tdmstate").exists(),
+        "the sidecar must stay so a later run can retry the failed range"
+    );
+}
+
+/// Baseline timing, not a correctness test. Run with
+/// `cargo test --release --test engine_local_server -- --ignored --nocapture baseline`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn baseline_256_mib_fast_download_five_runs() {
+    let body = Arc::new(sample_body(256 * 1024 * 1024));
+    let url = serve(Arc::clone(&body), Options { honour_range: true, ..Default::default() }).await;
+    let mut times = Vec::new();
+    for run in 1..=5 {
+        let dest = temp_file(&format!("baseline-{run}.bin"));
+        let download = Download::new(url.clone(), &dest, 8);
+        let started = std::time::Instant::now();
+        download.run().await.expect("download");
+        let secs = started.elapsed().as_secs_f64();
+        assert_eq!(download.snapshot().status, Status::Finished);
+        println!("baseline run {run}: {secs:.3} s");
+        times.push(secs);
+        let _ = std::fs::remove_file(&dest);
+    }
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    println!("baseline mean over 5 runs: {mean:.3} s (256 MiB, in-process server, 8 segments)");
 }
 
 /// Distinct non-probe byte ranges the server was asked for.

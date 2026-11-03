@@ -3,6 +3,7 @@
 //! Probe with a one-byte range, split into byte ranges, write each range at its
 //! offset, and keep a resumable state file next to the download.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::task::JoinSet;
 
 use crate::filetype;
+use crate::planner;
 
 /// Splitting a range with less than this left is not worth another connection.
 ///
@@ -26,6 +28,11 @@ const MIN_SPLIT_BYTES: u64 = 0x5b43;
 /// pool is allowed to grow again, so a slow link is not flooded with
 /// connections.
 const RAMP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A connection is "slow" when its rate is under the median rate divided by
+/// this factor, once it has run for `SLOW_AGE_SECS`.
+const SLOW_FACTOR: f64 = 3.0;
+const SLOW_AGE_SECS: f64 = 4.0;
 
 /// Attempts per segment when the caller sets no budget of its own.
 const MAX_ATTEMPTS: u32 = 3;
@@ -64,6 +71,10 @@ pub enum Error {
          joining them needs ffmpeg on PATH, which was not found"
     )]
     NeedsMux { video: String, audio: String },
+    #[error("the file changed on the server while it was downloading")]
+    ValidatorChanged,
+    #[error("the disk is full: free some space, then resume")]
+    DiskFull,
 }
 
 /// A reqwest failure that happened on the wire rather than in the request
@@ -156,6 +167,12 @@ pub struct Snapshot {
     pub kind: Option<filetype::Kind>,
     /// The Content-Type the server sent with the probe, trimmed.
     pub content_type: Option<String>,
+    /// Why the download paused by itself, such as a full disk. Cleared when it
+    /// is resumed. The UI shows it; the user resumes once there is room.
+    pub paused_reason: Option<String>,
+    /// The digest the server announced with the probe, for the checksum step.
+    /// The downloaded bytes do not depend on it.
+    pub server_hash: Option<crate::serverhash::ExpectedHash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +184,10 @@ struct Segment {
     /// Bytes already written for this range.
     done: u64,
     complete: bool,
+    /// Its connection failed for good. The range is left unfinished and is
+    /// not handed to a new connection; a later resume clears the flag and retries it.
+    #[serde(default)]
+    failed: bool,
 }
 
 impl Segment {
@@ -175,11 +196,49 @@ impl Segment {
     }
 }
 
+/// What the server said identifies this version of the file. A resume is only
+/// safe while these still match. Every ranged request repeats them in
+/// `If-Range`, so the server sends the whole file if they changed meanwhile.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Validators {
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+impl Validators {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        Self {
+            etag: header_text(headers, "etag"),
+            last_modified: header_text(headers, "last-modified"),
+        }
+    }
+
+    /// The value for `If-Range`: the strong ETag, else Last-Modified. A weak
+    /// ETag is not allowed there, so it is skipped.
+    fn if_range(&self) -> Option<&str> {
+        self.etag
+            .as_deref()
+            .filter(|e| !e.starts_with("W/"))
+            .or(self.last_modified.as_deref())
+    }
+}
+
+fn header_text(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
 #[derive(Serialize, Deserialize)]
 struct StateFile {
     url: String,
     total: Option<u64>,
     ranged: bool,
+    #[serde(default)]
+    validators: Validators,
     segments: Vec<Segment>,
 }
 
@@ -296,6 +355,9 @@ pub struct Download {
     /// Alternative URLs for the same file, tried in order when a segment keeps
     /// failing on the current one. The primary URL is always tried first.
     mirrors: Vec<String>,
+    /// Learned per-host connection limits, shared between downloads. `None`
+    /// means the requested count is used as it is.
+    hosts: Option<Arc<Mutex<crate::hosts::HostLimits>>>,
 }
 
 impl Download {
@@ -313,6 +375,24 @@ impl Download {
             attempts: MAX_ATTEMPTS,
             timeout: DEFAULT_TIMEOUT,
             mirrors: Vec::new(),
+            hosts: None,
+        }
+    }
+
+    /// Share learned per-host connection limits with other downloads. A host
+    /// that refuses connections past some count is then started below it.
+    pub fn set_host_limits(&mut self, limits: Arc<Mutex<crate::hosts::HostLimits>>) {
+        self.hosts = Some(limits);
+    }
+
+    /// How many connections this host may take, as far as it is known.
+    fn host_cap(&self, host: &str) -> u32 {
+        match &self.hosts {
+            Some(limits) => limits
+                .lock()
+                .expect("host limits")
+                .cap(host, self.max_segments, self.max_segments),
+            None => self.max_segments,
         }
     }
 
@@ -444,10 +524,29 @@ impl Download {
             return Ok(());
         }
         self.stop.store(false, Ordering::SeqCst);
+        {
+            let mut s = self.shared.lock().expect("snapshot lock");
+            s.error = None;
+            s.paused_reason = None;
+        }
         self.set_status(Status::Running);
-        let result = self.run_inner().await;
+        let mut result = self.run_inner().await;
+        if matches!(result, Err(Error::ValidatorChanged)) {
+            // The bytes on disk belong to the old version of the file. Start
+            // over once, from a fresh probe; a second change is reported as a failure.
+            let _ = tokio::fs::remove_file(self.state_path()).await;
+            self.stop.store(false, Ordering::SeqCst);
+            result = self.run_inner().await;
+        }
         match &result {
             Ok(()) if self.stop.load(Ordering::SeqCst) => self.set_status(Status::Paused),
+            Err(Error::DiskFull) => {
+                // Not a failure: the sidecar is kept, so resuming picks up
+                // where the disk filled.
+                let mut s = self.shared.lock().expect("snapshot lock");
+                s.status = Status::Paused;
+                s.paused_reason = Some(Error::DiskFull.to_string());
+            }
             Ok(()) => {
                 // Sniffed before Finished is published, so the UI never sees a
                 // finished download without its kind.
@@ -462,7 +561,10 @@ impl Download {
                 s.error = Some(e.to_string());
             }
         }
-        result
+        match result {
+            Err(Error::DiskFull) => Ok(()),
+            other => other,
+        }
     }
 
     /// The real type of the finished file. Media output is a concatenation of
@@ -525,6 +627,7 @@ impl Download {
         let client = self.build_client(policy)?;
 
         let configured = self.headers.lock().expect("headers lock").clone();
+        let host = crate::hosts::HostLimits::host_key(&self.url);
 
         if media {
             return self.run_media(&client, &configured).await;
@@ -542,15 +645,25 @@ impl Download {
         // file that changed on the server would otherwise write new bytes into
         // old segment offsets and produce a corrupt result that still looks
         // complete.
-        let (total, ranged, headers, fetch_url) = if is_ftp {
+        let (total, ranged, headers, fetch_url, validators) = if is_ftp {
             let ftp = crate::ftp::FtpDownload::parse(&self.url)?;
             let p = ftp.probe().await?;
             // Without REST the server cannot resume, so the file is one stream.
-            (p.size, p.supports_rest && p.size.is_some(), Vec::new(), self.url.clone())
+            (
+                p.size,
+                p.supports_rest && p.size.is_some(),
+                Vec::new(),
+                self.url.clone(),
+                Validators::default(),
+            )
         } else {
             let p = probe(&client, &self.url, &configured).await?;
-            self.shared.lock().expect("snapshot lock").content_type = p.content_type;
-            (p.total, p.ranged, p.headers, p.url)
+            {
+                let mut s = self.shared.lock().expect("snapshot lock");
+                s.content_type = p.content_type;
+                s.server_hash = p.server_hash;
+            }
+            (p.total, p.ranged, p.headers, p.url, p.validators)
         };
 
         // A saved state that no longer matches the server's answer cannot be
@@ -559,15 +672,23 @@ impl Download {
         // is gone, or is not the size the plan assumes, resuming would mark
         // ranges complete that were never written.
         let on_disk = tokio::fs::metadata(&self.dest).await.ok().map(|m| m.len());
+        // A sidecar written for another version of the file describes bytes the
+        // server no longer has, so it is never resumed.
         let resumed = saved.filter(|s| {
             s.ranged == ranged
                 && s.total == total
+                && s.validators == validators
                 && on_disk.is_some()
                 && (!ranged || on_disk == total)
         });
         let fresh = resumed.is_none();
         let segments = match resumed {
-            Some(s) => s.segments,
+            // Ranges that failed last time get another try on resume.
+            Some(s) => s
+                .segments
+                .into_iter()
+                .map(|seg| Segment { failed: false, ..seg })
+                .collect::<Vec<Segment>>(),
             None => plan_segments(total, ranged),
         };
         self.shared.lock().expect("snapshot lock").total = total;
@@ -582,41 +703,57 @@ impl Download {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        // Refuse before touching the file: a fresh start truncates it, and a
+        // download that cannot fit should wait for room rather than fail half way.
+        if let Some(size) = total {
+            let existing = if fresh { 0 } else { on_disk.unwrap_or(0) };
+            let dir = self
+                .dest
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            if let Some(free) = free_bytes(dir)
+                && free < size.saturating_sub(existing)
+            {
+                return Err(Error::DiskFull);
+            }
+        }
+
+        // One handle for every range. A fresh start must not keep an older,
+        // longer file's tail: with no known size there is no `set_len` to cut it off.
         let file = OpenOptions::new()
             .create(true)
             .write(true)
-            // A fresh start must not keep an older, longer file's tail: with
-            // no known size there is no `set_len` to cut it off.
             .truncate(fresh)
             .open(&self.dest)
             .await?;
         if let Some(size) = total {
-            file.set_len(size).await?;
+            file.set_len(size).await.map_err(write_error)?;
         }
-        drop(file);
+        let file = Arc::new(tokio::sync::Mutex::new(file));
 
         let segments = Arc::new(Mutex::new(segments));
         let mut tasks = JoinSet::new();
         let spawn_worker = |tasks: &mut JoinSet<_>, index: usize| {
-            tasks.spawn(
-                Worker {
-                    client: client.clone(),
-                    urls: std::iter::once(fetch_url.clone())
-                        .chain(self.mirrors.iter().cloned())
-                        .collect(),
-                    path: self.dest.clone(),
-                    index,
-                    ranged,
-                    segments: Arc::clone(&segments),
-                    stop: Arc::clone(&self.stop),
-                    rate: Arc::clone(&self.rate),
-                    headers: headers.clone(),
-                    total,
-                    is_ftp,
-                    attempts: self.attempts,
-                }
-                .run(),
-            );
+            let worker = Worker {
+                client: client.clone(),
+                urls: std::iter::once(fetch_url.clone())
+                    .chain(self.mirrors.iter().cloned())
+                    .collect(),
+                path: self.dest.clone(),
+                file: Arc::clone(&file),
+                index,
+                ranged,
+                if_range: validators.if_range().map(str::to_owned),
+                segments: Arc::clone(&segments),
+                stop: Arc::clone(&self.stop),
+                rate: Arc::clone(&self.rate),
+                headers: headers.clone(),
+                total,
+                is_ftp,
+                attempts: self.attempts,
+            };
+            tasks.spawn(async move { (index, worker.run().await) });
         };
 
         // Every segment that still has work gets a connection. On a fresh
@@ -624,7 +761,7 @@ impl Download {
         // the previous run had split into.
         let initial: Vec<usize> = {
             let segs = segments.lock().expect("segments lock");
-            (0..segs.len()).filter(|i| !segs[*i].complete).collect()
+            (0..segs.len()).filter(|i| !segs[*i].complete && !segs[*i].failed).collect()
         };
         for index in &initial {
             spawn_worker(&mut tasks, *index);
@@ -635,6 +772,8 @@ impl Download {
         let mut first_error: Option<Error> = None;
         let mut last_ramp = Instant::now();
         let mut last_total_done = 0u64;
+        // When each segment was first seen, for the slow-connection check.
+        let mut started: HashMap<usize, Instant> = HashMap::new();
         // The segment layout last written to the sidecar, so an unchanged
         // checkpoint is not rewritten every tick.
         let mut last_saved: Option<Vec<Segment>> = None;
@@ -645,10 +784,10 @@ impl Download {
                     // A failed checkpoint must not abort a healthy transfer —
                     // the worst case is resuming from an older position, which
                     // is strictly better than losing the download.
-                    let done_now = match self.publish(&segments, total, ranged, &mut last_saved).await {
+                    let done_now = match self.publish(&segments, total, ranged, &validators, &mut last_saved).await {
                         Ok(done) => done,
                         Err(e) => {
-                            eprintln!("could not checkpoint progress: {e}");
+                            tracing::warn!(error = %e, "could not checkpoint progress");
                             segments.lock().expect("segments lock").iter().map(|s| s.done).sum()
                         }
                     };
@@ -658,19 +797,46 @@ impl Download {
                     // very slow link gains nothing from more sockets.
                     let progressing = done_now > last_total_done;
                     last_total_done = done_now;
-                    let room = (self.max_segments as usize).saturating_sub(live);
+                    // Connections that have run a while but move far slower
+                    // than the rest are split first, so their tails move to
+                    // new connections.
+                    let mut slow = {
+                        let now = Instant::now();
+                        let segs = segments.lock().expect("segments lock");
+                        let rates: Vec<planner::SegmentRate> = segs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| !s.complete && !s.failed && s.end != u64::MAX)
+                            .map(|(i, s)| {
+                                let since = *started.entry(i).or_insert(now);
+                                let age = now.duration_since(since).as_secs_f64();
+                                planner::SegmentRate {
+                                    id: i as u64,
+                                    bytes_per_sec: s.done as f64 / age.max(1.0),
+                                    age_secs: age,
+                                }
+                            })
+                            .collect();
+                        planner::slow_segments(&rates, SLOW_FACTOR, SLOW_AGE_SECS).into_iter()
+                    };
+                    let room = (self.host_cap(&host) as usize).saturating_sub(live);
                     if ranged && ! self.stop.load(Ordering::SeqCst)
                         && progressing
                         && room > 0
                         && last_ramp.elapsed() >= RAMP_INTERVAL
                     {
+                        if let Some(limits) = &self.hosts {
+                            limits.lock().expect("host limits").on_working(&host, live as u32);
+                        }
                         // Double the pool (1, 2, 4, 8 ...).
                         let want = live.min(room);
                         let mut added = 0;
                         for _ in 0..want {
                             let new_index = {
                                 let mut segs = segments.lock().expect("segments lock");
-                                split_largest(&mut segs)
+                                slow.next()
+                                    .and_then(|id| split_segment(&mut segs, id as usize))
+                                    .or_else(|| split_largest(&mut segs))
                             };
                             match new_index {
                                 Some(i) => { spawn_worker(&mut tasks, i); added += 1; }
@@ -685,7 +851,7 @@ impl Download {
                 }
                 joined = tasks.join_next() => match joined {
                     None => break,
-                    Some(Ok(Ok(()))) => {
+                    Some(Ok((_, Ok(())))) => {
                         live = live.saturating_sub(1);
                         // A connection that finished early takes the back half
                         // of whatever range has the most left to do.
@@ -700,12 +866,30 @@ impl Download {
                             }
                         }
                     }
-                    Some(Ok(Err(e))) => {
+                    Some(Ok((index, Err(e)))) => {
+                        // A refusal (503) or a connection that could not be
+                        // made tells us the host's limit: `live` connections were open.
+                        if matches!(e, Error::Status(503))
+                            || matches!(&e, Error::Http(h) if h.is_connect())
+                        {
+                            if let Some(limits) = &self.hosts {
+                                limits.lock().expect("host limits").on_refused(&host, live as u32);
+                            }
+                        }
                         live = live.saturating_sub(1);
-                        if first_error.is_none() {
+                        // Only this range is lost. The others keep going until
+                        // they are done, and the download still ends in this
+                        // error because the failed range is unfinished.
+                        segments.lock().expect("segments lock")[index].failed = true;
+                        // A changed file or a full disk concerns every range,
+                        // so those stop the rest.
+                        let whole_file = matches!(e, Error::ValidatorChanged | Error::DiskFull);
+                        if whole_file {
+                            self.stop.store(true, Ordering::SeqCst);
+                        }
+                        if first_error.is_none() || whole_file {
                             first_error = Some(e);
                         }
-                        self.stop.store(true, Ordering::SeqCst);
                     }
                     Some(Err(join_err)) => {
                         live = live.saturating_sub(1);
@@ -717,7 +901,7 @@ impl Download {
             }
         }
 
-        self.publish(&segments, total, ranged, &mut last_saved).await?;
+        self.publish(&segments, total, ranged, &validators, &mut last_saved).await?;
         if let Some(e) = first_error {
             return Err(e);
         }
@@ -846,6 +1030,7 @@ impl Download {
         segments: &Arc<Mutex<Vec<Segment>>>,
         total: Option<u64>,
         ranged: bool,
+        validators: &Validators,
         last_saved: &mut Option<Vec<Segment>>,
     ) -> Result<u64, Error> {
         let snapshot_segments = segments.lock().expect("segments lock").clone();
@@ -860,12 +1045,13 @@ impl Download {
             url: self.url.clone(),
             total,
             ranged,
+            validators: validators.clone(),
             segments: snapshot_segments.clone(),
         };
         let json = serde_json::to_vec_pretty(&state)?;
         let tmp = with_suffix(&self.state_path(), ".tmp");
-        tokio::fs::write(&tmp, json).await?;
-        tokio::fs::rename(&tmp, self.state_path()).await?;
+        tokio::fs::write(&tmp, json).await.map_err(write_error)?;
+        tokio::fs::rename(&tmp, self.state_path()).await.map_err(write_error)?;
         *last_saved = Some(snapshot_segments);
         Ok(done)
     }
@@ -882,7 +1068,11 @@ impl Download {
         let saved: StateFile = match serde_json::from_slice(&bytes) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("ignoring unreadable resume state {}: {e}", self.state_path().display());
+                tracing::warn!(
+                    path = %self.state_path().display(),
+                    error = %e,
+                    "ignoring unreadable resume state"
+                );
                 return Ok(None);
             }
         };
@@ -897,6 +1087,8 @@ impl Download {
 struct Probe {
     total: Option<u64>,
     ranged: bool,
+    /// The digest the server announced, if its headers name one.
+    server_hash: Option<crate::serverhash::ExpectedHash>,
     /// The URL the chain actually ended at. Segment requests go here, so a
     /// redirect is resolved once instead of on every connection.
     url: String,
@@ -905,6 +1097,8 @@ struct Probe {
     headers: Vec<(String, String)>,
     /// The Content-Type header of the final response, trimmed; empty is `None`.
     content_type: Option<String>,
+    /// The ETag and Last-Modified of the final response.
+    validators: Validators,
 }
 
 /// Ask for bytes 0-0 to learn the size, whether byte ranges work, and where
@@ -946,6 +1140,8 @@ async fn probe(
             continue;
         }
 
+        let validators = Validators::from_headers(resp.headers());
+        let server_hash = crate::serverhash::from_headers(resp.headers());
         return match status {
             206 => {
                 let total = resp
@@ -963,6 +1159,8 @@ async fn probe(
                     url: current.to_string(),
                     headers,
                     content_type: content_type_of(&resp),
+                    validators,
+                    server_hash,
                 })
             }
             200 => Ok(Probe {
@@ -971,6 +1169,8 @@ async fn probe(
                 url: current.to_string(),
                 headers,
                 content_type: content_type_of(&resp),
+                validators,
+                server_hash,
             }),
             other => Err(Error::Status(other)),
         };
@@ -1024,11 +1224,11 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 /// a connection that finishes early takes work off the slowest one.
 fn plan_segments(total: Option<u64>, ranged: bool) -> Vec<Segment> {
     match total {
-        Some(0) => vec![Segment { start: 0, end: 0, done: 0, complete: true }],
+        Some(0) => vec![Segment { start: 0, end: 0, done: 0, complete: true, failed: false }],
         Some(size) if ranged && size > 0 => {
-            vec![Segment { start: 0, end: size - 1, done: 0, complete: false }]
+            vec![Segment { start: 0, end: size - 1, done: 0, complete: false, failed: false }]
         }
-        _ => vec![Segment { start: 0, end: u64::MAX, done: 0, complete: false }],
+        _ => vec![Segment { start: 0, end: u64::MAX, done: 0, complete: false, failed: false }],
     }
 }
 
@@ -1063,24 +1263,33 @@ fn safe_split_floor(seg: &Segment) -> u64 {
 /// left to be worth splitting. The victim keeps the front half and stops early
 /// once it reaches its new end.
 fn split_largest(segments: &mut Vec<Segment>) -> Option<usize> {
-    let (victim, left) = segments
+    // Candidates are (segment index, first byte still to fetch, end). Failed,
+    // finished and open-ended segments are never split.
+    let candidates: Vec<(u64, u64, u64)> = segments
         .iter()
         .enumerate()
-        .map(|(i, s)| (i, remaining(s)))
-        .max_by_key(|(_, left)| *left)?;
-    if left < MIN_SPLIT_BYTES {
+        .filter(|(_, s)| !s.complete && !s.failed && s.end != u64::MAX)
+        .map(|(i, s)| (i as u64, s.start.saturating_add(s.done), s.end))
+        .collect();
+    let victim = planner::pick_split(&candidates)?;
+    split_segment(segments, candidates[victim].0 as usize)
+}
+
+/// Hand the back half of segment `victim` to a new connection, if enough is
+/// left. Returns the new segment's index.
+fn split_segment(segments: &mut Vec<Segment>, victim: usize) -> Option<usize> {
+    let seg = segments.get(victim)?;
+    if seg.complete || seg.failed || seg.end == u64::MAX || remaining(seg) < MIN_SPLIT_BYTES {
         return None;
     }
-    let end = segments[victim].end;
-    let new_start = end - left / 2;
-    // Guard the degenerate case where rounding would produce an empty or
-    // backwards range, and stay clear of bytes the victim may already have in
-    // flight — see `safe_split_floor`.
-    if new_start <= safe_split_floor(&segments[victim]) || new_start > end {
+    let (position, end) = (seg.start.saturating_add(seg.done), seg.end);
+    let new_start = planner::split_point(position, end)?;
+    // Stay clear of bytes the victim may already have in flight, see `safe_split_floor`.
+    if new_start <= safe_split_floor(seg) {
         return None;
     }
     segments[victim].end = new_start - 1;
-    segments.push(Segment { start: new_start, end, done: 0, complete: false });
+    segments.push(Segment { start: new_start, end, done: 0, complete: false, failed: false });
     Some(segments.len() - 1)
 }
 
@@ -1090,8 +1299,13 @@ struct Worker {
     /// worker to the next entry before it retries.
     urls: Vec<String>,
     path: PathBuf,
+    /// The one handle every range writes through. Each write seeks to its own
+    /// offset while holding the lock.
+    file: Arc<tokio::sync::Mutex<tokio::fs::File>>,
     index: usize,
     ranged: bool,
+    /// Sent as `If-Range` on every ranged request. `None` when the server gave no validator.
+    if_range: Option<String>,
     segments: Arc<Mutex<Vec<Segment>>>,
     stop: Arc<AtomicBool>,
     rate: Arc<Limiter>,
@@ -1120,7 +1334,12 @@ impl Worker {
                 // A server that ignores Range, or answers with the wrong one,
                 // will not start honouring it on retry. Retrying would just
                 // write the same wrong bytes again, so fail loudly instead.
-                Err(e @ (Error::RangeIgnored | Error::RangeMismatch { .. })) => return Err(e),
+                Err(
+                    e @ (Error::RangeIgnored
+                    | Error::RangeMismatch { .. }
+                    | Error::ValidatorChanged
+                    | Error::DiskFull),
+                ) => return Err(e),
                 // 4xx other than 408/429 is a permanent client error; retrying
                 // a 404 only wastes time. Everything else — including a 503 or
                 // a rate limit — is worth another attempt.
@@ -1202,17 +1421,21 @@ impl Worker {
         }
         if self.ranged {
             request = request.header("Range", format!("bytes={}-{}", from, segment.end));
+            if let Some(validator) = &self.if_range {
+                request = request.header("If-Range", validator);
+            }
         }
         let resp = request.send().await?;
         let status = resp.status().as_u16();
         if self.ranged && status != 206 {
-            // Only a 200 means "I ignored your Range". Anything else is an
-            // ordinary HTTP failure, and reporting a transient 503 as
-            // RangeIgnored would make it permanent and kill the download.
-            return Err(if status == 200 {
-                Error::RangeIgnored
-            } else {
-                Error::Status(status)
+            // Only a 200 means "I ignored your Range" (or, with If-Range sent,
+            // "the file changed"). Anything else is an ordinary HTTP failure,
+            // and reporting a transient 503 as RangeIgnored would make it
+            // permanent and kill the download.
+            return Err(match (status, &self.if_range) {
+                (200, Some(_)) => Error::ValidatorChanged,
+                (200, None) => Error::RangeIgnored,
+                _ => Error::Status(status),
             });
         }
         if !self.ranged && status != 200 {
@@ -1244,12 +1467,10 @@ impl Worker {
             }
         }
 
-        let mut file = OpenOptions::new().write(true).open(&self.path).await?;
-        file.seek(std::io::SeekFrom::Start(from)).await?;
+        let mut pos = from;
         let mut body = resp.bytes_stream();
         while let Some(chunk) = body.next().await {
             if self.stop.load(Ordering::SeqCst) {
-                file.flush().await?;
                 return Ok(());
             }
             let chunk = chunk?;
@@ -1273,24 +1494,25 @@ impl Worker {
             };
 
             if take > 0 {
-                file.write_all(&chunk[..take]).await?;
-                // Flush before recording progress, never after. `write_all`
-                // on a tokio File only queues into its buffer; if the
-                // 500 ms checkpoint ran between the write and the flush it
-                // would persist a `done` ahead of the bytes that actually
-                // exist, and a resume would skip them — silent corruption
-                // that looks like a complete file.
-                file.flush().await?;
+                // Flush before recording progress, never after. A buffered
+                // write is not on disk yet; if the 500 ms checkpoint ran in
+                // between it would persist a `done` ahead of the bytes that
+                // actually exist, and a resume would skip them.
+                {
+                    let mut file = self.file.lock().await;
+                    file.seek(std::io::SeekFrom::Start(pos)).await.map_err(write_error)?;
+                    file.write_all(&chunk[..take]).await.map_err(write_error)?;
+                    file.flush().await.map_err(write_error)?;
+                }
+                pos += take as u64;
                 let mut segments = self.segments.lock().expect("segments lock");
                 segments[self.index].done += take as u64;
             }
             if shrunk {
-                file.flush().await?;
                 break;
             }
             self.rate.account(take as u64).await;
         }
-        file.flush().await?;
 
         let mut segments = self.segments.lock().expect("segments lock");
         let seg = &mut segments[self.index];
@@ -1321,6 +1543,52 @@ pub fn next_to_start(statuses: &[Status], max_active: usize) -> Vec<usize> {
         .map(|(i, _)| i)
         .take(free)
         .collect()
+}
+
+/// Free bytes on the volume holding `dir`. `None` where the check is not
+/// available, in which case the download just tries and relies on `DiskFull`.
+#[cfg(windows)]
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is NUL-terminated and lives across the call, and `free` is
+    // a valid out-pointer. The two optional out-pointers may be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(not(windows))]
+fn free_bytes(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// Whether an OS write error means the volume is out of space: ENOSPC on Unix,
+/// ERROR_DISK_FULL (or ERROR_HANDLE_DISK_FULL) on Windows.
+fn is_disk_full(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    const FULL: &[i32] = &[112, 39];
+    #[cfg(not(windows))]
+    const FULL: &[i32] = &[28];
+    e.raw_os_error().is_some_and(|code| FULL.contains(&code))
+}
+
+/// A write failure as an engine error: a full disk pauses, anything else is an I/O error.
+fn write_error(e: std::io::Error) -> Error {
+    if is_disk_full(&e) { Error::DiskFull } else { Error::Io(e) }
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -1615,11 +1883,11 @@ mod tests {
 
     #[test]
     fn remaining_does_not_overflow_on_an_open_ended_segment() {
-        let seg = Segment { start: 0, end: u64::MAX, done: 0, complete: false };
+        let seg = Segment { start: 0, end: u64::MAX, done: 0, complete: false, failed: false };
         assert_eq!(remaining(&seg), 0);
         // And a segment whose done has run past its end reports nothing left,
         // rather than wrapping to a huge number.
-        let past = Segment { start: 0, end: 10, done: 50, complete: false };
+        let past = Segment { start: 0, end: 10, done: 50, complete: false, failed: false };
         assert_eq!(remaining(&past), 0);
     }
 
@@ -1655,9 +1923,9 @@ mod tests {
     fn splitting_picks_the_segment_with_the_most_left_not_the_largest() {
         let mut segs = vec![
             // Big range, but nearly done.
-            Segment { start: 0, end: 999_999, done: 999_000, complete: false },
+            Segment { start: 0, end: 999_999, done: 999_000, complete: false, failed: false },
             // Smaller range, barely started: this is the one that needs help.
-            Segment { start: 1_000_000, end: 1_500_000, done: 10, complete: false },
+            Segment { start: 1_000_000, end: 1_500_000, done: 10, complete: false, failed: false },
         ];
         let new = split_largest(&mut segs).expect("splittable");
         assert_eq!(segs[new].end, 1_500_000, "split the wrong segment");
@@ -1666,8 +1934,8 @@ mod tests {
     #[test]
     fn a_completed_segment_is_never_chosen() {
         let mut segs = vec![
-            Segment { start: 0, end: 9_999_999, done: 10_000_000, complete: true },
-            Segment { start: 10_000_000, end: 10_000_100, done: 0, complete: false },
+            Segment { start: 0, end: 9_999_999, done: 10_000_000, complete: true, failed: false },
+            Segment { start: 10_000_000, end: 10_000_100, done: 0, complete: false, failed: false },
         ];
         // Only 101 bytes are genuinely outstanding, which is under the floor.
         assert!(split_largest(&mut segs).is_none());
@@ -1768,7 +2036,8 @@ mod tests {
             url: url.clone(),
             total: Some(len),
             ranged: true,
-            segments: vec![Segment { start: 0, end: len - 1, done: len, complete: true }],
+            validators: Validators::default(),
+            segments: vec![Segment { start: 0, end: len - 1, done: len, complete: true, failed: false }],
         };
         std::fs::write(with_suffix(&dest, ".tdmstate"), serde_json::to_vec(&state).unwrap()).unwrap();
 
@@ -1787,6 +2056,231 @@ mod tests {
 
         let saved = Download::new("http://x/y", dest.clone(), 1).load_state().await;
         assert!(matches!(saved, Ok(None)), "garbage must read as no state, not an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One version of a file that a test server can serve.
+    #[derive(Clone)]
+    struct Version {
+        etag: String,
+        content: Vec<u8>,
+    }
+
+    /// Serve `first` on 127.0.0.1 with its ETag, honouring `If-Range` the way a
+    /// real server does: a mismatch gets the whole file back as a 200. When
+    /// `flip` is set, the first range request after the probe swaps the file
+    /// to `flip` before answering, as if it had been replaced mid-download.
+    /// Every request head is recorded in `heads`.
+    fn serve_versioned(
+        first: Version,
+        flip: Option<Version>,
+        heads: Arc<Mutex<Vec<String>>>,
+    ) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new((first, flip)));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let state = Arc::clone(&state);
+                let heads = Arc::clone(&heads);
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut head = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                    }
+                    heads.lock().unwrap().push(head.clone());
+
+                    let range = head.lines().find_map(|l| {
+                        let r = l.to_ascii_lowercase().strip_prefix("range: bytes=")?.to_owned();
+                        let (a, b) = r.split_once('-')?;
+                        Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
+                    });
+                    // The ETag is case-sensitive, so take If-Range from the original line.
+                    let if_range = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("if-range:"))
+                        .map(|l| l["if-range:".len()..].trim().to_owned());
+
+                    let current = {
+                        let mut guard = state.lock().unwrap();
+                        if range.is_some() && range != Some((0, 0)) {
+                            if let Some(next) = guard.1.take() {
+                                guard.0 = next;
+                            }
+                        }
+                        guard.0.clone()
+                    };
+                    let len = current.content.len();
+                    let if_range_holds = if_range.as_deref().is_none_or(|v| v == current.etag);
+                    let (status, start, end) = match range {
+                        Some((s, e)) if if_range_holds => ("206 Partial Content", s, e.min(len - 1)),
+                        _ => ("200 OK", 0, len - 1),
+                    };
+                    let content_range = if status.starts_with("206") {
+                        format!("Content-Range: bytes {start}-{end}/{len}\r\n")
+                    } else {
+                        String::new()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\n{content_range}Content-Length: {}\r\nETag: {}\r\nConnection: close\r\n\r\n",
+                        end - start + 1,
+                        current.etag
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(&current.content[start..=end]);
+                });
+            }
+        });
+        format!("http://{addr}/file.bin")
+    }
+
+    /// Answer every connection with `response`, whatever it asked for.
+    fn serve_fixed(response: &'static [u8]) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let _ = stream.write_all(response);
+                });
+            }
+        });
+        format!("http://{addr}/file.bin")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sidecar_from_another_version_of_the_file_is_discarded() {
+        // Same size, different ETag: the sidecar claims every byte is done, so
+        // resuming it would keep the old version's bytes in the new file.
+        let old = Version { etag: "\"a\"".into(), content: vec![b'a'; 50_000] };
+        let new = Version { etag: "\"b\"".into(), content: vec![b'b'; 50_000] };
+        let url = serve_versioned(new.clone(), None, Default::default());
+
+        let dir = scratch("other-version");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("file.bin");
+        std::fs::write(&dest, &old.content).unwrap();
+        let state = StateFile {
+            url: url.clone(),
+            total: Some(50_000),
+            ranged: true,
+            validators: Validators { etag: Some(old.etag.clone()), last_modified: None },
+            segments: vec![Segment { start: 0, end: 49_999, done: 50_000, complete: true, failed: false }],
+        };
+        std::fs::write(with_suffix(&dest, ".tdmstate"), serde_json::to_vec(&state).unwrap()).unwrap();
+
+        Download::new(url, dest.clone(), 1).run().await.expect("download");
+        assert!(std::fs::read(&dest).unwrap() == new.content, "bytes from the old version were kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_ranged_request_sends_the_etag_as_if_range() {
+        let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_versioned(
+            Version { etag: "\"v1\"".into(), content: content.clone() },
+            None,
+            Arc::clone(&heads),
+        );
+        let dir = scratch("if-range");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("file.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        Download::new(url, dest.clone(), 4).run().await.expect("download");
+        assert!(std::fs::read(&dest).unwrap() == content);
+
+        let heads = heads.lock().unwrap();
+        let ranged: Vec<&String> = heads
+            .iter()
+            .filter(|h| !h.to_ascii_lowercase().contains("range: bytes=0-0"))
+            .collect();
+        assert!(!ranged.is_empty(), "no ranged request was made");
+        for head in ranged {
+            assert!(
+                head.lines().any(|l| l.eq_ignore_ascii_case("if-range: \"v1\"")),
+                "ranged request without If-Range: {head}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_that_changes_mid_download_is_fetched_again_from_scratch() {
+        // The server answers the segment request with the whole new file (a 200
+        // to a ranged request under If-Range). The download must start over
+        // from a fresh probe, not splice the new bytes onto the old ones.
+        let old = Version {
+            etag: "\"a\"".into(),
+            content: (0..300_000u32).map(|i| (i % 251) as u8).collect(),
+        };
+        let new = Version {
+            etag: "\"b\"".into(),
+            content: (0..300_000u32).map(|i| (i % 241) as u8).collect(),
+        };
+        let url = serve_versioned(old, Some(new.clone()), Default::default());
+        let dir = scratch("changed-midway");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("file.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        let download = Download::new(url, dest.clone(), 1);
+        download.run().await.expect("download after a restart");
+        assert!(std::fs::read(&dest).unwrap() == new.content, "bytes from both versions");
+        assert_eq!(download.snapshot().status, Status::Finished);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_full_disk_error_is_recognised_by_its_os_code() {
+        let full = if cfg!(windows) { 112 } else { 28 };
+        assert!(is_disk_full(&std::io::Error::from_raw_os_error(full)));
+        assert!(matches!(write_error(std::io::Error::from_raw_os_error(full)), Error::DiskFull));
+        assert!(!is_disk_full(&std::io::Error::from_raw_os_error(2)));
+        assert!(matches!(write_error(std::io::Error::from_raw_os_error(2)), Error::Io(_)));
+        assert!(!Error::DiskFull.is_transient(), "a full disk must not be retried in a loop");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_too_big_for_the_disk_pauses_instead_of_failing() {
+        // The server claims a file far larger than any disk. The preflight
+        // must refuse before anything is allocated.
+        let url = serve_fixed(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1000000000000000\r\n\
+              Content-Length: 1\r\nConnection: close\r\n\r\nx",
+        );
+        let dir = scratch("no-room");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("huge.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        let download = Download::new(url, dest.clone(), 1);
+        download.run().await.expect("a full disk pauses the download rather than failing it");
+        let snap = download.snapshot();
+        assert_eq!(snap.status, Status::Paused);
+        assert!(snap.paused_reason.is_some(), "the UI needs a reason to show");
+        assert!(!dest.exists(), "nothing was allocated");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -206,7 +206,7 @@ pub fn serve(inbox: Inbox, advert: Arc<Mutex<Advert>>) -> Result<Endpoint, Error
             std::thread::spawn(move || {
                 let _slot = slot;
                 if let Err(e) = handle(stream, inbox, advert, &expected) {
-                    eprintln!("native host connection ended: {e}");
+                    tracing::warn!("native host connection ended: {e}");
                 }
             });
         }
@@ -521,7 +521,7 @@ pub fn run_cli(args: &[String]) -> Option<i32> {
         return Some(match run_host_mode() {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("native host: {e}");
+                tracing::error!("native host: {e}");
                 1
             }
         });

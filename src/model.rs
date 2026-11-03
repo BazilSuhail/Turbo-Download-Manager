@@ -374,8 +374,8 @@ impl ProxySettings {
     /// `Manual` uses the fields on the page. `System` reads the user's Windows
     /// proxy (what the "Get System" button copies in), and
     /// applies it to both protocols — the system setting has no per-protocol
-    /// ticks. `Pac` resolves to nothing: evaluating a PAC script needs a
-    /// JavaScript engine, so the page says so rather than pretending.
+    /// ticks. `Pac` needs the script text, which the engine fetches, so it
+    /// resolves to nothing here; use [`ProxySettings::resolve_pac`] per URL.
     pub fn resolved(&self) -> Option<crate::engine::ProxyConfig> {
         match self.mode {
             ProxyMode::None | ProxyMode::Pac => None,
@@ -405,6 +405,32 @@ impl ProxySettings {
                 user: String::new(),
                 password: String::new(),
             }),
+        }
+    }
+
+    /// Where the PAC script comes from (`pac_url`, a URL or a file path), when
+    /// the mode is `Pac` and a location is set. The engine fetches the text.
+    pub fn pac_location(&self) -> Option<&str> {
+        let location = self.pac_url.trim();
+        (self.mode == ProxyMode::Pac && !location.is_empty()).then_some(location)
+    }
+
+    /// The proxy for `download_url`, given the PAC script text the engine
+    /// fetched from [`ProxySettings::pac_location`]. Other modes ignore
+    /// `pac_script`. `Ok(None)` means connect directly.
+    pub fn resolve_pac(
+        &self,
+        download_url: &str,
+        pac_script: &str,
+    ) -> Result<Option<crate::engine::ProxyConfig>, crate::proxy::PacError> {
+        if self.mode != ProxyMode::Pac {
+            return Ok(self.resolved());
+        }
+        match crate::proxy::pac_decide(pac_script, download_url)? {
+            crate::proxy::PacDecision::Direct => Ok(None),
+            crate::proxy::PacDecision::Proxy(url) => {
+                Ok(Some(crate::proxy::pac_proxy_config(url)))
+            }
         }
     }
 }
@@ -924,14 +950,45 @@ mod tests {
             .resolved()
             .is_none());
         assert!(ProxySettings::default().resolved().is_none());
-        // PAC needs a script engine we do not have; it must not silently
-        // behave as a direct connection to some other host.
+        // PAC resolves per URL once the engine supplies the script text (see
+        // `pac_resolves_per_url_once_the_script_is_supplied`); without it,
+        // `resolved()` yields nothing rather than guessing a proxy.
         let pac = ProxySettings {
             mode: ProxyMode::Pac,
             pac_url: "http://example.test/p.pac".into(),
             ..ProxySettings::default()
         };
         assert!(pac.resolved().is_none());
+        assert_eq!(pac.pac_location(), Some("http://example.test/p.pac"));
+    }
+
+    #[test]
+    fn pac_resolves_per_url_once_the_script_is_supplied() {
+        let script = r#"function FindProxyForURL(u, h) {
+            return h === "localhost" ? "DIRECT" : "SOCKS5 s.lan:1080";
+        }"#;
+        let p = ProxySettings {
+            mode: ProxyMode::Pac,
+            pac_url: "  file:///C:/proxy.pac ".into(),
+            ..ProxySettings::default()
+        };
+        assert_eq!(p.pac_location(), Some("file:///C:/proxy.pac"));
+        assert!(p.resolve_pac("http://localhost/a", script).unwrap().is_none());
+        let c = p.resolve_pac("https://example.com/a", script).unwrap().unwrap();
+        assert_eq!(c.url, "socks5://s.lan:1080");
+        assert!(c.http && c.https && c.user.is_empty());
+
+        // A PAC mode with no location has nothing to fetch.
+        let unset = ProxySettings { mode: ProxyMode::Pac, ..ProxySettings::default() };
+        assert_eq!(unset.pac_location(), None);
+        // Other modes ignore the script.
+        let manual = ProxySettings {
+            mode: ProxyMode::Manual,
+            host: "proxy.lan".into(),
+            port: 3128,
+            ..ProxySettings::default()
+        };
+        assert_eq!(manual.resolve_pac("https://example.com/", "").unwrap().unwrap().url, "http://proxy.lan:3128");
     }
 
     #[test]
