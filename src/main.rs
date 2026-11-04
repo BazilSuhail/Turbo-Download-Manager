@@ -19,7 +19,7 @@ mod batch;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use iced::animation::{Animation, Easing};
 use iced::keyboard::{self, key::Named, Key};
@@ -397,6 +397,11 @@ struct App {
     /// Set once the queue starts a download, cleared when the after-queue
     /// action runs, so that action fires once per run of the queue.
     queue_busy: bool,
+    /// Download queues with their own windows. Session-only for now: nothing
+    /// yet creates a queue or persists one, so it starts with the built-ins.
+    queues: tdm::scheduler::Scheduler,
+    /// Wall-clock time of the previous tick, for detecting a sleep or resume.
+    last_wall_tick: Option<SystemTime>,
     /// Current window width, so the sidebar can grow with the window.
     window_width: f32,
     open_menu: Option<usize>,
@@ -729,6 +734,8 @@ impl App {
             prompt_dir: None,
             prompt_seq: 0,
             queue_busy: false,
+            queues: tdm::scheduler::Scheduler::with_builtins(),
+            last_wall_tick: None,
             window_width: 900.0,
             open_menu: None,
             settings_open: false,
@@ -982,7 +989,17 @@ impl App {
         if self.schedule_blocks() {
             return Task::none();
         }
-        let statuses: Vec<Status> = self.downloads.iter().map(|e| e.snapshot.status).collect();
+        let now = tdm::scheduler::local_now();
+        // A queued download whose own queue window is closed is shown to
+        // `next_to_start` as Paused, so it neither starts nor takes a slot.
+        let statuses: Vec<Status> = self
+            .downloads
+            .iter()
+            .map(|e| match e.snapshot.status {
+                Status::Queued if !self.queues.window_allows(e.id, now) => Status::Paused,
+                other => other,
+            })
+            .collect();
         let mut tasks = Vec::new();
         for index in next_to_start(&statuses, self.settings.max_active) {
             let entry = &mut self.downloads[index];
@@ -2093,12 +2110,20 @@ impl App {
             tasks.push(iced::clipboard::read().map(Message::Clipboard));
         }
 
+        // A wall-clock jump since the last tick means the machine slept or resumed.
+        let wall = SystemTime::now();
+        let woke = self.last_wall_tick.is_some_and(|prev| woke_from_sleep(prev, wall));
+        self.last_wall_tick = Some(wall);
         let now = Instant::now();
         for entry in &mut self.downloads {
             // A pending retry only means something while the download is still
             // Failed; anything else means the user or a retry has moved it on.
             if entry.snapshot.status != Status::Failed {
                 entry.retry_at = None;
+            }
+            // After a wake, a download waiting to retry is due now, not on its old timer.
+            if woke {
+                entry.retry_at = entry.retry_at.map(|_| now);
             }
             // The retry is due: requeue it, and `start_ready` below starts it.
             if entry.retry_at.is_some_and(|at| now >= at) {
@@ -4028,6 +4053,16 @@ fn retry_wait(transient: bool, auto_retry: bool, max: u32, retries: u32) -> Opti
     (transient && auto_retry && retries < max.min(AUTO_RETRY_MAX)).then(|| retry_delay(retries))
 }
 
+/// A wall-clock gap between two ticks longer than this means the machine slept.
+const WAKE_GAP: Duration = Duration::from_secs(120);
+
+/// Whether the wall clock jumped more than `WAKE_GAP` since the previous tick.
+/// Uses `SystemTime` because `Instant` may not advance across a sleep. A clock
+/// that moved backwards is not a wake.
+fn woke_from_sleep(prev: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(prev).is_ok_and(|gap| gap > WAKE_GAP)
+}
+
 fn tip<'a>(content: impl Into<Element<'a, Message>>, label: impl text::IntoFragment<'a>) -> Element<'a, Message> {
     tooltip(
         content,
@@ -4428,6 +4463,8 @@ mod tests {
             prompt_dir: None,
             prompt_seq: 0,
             queue_busy: false,
+            queues: tdm::scheduler::Scheduler::with_builtins(),
+            last_wall_tick: None,
             window_width: 900.0,
             open_menu: None,
             settings_open: false,
@@ -4596,6 +4633,20 @@ mod tests {
         // A hand-edited budget above the cap is clamped to ten.
         assert!(retry_wait(true, true, 500, 9).is_some());
         assert_eq!(retry_wait(true, true, 500, 10), None);
+    }
+
+    #[test]
+    fn a_wall_clock_gap_over_two_minutes_counts_as_a_wake() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let after = |secs| t0 + Duration::from_secs(secs);
+        // Normal 500 ms ticks, and exactly the limit, are not a wake.
+        assert!(!woke_from_sleep(t0, after(0)));
+        assert!(!woke_from_sleep(t0, t0 + Duration::from_millis(500)));
+        assert!(!woke_from_sleep(t0, after(120)));
+        // Just over the limit is a wake.
+        assert!(woke_from_sleep(t0, after(121)));
+        // A clock set backwards is not a wake.
+        assert!(!woke_from_sleep(after(121), t0));
     }
 
     #[test]

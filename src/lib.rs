@@ -15,6 +15,7 @@ pub mod native_host;
 pub mod planner;
 pub mod proxy;
 pub mod register;
+pub mod rss;
 pub mod scan;
 pub mod scheduler;
 pub mod secrets;

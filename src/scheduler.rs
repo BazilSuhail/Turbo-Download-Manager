@@ -566,6 +566,16 @@ impl Scheduler {
             .collect()
     }
 
+    /// Whether download `id` may start at `now` under its own queue's window.
+    /// A download in no queue, or in a queue with no window enabled, is not
+    /// held back here; the global schedule is the caller's separate check.
+    pub fn window_allows(&self, id: u64, now: (Weekday, TimeOfDay)) -> bool {
+        self.queues
+            .iter()
+            .find(|q| q.items.contains(&id))
+            .is_none_or(|q| !q.schedule.enabled || due(&q.schedule, now) == Action::Start)
+    }
+
     pub fn next_to_start(&self, running: &[u64]) -> Vec<u64> {
         let mut out = Vec::new();
         for queue in &self.queues {
@@ -647,6 +657,21 @@ mod lead_tests {
         let night = (Weekday::Monday, at(23, 30));
         assert_eq!(s.ready_now(night, &[1]).len(), 1, "one slot should remain");
         assert!(s.ready_now(night, &[1, 2]).is_empty(), "no slot should remain");
+    }
+
+    #[test]
+    fn window_allows_gates_only_downloads_in_a_windowed_queue() {
+        let mut s = overnight_queue();
+        let noon = (Weekday::Monday, at(12, 0));
+        let night = (Weekday::Monday, at(23, 30));
+        // Download 1 is in the windowed queue: closed at noon, open at night.
+        assert!(!s.window_allows(1, noon));
+        assert!(s.window_allows(1, night));
+        // Download 99 is in no queue, so the queue window never holds it back.
+        assert!(s.window_allows(99, noon));
+        // A queue with its window off runs on demand.
+        s.queues[0].schedule.enabled = false;
+        assert!(s.window_allows(1, noon));
     }
 
     #[test]
