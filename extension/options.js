@@ -97,5 +97,48 @@ $("revokeMedia").addEventListener("click", async () => {
   refresh();
 });
 
+// Sites where media detection runs, stored as origins under "mediaSites".
+// Empty by default (no detection). Unchecking the box clears the list.
+const MEDIA_SITES_KEY = "mediaSites";
+const mediaSitesOn = $("mediaSitesOn");
+const mediaSitesText = $("mediaSites");
+
+// One site per line; a bare host gets https://. Anything that is not a web
+// address is dropped. The result is origins, which is what the background matches.
+function parseOrigins(text) {
+  const out = new Set();
+  for (const line of text.split(/\r?\n/)) {
+    const v = line.trim();
+    if (!v) continue;
+    try {
+      const u = new URL(/^https?:\/\//i.test(v) ? v : `https://${v}`);
+      if (u.protocol === "http:" || u.protocol === "https:") out.add(u.origin);
+    } catch (_) {
+      /* not a site; skipped */
+    }
+  }
+  return [...out];
+}
+
+api.storage.local
+  .get(MEDIA_SITES_KEY)
+  .then((v) => {
+    const list = Array.isArray(v[MEDIA_SITES_KEY]) ? v[MEDIA_SITES_KEY] : [];
+    mediaSitesText.value = list.join("\n");
+    mediaSitesOn.checked = list.length > 0;
+    mediaSitesText.disabled = !mediaSitesOn.checked;
+  })
+  .catch(() => null);
+
+function saveMediaSites() {
+  mediaSitesText.disabled = !mediaSitesOn.checked;
+  if (!mediaSitesOn.checked) mediaSitesText.value = "";
+  const list = mediaSitesOn.checked ? parseOrigins(mediaSitesText.value) : [];
+  if (mediaSitesOn.checked) mediaSitesText.value = list.join("\n");
+  api.storage.local.set({ [MEDIA_SITES_KEY]: list }).catch(() => null);
+}
+mediaSitesOn.addEventListener("change", saveMediaSites);
+mediaSitesText.addEventListener("change", saveMediaSites);
+
 refresh();
 setInterval(refresh, 2000);

@@ -365,15 +365,44 @@ function updateTabMedia(tabId, change) {
   return mediaChain;
 }
 
+// Origins the user turned media detection on for (options page). Empty by
+// default, so nothing is kept until a site is listed. Cached; dropped whenever
+// the list changes in storage.
+let mediaSites = null;
+async function mediaSiteEnabled(origin) {
+  if (!origin) return false;
+  if (!mediaSites) {
+    const { mediaSites: list = [] } = await api.storage.local.get("mediaSites");
+    mediaSites = new Set(list);
+  }
+  return mediaSites.has(origin);
+}
+api.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.mediaSites) mediaSites = null;
+});
+
+// The page a request was made from: Chromium's `initiator`, Firefox's `originUrl`.
+function pageOrigin(d) {
+  try {
+    return new URL(d.initiator || d.originUrl || d.url).origin;
+  } catch (_) {
+    return "";
+  }
+}
+
 function onMediaResponse(d) {
   if (d.tabId < 0) return; // service workers, prefetch, the extension itself
   if (d.type === "main_frame") return void updateTabMedia(d.tabId, (list) => (list.length ? [] : null));
   const header = (d.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type");
   const kind = mediaKind(d.url, header && header.value);
   if (!kind) return;
-  updateTabMedia(d.tabId, (list) =>
-    list.some((m) => m.url === d.url) ? null : [...list, { url: d.url, kind }].slice(-MEDIA_KEEP),
-  );
+  // Only pages on sites the user enabled; nothing is recorded for any other site.
+  void mediaSiteEnabled(pageOrigin(d)).then((on) => {
+    if (!on) return;
+    updateTabMedia(d.tabId, (list) =>
+      list.some((m) => m.url === d.url) ? null : [...list, { url: d.url, kind }].slice(-MEDIA_KEEP),
+    );
+  }, quiet);
 }
 
 // `api.webRequest` only exists once the optional permission is granted. Called
@@ -533,6 +562,19 @@ function fromExtensionPage(sender) {
   return sender.id === api.runtime.id && typeof sender.url === "string" && sender.url.startsWith(api.runtime.getURL(""));
 }
 
+// A content script may start a download only for a URL on the origin of the
+// tab it runs in. Anything else is refused by the caller.
+function sameOriginAsTab(raw, sender) {
+  const target = httpUrl(raw);
+  const tabUrl = sender.tab && sender.tab.url;
+  if (!target || !tabUrl) return false;
+  try {
+    return new URL(tabUrl).origin === target.origin;
+  } catch (_) {
+    return false;
+  }
+}
+
 api.runtime.onMessage.addListener((msg, sender, reply) => {
   if (!msg || typeof msg.cmd !== "string") return;
   const page = fromExtensionPage(sender);
@@ -542,6 +584,11 @@ api.runtime.onMessage.addListener((msg, sender, reply) => {
   };
 
   if (msg.cmd === "downloadMedia" && typeof msg.url === "string") {
+    if (!page && !sameOriginAsTab(msg.url, sender)) {
+      // The reason only; the URL is not logged.
+      console.warn("downloadMedia refused: URL is not on the sender's tab origin");
+      return answer(Promise.resolve({ result: "rejected" }));
+    }
     // From the popup the page details come in the message; from the content
     // script they come from the browser, which the page cannot forge.
     const referer = page ? msg.pageUrl : sender.url;

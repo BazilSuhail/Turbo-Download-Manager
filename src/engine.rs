@@ -873,6 +873,15 @@ impl Download {
             .truncate(fresh)
             .open(&self.dest)
             .await?;
+        // Only the run that creates the file marks it, so a resume leaves the
+        // existing marker alone.
+        if on_disk.is_none() {
+            let referrer = configured
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("referer"))
+                .map(|(_, v)| v.as_str());
+            mark_of_the_web(&self.dest, &self.url, referrer);
+        }
         if let Some(size) = total {
             file.set_len(size).await.map_err(write_error)?;
         }
@@ -1805,6 +1814,26 @@ fn verify_server_hash(
         ))
     }
 }
+
+/// Tag a newly created file as downloaded from the internet (Windows Mark of
+/// the Web), so Windows warns before it runs. Failure is logged, not fatal.
+#[cfg(windows)]
+fn mark_of_the_web(dest: &Path, url: &str, referrer: Option<&str>) {
+    let mut body = String::from("[ZoneTransfer]\r\nZoneId=3\r\n");
+    if let Some(r) = referrer.filter(|r| !r.is_empty()) {
+        body.push_str(&format!("ReferrerUrl={r}\r\n"));
+    }
+    body.push_str(&format!("HostUrl={url}\r\n"));
+    let mut ads = dest.as_os_str().to_owned();
+    ads.push(":Zone.Identifier");
+    if let Err(e) = std::fs::write(PathBuf::from(ads), body) {
+        let host = crate::hosts::HostLimits::host_key(url);
+        tracing::warn!(%host, "could not write Mark of the Web: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_of_the_web(_dest: &Path, _url: &str, _referrer: Option<&str>) {}
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();

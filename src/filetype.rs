@@ -1381,3 +1381,93 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Leading bytes of real formats, so the parsers get past their first checks.
+    const MAGICS: &[&[u8]] = &[
+        b"\x89PNG\r\n\x1a\n",
+        b"\xFF\xD8\xFF",
+        b"GIF89a",
+        b"RIFF\0\0\0\0WEBP",
+        b"RIFF\0\0\0\0AVI ",
+        b"BM",
+        b"%PDF-",
+        b"PK\x03\x04",
+        b"PK\x05\x06",
+        b"7z\xBC\xAF\x27\x1C",
+        b"\x1F\x8B\x08",
+        b"BZh9",
+        b"\x28\xB5\x2F\xFD",
+        b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1",
+        b"MZ",
+        b"\x7FELF",
+        b"\xCF\xFA\xED\xFE",
+        b"\xCA\xFE\xBA\xBE",
+        b"\x1A\x45\xDF\xA3",
+        b"\x00\x00\x00\x18ftyp",
+        b"\x00\x00\x00\x18ftypisom",
+        b"\x00\x00\x01\x00",
+        b"ID3",
+        b"OggS",
+        b"fLaC",
+        b"\xFF\xF1",
+        b"\x47\x00",
+        b"wOFF",
+        b"wOF2",
+        b"SQLite format 3\0",
+        b"\0asm",
+        b"<!DOCTYPE html>",
+        b"<?xml version=\"1.0\"?><error/>",
+        b"\xEF\xBB\xBF<html>",
+        b"\xFF\xFE<\0h\0t\0m\0l\0",
+    ];
+
+    fn bytes_up_to_8k() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..=8192)
+    }
+
+    fn head_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            bytes_up_to_8k(),
+            (prop::sample::select(MAGICS), bytes_up_to_8k()).prop_map(|(magic, rest)| {
+                let mut head = magic.to_vec();
+                head.extend(rest);
+                head.truncate(HEAD);
+                head
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn sniff_and_verdict_never_panic(head in head_bytes(), tail in bytes_up_to_8k()) {
+            let kind = sniff(&head, &tail);
+            for name in ["clip.mp4", ".mp4", "x.MP4", "a.png", "b.html", "c", "d.tar.gz", "e."] {
+                let _ = verdict(kind, name, None, false);
+                let _ = verdict(kind, name, Some("video/mp4"), true);
+            }
+            let _ = fixed_name("weird.", kind);
+        }
+
+        /// Random bytes named `.mp4` must not be reported as a match. A `Match` for an
+        /// mp4 name needs an `ftyp` box at offset 4, which is the only signature that
+        /// sniffs as an MP4-family kind, so that case is excluded.
+        #[test]
+        fn random_bytes_named_mp4_are_never_a_match(
+            head in bytes_up_to_8k(),
+            tail in bytes_up_to_8k(),
+        ) {
+            prop_assume!(head.get(4..8) != Some(b"ftyp".as_slice()));
+            let kind = sniff(&head, &tail);
+            for name in ["clip.mp4", ".mp4"] {
+                prop_assert!(verdict(kind, name, None, false) != Verdict::Match, "{kind:?} {name}");
+            }
+        }
+    }
+}

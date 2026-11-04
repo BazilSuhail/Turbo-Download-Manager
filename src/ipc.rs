@@ -244,8 +244,33 @@ fn write_endpoint(path: &std::path::Path, endpoint: &Endpoint) -> Result<(), Err
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(windows)]
+    restrict_to_user(&tmp);
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// On Windows, drop inherited access and grant only the current user read and
+/// write, using the built-in `icacls`. Failure is logged, not fatal.
+#[cfg(windows)]
+fn restrict_to_user(path: &std::path::Path) {
+    let Some(user) = std::env::var_os("USERNAME").filter(|u| !u.is_empty()) else {
+        tracing::warn!("USERNAME is not set; the endpoint file keeps its default permissions");
+        return;
+    };
+    let mut grant = user;
+    grant.push(":(R,W)");
+    match std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(grant)
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => tracing::warn!("icacls could not restrict the endpoint file ({})", out.status),
+        Err(e) => tracing::warn!("could not run icacls on the endpoint file: {e}"),
+    }
 }
 
 fn handle(

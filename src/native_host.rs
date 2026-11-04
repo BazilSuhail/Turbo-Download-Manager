@@ -213,6 +213,8 @@ pub fn sanitize_filename(name: &str) -> String {
         "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$",
         "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        // Superscript digits are reserved too.
+        "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
     ];
     let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
     if RESERVED.contains(&stem.as_str()) {
@@ -368,5 +370,110 @@ mod tests {
         assert_eq!(sanitize_filename("CONIN$"), "_CONIN$");
         assert_eq!(sanitize_filename("conout$.txt"), "_conout$.txt");
         assert_eq!(sanitize_filename("CLOCK$"), "_CLOCK$");
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::Value;
+    use std::io::Cursor;
+
+    /// Arbitrary JSON, nested one level: scalars, arrays and objects of scalars.
+    fn json_leaf() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(Value::from),
+            "\\PC{0,16}".prop_map(Value::String),
+        ]
+    }
+
+    fn json_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            json_leaf(),
+            prop::collection::vec(json_leaf(), 0..6).prop_map(Value::Array),
+            prop::collection::btree_map("\\PC{0,8}", json_leaf(), 0..6)
+                .prop_map(|m| Value::Object(m.into_iter().collect())),
+        ]
+    }
+
+    /// Names that Windows reserves, in the case and with the suffixes that
+    /// the sanitizer has to handle.
+    fn reserved_name() -> impl Strategy<Value = String> {
+        (
+            prop::sample::select(vec!["con", "NUL", "Com3", "lpt1", "conin$", "CLOCK$", "aux"]),
+            prop::sample::select(vec!["", ".txt", ".", " ", ". ", ":x", "/y", ".tar.gz"]),
+        )
+            .prop_map(|(stem, suffix)| format!("{stem}{suffix}"))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn sanitized_names_are_safe_path_components(
+            name in prop_oneof![
+                any::<String>(),
+                "\\PC{0,40}",
+                "[ ._/\\\\:$a-zA-Z0-9<>|?*\"]{0,30}",
+                reserved_name(),
+            ],
+        ) {
+            let out = sanitize_filename(&name);
+            prop_assert!(!out.is_empty());
+            prop_assert!(!out.contains(['/', '\\', ':']), "separator in {out:?}");
+            prop_assert!(!out.chars().any(char::is_control), "control char in {out:?}");
+            // Without separators the output is one component, so it must not be `.` or `..`.
+            prop_assert!(out != "." && out != "..", "traversal component {out:?}");
+            let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
+            let reserved = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"];
+            let com_lpt = |p: &str| {
+                stem.len() == 4
+                    && stem.starts_with(p)
+                    && stem.as_bytes()[3].is_ascii_digit()
+                    && stem.as_bytes()[3] != b'0'
+            };
+            prop_assert!(
+                !reserved.contains(&stem.as_str()) && !com_lpt("COM") && !com_lpt("LPT"),
+                "reserved device name {out:?}"
+            );
+        }
+
+        #[test]
+        fn decoding_arbitrary_bytes_never_panics(
+            bytes in prop::collection::vec(any::<u8>(), 0..4096),
+            claimed in 0u32..=4096,
+        ) {
+            // Raw bytes, and a plausible length prefix in front of a random body.
+            let mut framed = claimed.to_le_bytes().to_vec();
+            framed.extend_from_slice(&bytes);
+            let _ = Codec::new(Cursor::new(bytes), Vec::new()).read::<Request>();
+            let _ = Codec::new(Cursor::new(framed.clone()), Vec::new()).read::<Request>();
+            let _ = Codec::new(Cursor::new(framed), Vec::new()).read::<Value>();
+        }
+
+        /// The length is checked before the body buffer is allocated, so a
+        /// prefix of u32::MAX must come back as `TooLarge`, not an allocation
+        /// or an I/O error from the short body.
+        #[test]
+        fn frames_above_the_cap_are_refused_before_allocation(
+            len in (MAX_MESSAGE_BYTES + 1)..=u32::MAX,
+            tail in prop::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let mut bytes = len.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&tail);
+            let got = Codec::new(Cursor::new(bytes), Vec::new()).read::<Request>();
+            prop_assert!(matches!(got, Err(Error::TooLarge(n)) if n == len), "{got:?}");
+        }
+
+        #[test]
+        fn encode_then_decode_round_trips_json(value in json_value()) {
+            let mut wire = Vec::new();
+            Codec::new(Cursor::new(Vec::new()), &mut wire).write(&value).unwrap();
+            let back: Value = Codec::new(Cursor::new(wire), Vec::new()).read().unwrap().unwrap();
+            prop_assert_eq!(back, value);
+        }
     }
 }

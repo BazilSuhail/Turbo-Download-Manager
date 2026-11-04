@@ -40,6 +40,8 @@ rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 # Phase 1: OS keychain for proxy and site secrets (src/secrets.rs). Native backends only:
 # Windows Credential Manager, macOS Keychain, Linux Secret Service (D-Bus). 3.x kept as the pinned line.
 keyring = { version = "3.6.3", default-features = false, features = ["windows-native", "apple-native", "sync-secret-service"] }
+# Phase 4: command-line mode (src/bin/tdm-cli.rs).
+clap = { version = "4.6.7", features = ["derive"] }
 # Phase 2: encrypted FTP (FTPS), archive extraction (zip, tar, gzip, xz). Versions as MDM pins them.
 suppaftp = { version = "12.2.1", default-features = false, features = ["tokio-rustls-aws-lc-rs", "deprecated"] }
 # Phase 2: FTPS certificate checks against the platform trust store (same version reqwest pulls in).
@@ -52,6 +54,8 @@ lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "x
 [dev-dependencies]
 # Lab server for the engine integration tests (tests/engine_local_server.rs).
 tdm-labserver = { path = "crates/tdm-labserver" }
+# Phase 3: property tests for the file sniffer, the filename sanitizer and the native message codec.
+proptest = "1.12.0"
 
 [workspace]
 # Phase 0 crates. The app stays the root package.

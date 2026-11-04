@@ -585,6 +585,26 @@ fn rename_finished(from: &std::path::Path, to: &std::path::Path) -> std::io::Res
     }
 }
 
+/// Move a file flagged by the virus scanner into the quarantine folder under the
+/// app directory, and return its new path. A cross-volume move falls back to
+/// copy-then-remove; the original is removed only after the copy exists.
+fn quarantine_file(from: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dir = tdm::store::app_dir().join("quarantine");
+    std::fs::create_dir_all(&dir)?;
+    let name = from
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let to = unique_dest(dir.join(name), |p| p.exists());
+    match std::fs::rename(from, &to) {
+        Ok(()) => Ok(to),
+        Err(_) => {
+            std::fs::copy(from, &to)?;
+            std::fs::remove_file(from)?;
+            Ok(to)
+        }
+    }
+}
+
 /// Rename `from` to `want`, or to the first name after it that is free, trying
 /// at most 100 names. Runs off the UI thread, since every check touches disk.
 fn rename_to_free_name(from: &std::path::Path, want: &std::path::Path, others: &[PathBuf]) -> Result<PathBuf, String> {
@@ -1654,7 +1674,17 @@ impl App {
                 if let Some(ix) = self.index_of(id) {
                     if verdict == tdm::scan::Verdict::Threat {
                         let name = self.downloads[ix].name.clone();
-                        self.toast(ToastKind::Error, format!("Threat found in {}. The file is kept: review it before opening.", middle_ellipsis(&name, 48)));
+                        let from = self.downloads[ix].handle.dest().to_owned();
+                        match quarantine_file(&from) {
+                            Ok(to) => {
+                                let e = &mut self.downloads[ix];
+                                e.name = file_name_of(&to);
+                                e.handle.set_dest(to.clone());
+                                self.save();
+                                self.toast(ToastKind::Error, format!("Threat found in {}. The file was moved to {}. Review it before opening.", middle_ellipsis(&name, 48), middle_ellipsis(&to.display().to_string(), 48)));
+                            }
+                            Err(err) => self.toast(ToastKind::Error, format!("Threat found in {}, but it could not be moved to quarantine: {}", middle_ellipsis(&name, 48), short_error(&err.to_string()))),
+                        }
                     }
                     self.downloads[ix].scan = Some(verdict);
                     self.downloads[ix].scanning = false;

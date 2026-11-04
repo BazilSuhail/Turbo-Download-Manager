@@ -39,7 +39,8 @@ pub struct DownloadRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_id: Option<u32>,
     /// Headers replayed on every request for this download (Referer, Cookie,
-    /// User-Agent).
+    /// User-Agent). `Cookie`, `Authorization` and `Proxy-Authorization` are
+    /// kept in memory only: `Store::save_list` never writes them to disk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
     /// Alternative URLs for the same file, tried when a segment keeps failing.
@@ -111,8 +112,18 @@ impl Store {
         load(&self.list_path())
     }
 
+    /// Writes the list without credential headers. The caller's copy keeps them
+    /// for the current session.
     pub fn save_list(&self, list: &DownloadList) -> Result<(), Error> {
-        save(&self.list_path(), list)
+        let mut on_disk = list.clone();
+        for record in &mut on_disk.downloads {
+            let before = record.headers.len();
+            record.headers.retain(|(name, _)| !is_credential_header(name));
+            if record.headers.len() != before {
+                note_sign_in_not_kept();
+            }
+        }
+        save(&self.list_path(), &on_disk)
     }
 
     pub fn hosts_path(&self) -> PathBuf {
@@ -127,6 +138,25 @@ impl Store {
 
     pub fn save_hosts(&self, limits: &HostLimits) -> Result<(), Error> {
         save(&self.hosts_path(), &limits.to_map())
+    }
+}
+
+/// Headers that carry a sign-in and so must not be written to disk.
+fn is_credential_header(name: &str) -> bool {
+    ["cookie", "authorization", "proxy-authorization"]
+        .iter()
+        .any(|secret| name.eq_ignore_ascii_case(secret))
+}
+
+/// Logs once per session that sign-in headers were left out of the saved list.
+/// A download resumed after a restart runs without its cookie, so a server that
+/// needs the sign-in may refuse it.
+fn note_sign_in_not_kept() {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "sign-in cookies are not saved to disk; downloads resumed after a restart may fail if the server needs the sign-in again"
+        );
     }
 }
 
@@ -249,6 +279,43 @@ mod tests {
         assert_eq!(back.downloads[0].total, Some(1234));
         assert_eq!(back.downloads[0].kind.as_deref(), Some("png"));
         assert_eq!(back.downloads[0].content_type.as_deref(), Some("text/html"));
+    }
+
+    #[test]
+    fn a_saved_record_has_no_cookie_or_authorization_after_a_round_trip() {
+        let store = temp_store("no-cookie");
+        let list = DownloadList {
+            downloads: vec![DownloadRecord {
+                url: "https://example.test/private.zip".into(),
+                dest: PathBuf::from("D:\\dl\\private.zip"),
+                category_id: None,
+                headers: vec![
+                    ("Referer".into(), "https://example.test/".into()),
+                    ("Cookie".into(), "session=secret-cookie".into()),
+                    ("authorization".into(), "Bearer secret-token".into()),
+                    ("Proxy-Authorization".into(), "Basic c2VjcmV0".into()),
+                ],
+                mirrors: vec![],
+                total: None,
+                complete: false,
+                kind: None,
+                content_type: None,
+            }],
+        };
+        store.save_list(&list).unwrap();
+
+        let raw = std::fs::read_to_string(store.list_path()).unwrap();
+        assert!(!raw.contains("secret-cookie"), "cookie value on disk: {raw}");
+        assert!(!raw.contains("secret-token"), "authorization value on disk: {raw}");
+        assert!(!raw.contains("c2VjcmV0"), "proxy authorization on disk: {raw}");
+
+        let back = store.load_list().unwrap();
+        assert_eq!(
+            back.downloads[0].headers,
+            vec![("Referer".to_owned(), "https://example.test/".to_owned())]
+        );
+        // The caller's copy keeps the sign-in for the current session.
+        assert_eq!(list.downloads[0].headers.len(), 4);
     }
 
     #[test]

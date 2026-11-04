@@ -17,6 +17,7 @@
       dl { display: grid; gap: 8px 16px; grid-template-columns: max-content 1fr; margin: 0; }
       dt { color: var(--muted); }
       dd { margin: 0; overflow-wrap: anywhere; }
+      textarea { width: 100%; box-sizing: border-box; font: inherit; }
     </style>
   </head>
   <body>
@@ -84,6 +85,20 @@
           nothing leaves your computer except the URL you choose to download,
           which goes to the TDM app. Already-open tabs need a reload.
         </p>
+      </section>
+
+      <section class="card">
+        <h2>Media sites</h2>
+        <div class="row spread">
+          <label for="mediaSitesOn"><strong>Detect videos on these sites</strong></label>
+          <span class="switch"><input id="mediaSitesOn" type="checkbox" role="switch" /><span></span></span>
+        </div>
+        <p class="hint">
+          Off by default. Only pages on the sites listed below are watched for
+          streamed media. Needs Media detection above. One site per line, for
+          example https://example.com. Already-open tabs need a reload.
+        </p>
+        <textarea id="mediaSites" rows="4" spellcheck="false" aria-label="Sites to detect videos on" placeholder="https://example.com" disabled></textarea>
       </section>
 
       <section class="card">
