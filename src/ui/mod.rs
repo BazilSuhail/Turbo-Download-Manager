@@ -2,7 +2,9 @@
 //! the Preferences pages and the TDM palettes.
 
 pub mod assets;
+pub mod components;
 pub mod fit;
+pub mod keymap;
 pub mod menu;
 pub mod options;
 pub mod theme;

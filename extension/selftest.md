@@ -143,7 +143,7 @@ the service-worker console (**Details → Inspect views: service worker**).
 28. Click **×** on the pill, move away and back.
     Expect: the pill stays hidden for that video until reload.
 29. Keyboard: Tab to a player with `controls`, then press Tab again.
-    Expect: focus moves into the pill (orange focus ring); Esc returns focus
+    Expect: focus moves into the pill (blue focus ring); Esc returns focus
     to the player; Tab from **×** leaves the pill and the next Tab moves on.
 30. A page with hostile CSS (`div, button { all: unset !important }`) or a
     strict `style-src` / Trusted Types CSP.

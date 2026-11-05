@@ -27,6 +27,155 @@ pub enum ToolError {
     Io(#[source] std::io::Error),
     #[error("tool timed out after {0:?}")]
     Timeout(Duration),
+    #[error("could not put the tool in a job object: {0}")]
+    Job(#[source] std::io::Error),
+}
+
+/// Keeps a helper and any processes it starts inside one job object, so they
+/// die with the job. On Windows the job kills its processes when its handle
+/// closes. On other platforms this does nothing.
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+    use std::io;
+
+    use tokio::process::Child;
+
+    use super::ToolError;
+
+    type Handle = *mut c_void;
+
+    /// `JobObjectExtendedLimitInformation` from the `JOBOBJECTINFOCLASS` enum.
+    const EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` from winnt.h.
+    const LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+    /// Mirrors `JOBOBJECT_BASIC_LIMIT_INFORMATION` (winnt.h, 64 bytes on x64).
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(dead_code)] // the kernel reads these fields; Rust never does
+
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    /// Mirrors `IO_COUNTERS` (winnt.h, 48 bytes).
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    /// Mirrors `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` (winnt.h, 144 bytes on x64).
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct ExtendedLimitInformation {
+        basic: BasicLimitInformation,
+        io: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, info_len: u32) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    /// An owned job handle. The handle is stored as an integer so the future
+    /// that holds it stays `Send`. Dropping it closes the handle, which kills
+    /// every process still in the job.
+    pub struct Job(usize);
+
+    impl Job {
+        /// Creates a job that kills its processes when the handle closes.
+        pub fn create() -> Result<Self, ToolError> {
+            // SAFETY: null attributes and a null name are both allowed. The call only returns a handle.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(ToolError::Job(io::Error::last_os_error()));
+            }
+            // From here on, `job` owns the handle and closes it on every error path.
+            let job = Job(handle as usize);
+            let info = ExtendedLimitInformation {
+                basic: BasicLimitInformation { limit_flags: LIMIT_KILL_ON_JOB_CLOSE, ..Default::default() },
+                ..Default::default()
+            };
+            // SAFETY: `info` is a #[repr(C)] value laid out like JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            // and the length is its exact size. `handle` is a live job handle owned by `job`.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    EXTENDED_LIMIT_INFORMATION_CLASS,
+                    (&info as *const ExtendedLimitInformation).cast(),
+                    std::mem::size_of::<ExtendedLimitInformation>() as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(ToolError::Job(io::Error::last_os_error()));
+            }
+            Ok(job)
+        }
+
+        /// Puts the running child into the job. A child that has already exited has nothing to contain.
+        pub fn assign(&self, child: &Child) -> Result<(), ToolError> {
+            let Some(process) = child.raw_handle() else { return Ok(()) };
+            // SAFETY: `self.0` is a live job handle owned by `self`. `process` is the child's process
+            // handle, which tokio keeps open while the child has not been reaped.
+            let ok = unsafe { AssignProcessToJobObject(self.0 as Handle, process) };
+            if ok == 0 {
+                return Err(ToolError::Job(io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from CreateJobObjectW and is closed only here, once.
+            unsafe {
+                CloseHandle(self.0 as Handle);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod job {
+    use tokio::process::Child;
+
+    use super::ToolError;
+
+    pub struct Job;
+
+    impl Job {
+        pub fn create() -> Result<Self, ToolError> {
+            Ok(Self)
+        }
+
+        pub fn assign(&self, _child: &Child) -> Result<(), ToolError> {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +233,16 @@ pub async fn run(program: &Path, args: &[String], limit: Duration) -> Result<Out
     if !program.is_file() {
         return Err(ToolError::Missing(program.display().to_string()));
     }
+    // The job is created before the spawn, so a failure here never leaves an
+    // unsandboxed helper running.
+    //
+    // Known gap (Windows): the child is spawned running and only then assigned
+    // to the job. A helper that starts a grandchild in that short window can
+    // leave the grandchild outside the job, where closing the job will not end
+    // it. Closing the gap needs a suspended spawn (CREATE_SUSPENDED, then
+    // resume after assignment). That was not done here: it changes the spawn
+    // path, and it cannot be tested without a build.
+    let job = job::Job::create()?;
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -92,6 +251,12 @@ pub async fn run(program: &Path, args: &[String], limit: Duration) -> Result<Out
         .kill_on_drop(true)
         .spawn()
         .map_err(ToolError::Spawn)?;
+    if let Err(e) = job.assign(&child) {
+        let _ = child.start_kill();
+        return Err(e);
+    }
+    // `job` lives until this function returns. Closing it then ends any
+    // helper-started processes that are still running.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 

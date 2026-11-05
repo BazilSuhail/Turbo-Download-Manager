@@ -231,45 +231,52 @@ impl Drop for LiveSlot {
 /// must never see a half-written file.
 fn write_endpoint(path: &std::path::Path, endpoint: &Endpoint) -> Result<(), Error> {
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    // Created owner-only, not chmod-ed afterwards: in between, the token would
-    // sit in a file any local user can read.
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    std::io::Write::write_all(&mut options.open(&tmp)?, &serde_json::to_vec_pretty(endpoint)?)?;
+    // Create the file empty, restrict it, and only then write the token, so the
+    // token never sits in a file that another local user can read.
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options.open(&tmp)?;
+    }
     #[cfg(unix)]
     {
         // A leftover temp file from a crash keeps its old mode on reopen.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
+    // Fails closed: if the file cannot be restricted, the token is not written.
     #[cfg(windows)]
-    restrict_to_user(&tmp);
+    restrict_to_user(&tmp)?;
+    std::fs::write(&tmp, serde_json::to_vec_pretty(endpoint)?)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
 /// On Windows, drop inherited access and grant only the current user read and
-/// write, using the built-in `icacls`. Failure is logged, not fatal.
+/// write, using the built-in `icacls`. The caller must not write the token
+/// unless this succeeds.
 #[cfg(windows)]
-fn restrict_to_user(path: &std::path::Path) {
+fn restrict_to_user(path: &std::path::Path) -> Result<(), Error> {
     let Some(user) = std::env::var_os("USERNAME").filter(|u| !u.is_empty()) else {
-        tracing::warn!("USERNAME is not set; the endpoint file keeps its default permissions");
-        return;
+        return Err(Error::Io(std::io::Error::other("USERNAME is not set; refusing to publish the token")));
     };
     let mut grant = user;
     grant.push(":(R,W)");
-    match std::process::Command::new("icacls")
+    let out = std::process::Command::new("icacls")
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
         .arg(grant)
-        .output()
-    {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => tracing::warn!("icacls could not restrict the endpoint file ({})", out.status),
-        Err(e) => tracing::warn!("could not run icacls on the endpoint file: {e}"),
+        .output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::other(format!(
+            "icacls could not restrict the endpoint file ({})",
+            out.status
+        ))))
     }
 }
 
@@ -594,6 +601,21 @@ mod tests {
             exception_hosts: vec!["intranet.test".into()],
             enabled: true,
         }
+    }
+
+    #[test]
+    fn the_endpoint_file_is_written_whole_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("tdm-endpoint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoint.json");
+        let endpoint = Endpoint { port: 4242, token: make_token() };
+        write_endpoint(&path, &endpoint).unwrap();
+        let back: Endpoint = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back.port, 4242);
+        assert_eq!(back.token, endpoint.token);
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        assert!(!tmp.exists(), "the temp file was left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

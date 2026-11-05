@@ -263,6 +263,30 @@ pub struct DownloadSettings {
     /// The user has read and accepted the DHT notice (peers see your IP address).
     #[serde(default)]
     pub torrents_dht_notice_accepted: bool,
+    /// Per-download default cap in bytes/second. `None` means unlimited.
+    #[serde(default)]
+    pub default_speed_limit_bps: Option<u64>,
+    /// Path to the yt-dlp helper binary. `None` means not configured.
+    #[serde(default)]
+    pub yt_dlp_path: Option<PathBuf>,
+    /// Pinned SHA-256 of the yt-dlp binary. The helper refuses to run on mismatch.
+    #[serde(default)]
+    pub yt_dlp_sha256: String,
+    /// Path to the ffmpeg helper binary. `None` means not configured.
+    #[serde(default)]
+    pub ffmpeg_path: Option<PathBuf>,
+    /// Pinned SHA-256 of the ffmpeg binary. The helper refuses to run on mismatch.
+    #[serde(default)]
+    pub ffmpeg_sha256: String,
+    /// RSS feeds polled for new links.
+    #[serde(default)]
+    pub rss_feeds: Vec<RssFeed>,
+    /// Show a notification when a download finishes.
+    #[serde(default = "default_true")]
+    pub notify_on_finish: bool,
+    /// Open the download's folder when it finishes.
+    #[serde(default)]
+    pub open_folder_on_finish: bool,
 }
 
 impl Default for DownloadSettings {
@@ -282,7 +306,50 @@ impl Default for DownloadSettings {
             extract_archives: true,
             torrents_enabled: false,
             torrents_dht_notice_accepted: false,
+            default_speed_limit_bps: None,
+            yt_dlp_path: None,
+            yt_dlp_sha256: String::new(),
+            ffmpeg_path: None,
+            ffmpeg_sha256: String::new(),
+            rss_feeds: Vec::new(),
+            notify_on_finish: true,
+            open_folder_on_finish: false,
         }
+    }
+}
+
+/// Polling interval used when a feed does not state one.
+const RSS_INTERVAL_DEFAULT: u32 = 30;
+/// Shortest allowed RSS polling interval, in minutes.
+pub const RSS_INTERVAL_MIN: u32 = 5;
+/// Longest allowed RSS polling interval, in minutes.
+pub const RSS_INTERVAL_MAX: u32 = 1440;
+
+fn default_rss_interval() -> u32 {
+    RSS_INTERVAL_DEFAULT
+}
+
+/// An RSS feed TDM polls for links that match its rules.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RssFeed {
+    pub id: u64,
+    pub url: String,
+    /// Match rules applied to each item.
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Folder that matched downloads are saved into.
+    pub dir: PathBuf,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Minutes between polls. Clamped to `RSS_INTERVAL_MIN..=RSS_INTERVAL_MAX` when used.
+    #[serde(default = "default_rss_interval")]
+    pub interval_minutes: u32,
+}
+
+impl RssFeed {
+    /// The polling interval in minutes, clamped to `RSS_INTERVAL_MIN..=RSS_INTERVAL_MAX`.
+    pub fn clamped_interval(&self) -> u32 {
+        self.interval_minutes.clamp(RSS_INTERVAL_MIN, RSS_INTERVAL_MAX)
     }
 }
 
@@ -718,6 +785,11 @@ pub struct Settings {
     /// behaves as if there were no scheduler at all.
     #[serde(default)]
     pub schedule: crate::scheduler::Schedule,
+    /// Download queues: their names, windows and concurrency. Which download
+    /// sits in which queue is session-only (ids do not survive a restart), so
+    /// `save_settings` drops the members before writing.
+    #[serde(default)]
+    pub queues: crate::scheduler::Scheduler,
     /// Name and extensions half-typed into the new-category row. UI state, so
     /// it is not persisted.
     #[serde(skip)]
@@ -806,6 +878,7 @@ impl Default for Settings {
             connection: ConnectionSettings::default(),
             proxy: ProxySettings::default(),
             schedule: crate::scheduler::Schedule::default(),
+            queues: crate::scheduler::Scheduler::with_builtins(),
             draft_category: (String::new(), String::new()),
             light_theme: false,
             bring_to_front_on_capture: true,
@@ -1136,6 +1209,79 @@ mod tests {
         assert_eq!(s.connection.auto_retry_max, 3);
         assert!(s.downloads.flash_on_complete);
         assert_eq!(s.window, None);
+    }
+
+    #[test]
+    fn old_download_settings_without_new_fields_still_load() {
+        let old = r#"{
+            "show_start_dialog": false,
+            "queue_only": false,
+            "show_complete_dialog": true,
+            "start_while_showing_info": true,
+            "queue_panel_on_download_later": true,
+            "queue_panel_on_batch_close": true,
+            "ignore_modification_time": false,
+            "duplicate_action": "Ask",
+            "user_agent": ""
+        }"#;
+        let d: DownloadSettings = serde_json::from_str(old).expect("old downloads must load");
+        assert!(!d.show_start_dialog);
+        assert_eq!(d.default_speed_limit_bps, None);
+        assert_eq!(d.yt_dlp_path, None);
+        assert!(d.yt_dlp_sha256.is_empty());
+        assert_eq!(d.ffmpeg_path, None);
+        assert!(d.ffmpeg_sha256.is_empty());
+        assert!(d.rss_feeds.is_empty());
+        assert!(d.notify_on_finish);
+        assert!(!d.open_folder_on_finish);
+    }
+
+    #[test]
+    fn new_download_settings_defaults_are_as_specified() {
+        let d = DownloadSettings::default();
+        assert_eq!(d.default_speed_limit_bps, None);
+        assert_eq!(d.yt_dlp_path, None);
+        assert!(d.yt_dlp_sha256.is_empty());
+        assert_eq!(d.ffmpeg_path, None);
+        assert!(d.ffmpeg_sha256.is_empty());
+        assert!(d.rss_feeds.is_empty());
+        assert!(d.notify_on_finish);
+        assert!(!d.open_folder_on_finish);
+    }
+
+    #[test]
+    fn rss_interval_is_clamped_to_five_to_1440_minutes() {
+        let mut feed = RssFeed {
+            id: 1,
+            url: "https://example.test/feed.xml".into(),
+            rules: vec!["*.iso".into()],
+            dir: PathBuf::from("D:\\dl\\rss"),
+            enabled: true,
+            interval_minutes: 30,
+        };
+        assert_eq!(feed.clamped_interval(), 30);
+        feed.interval_minutes = 0;
+        assert_eq!(feed.clamped_interval(), 5);
+        feed.interval_minutes = 1;
+        assert_eq!(feed.clamped_interval(), 5);
+        feed.interval_minutes = 5;
+        assert_eq!(feed.clamped_interval(), 5);
+        feed.interval_minutes = 1440;
+        assert_eq!(feed.clamped_interval(), 1440);
+        feed.interval_minutes = 100_000;
+        assert_eq!(feed.clamped_interval(), 1440);
+    }
+
+    #[test]
+    fn rss_feed_without_interval_or_enabled_takes_defaults() {
+        let f: RssFeed = serde_json::from_str(
+            r#"{"id": 7, "url": "https://example.test/f", "dir": "D:\\dl"}"#,
+        )
+        .unwrap();
+        assert_eq!(f.interval_minutes, 30);
+        assert!(f.enabled);
+        assert!(f.rules.is_empty());
+        assert_eq!(f.clamped_interval(), 30);
     }
 
     #[test]

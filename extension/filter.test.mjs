@@ -1,7 +1,7 @@
 // Self-check for the capture decision. Run: node extension/filter.test.mjs
 // Silence plus exit code 0 means pass.
 import assert from "node:assert/strict";
-import { extensionOf, hostExcepted, httpUrl, normalizeExtension, shouldCapture } from "./filter.js";
+import { belowMinSize, extensionOf, hostExcepted, httpUrl, isTorrentLink, normalizeExtension, shouldCapture } from "./filter.js";
 
 const lists = { captureExtensions: ["zip", "exe"], exceptionHosts: ["example.com"] };
 
@@ -57,3 +57,21 @@ assert.equal(await checkIncognitoAccess({ isAllowedIncognitoAccess: () => Promis
 assert.equal(await checkIncognitoAccess({ isAllowedIncognitoAccess: () => Promise.reject(new Error("x")) }), false);
 assert.equal(await checkIncognitoAccess({ isAllowedIncognitoAccess: (cb) => cb(true) }), true);
 assert.equal(await checkIncognitoAccess({ isAllowedIncognitoAccess: () => { throw new Error("x"); } }), false);
+
+// Torrent links: a magnet with an info hash, or an http(s) .torrent URL
+assert.equal(isTorrentLink("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=x"), true);
+assert.equal(isTorrentLink("magnet:?dn=no-hash"), false);
+assert.equal(isTorrentLink("https://e.test/linux.torrent"), true);
+assert.equal(isTorrentLink("https://e.test/LINUX.TORRENT?x=1"), true);
+assert.equal(isTorrentLink("https://e.test/file.zip"), false);
+assert.equal(isTorrentLink("ftp://e.test/linux.torrent"), false);
+assert.equal(isTorrentLink(undefined), false);
+
+// Minimum size: only a known size below the floor counts
+assert.equal(belowMinSize(500, 1000), true);
+assert.equal(belowMinSize(999, 1000), true);
+assert.equal(belowMinSize(1000, 1000), false, "at the floor is not below");
+assert.equal(belowMinSize(2000, 1000), false);
+assert.equal(belowMinSize(-1, 1000), false, "unknown size (-1) is not below");
+assert.equal(belowMinSize(0, 1000), false, "unknown size (0) is not below");
+assert.equal(belowMinSize(500, 0), false, "no floor set");

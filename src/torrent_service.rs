@@ -14,12 +14,13 @@ use crate::torrent_host::{HostError, TorrentHost, may_start};
 use crate::torrent_worker::Event;
 
 /// How long `shutdown` waits for the thread to finish.
-const STOP_WAIT: Duration = Duration::from_secs(8);
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// Requests from the UI. Ids are the app's own download ids.
 #[derive(Debug)]
 pub enum Req {
     Add { id: u64, magnet: String, save_dir: PathBuf },
+    AddFile { id: u64, path: PathBuf, save_dir: PathBuf },
     Pause(u64),
     Resume(u64),
     Remove(u64),
@@ -75,6 +76,11 @@ impl TorrentService {
         self.req.send(req).is_ok()
     }
 
+    /// Queues a `.torrent` file add. Returns false when the service thread is gone.
+    pub fn add_file(&self, id: u64, path: PathBuf, save_dir: PathBuf) -> bool {
+        self.send(Req::AddFile { id, path, save_dir })
+    }
+
     /// The next note, if any. Never blocks.
     pub fn try_next(&self) -> Option<Note> {
         self.notes.try_recv().ok()
@@ -113,6 +119,9 @@ async fn run(
                     None | Some(Req::Shutdown) => break,
                     Some(Req::Add { id, magnet, save_dir }) => {
                         host.add_magnet(id, &magnet, &save_dir).await.err().map(|e| (Some(id), e))
+                    }
+                    Some(Req::AddFile { id, path, save_dir }) => {
+                        host.add_file(id, &path, &save_dir).await.err().map(|e| (Some(id), e))
                     }
                     Some(Req::Pause(id)) => host.pause(id).await.err().map(|e| (Some(id), e)),
                     Some(Req::Resume(id)) => host.resume(id).await.err().map(|e| (Some(id), e)),
@@ -163,6 +172,12 @@ mod tests {
     fn refuses_to_start_when_disabled() {
         let settings = DownloadSettings::default();
         assert!(matches!(TorrentService::start(&settings), Err(HostError::Disabled)));
+    }
+
+    #[test]
+    fn add_file_request_debug_prints_its_variant() {
+        let req = Req::AddFile { id: 3, path: PathBuf::from("a.torrent"), save_dir: PathBuf::from("out") };
+        assert!(format!("{req:?}").starts_with("AddFile"));
     }
 
     #[test]

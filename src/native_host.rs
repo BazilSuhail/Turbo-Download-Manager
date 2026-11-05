@@ -216,7 +216,8 @@ pub fn sanitize_filename(name: &str) -> String {
         // Superscript digits are reserved too.
         "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
     ];
-    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    // Windows also ignores spaces before the extension, so `CON .txt` is CON.
+    let stem = cleaned.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
     if RESERVED.contains(&stem.as_str()) {
         return format!("_{cleaned}");
     }
@@ -370,6 +371,15 @@ mod tests {
         assert_eq!(sanitize_filename("CONIN$"), "_CONIN$");
         assert_eq!(sanitize_filename("conout$.txt"), "_conout$.txt");
         assert_eq!(sanitize_filename("CLOCK$"), "_CLOCK$");
+    }
+
+    #[test]
+    fn device_names_with_spaces_before_the_extension_are_defused() {
+        assert_eq!(sanitize_filename("CON .txt"), "_CON .txt");
+        assert_eq!(sanitize_filename("prn   .log"), "_prn   .log");
+        assert_eq!(sanitize_filename("COM\u{b9} .zip"), "_COM\u{b9} .zip");
+        assert_eq!(sanitize_filename("LPT\u{b2}.txt"), "_LPT\u{b2}.txt");
+        assert_eq!(sanitize_filename("CON.  .txt"), "_CON.  .txt");
     }
 }
 

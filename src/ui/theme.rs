@@ -33,7 +33,7 @@ pub struct Palette {
     pub text: Color,
     /// Secondary text. Still held to body-text contrast.
     pub muted: Color,
-    /// Gradient start and end of the flame accent.
+    /// Gradient start and end of the accent.
     pub accent: Color,
     pub accent2: Color,
     /// Text drawn on the accent.
@@ -47,40 +47,41 @@ pub struct Palette {
 impl Palette {
     pub const fn dark() -> Self {
         Self {
-            bg: rgb(0x121010),
-            surface: rgb(0x1A1715),
-            card: rgb(0x221D1A),
-            raised: rgb(0x2E2622),
-            border: rgb(0x3B312B),
-            text: rgb(0xF6EEE7),
-            muted: rgb(0xB8AA9E),
+            bg: rgb(0x000000),
+            surface: rgb(0x0A0A0B),
+            card: rgb(0x111113),
+            raised: rgb(0x1B1B1E),
+            border: rgb(0x2A2A2E),
+            text: rgb(0xF2F2F3),
+            muted: rgb(0x9B9BA3),
             accent: rgb(0xFF7A1A),
             accent2: rgb(0xFFB347),
-            // White text on the orange buttons in dark mode.
-            on_accent: rgb(0xFFFFFF),
-            success: rgb(0x52C98F),
-            warning: rgb(0xFFC857),
-            danger: rgb(0xFF6B5E),
-            shadow: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.45 },
+            // Near-black text on the orange buttons: about 8:1 contrast, where white is about 2.6:1.
+            on_accent: rgb(0x0A0A0B),
+            success: rgb(0x34C77B),
+            warning: rgb(0xE5A93A),
+            danger: rgb(0xF2665C),
+            shadow: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.5 },
         }
     }
 
     pub const fn light() -> Self {
         Self {
-            bg: rgb(0xF7F2EE),
-            surface: rgb(0xF0E8E1),
+            bg: rgb(0xFFFFFF),
+            surface: rgb(0xF5F5F7),
             card: rgb(0xFFFFFF),
-            raised: rgb(0xF4E6DA),
-            border: rgb(0xE2D4C7),
-            text: rgb(0x2A1F18),
-            muted: rgb(0x6B5B4F),
+            raised: rgb(0xEEEEF2),
+            border: rgb(0xDCDCE2),
+            text: rgb(0x111114),
+            muted: rgb(0x5F5F68),
             accent: rgb(0xF06A10),
             accent2: rgb(0xFFA83A),
+            // Dark text on the orange buttons: about 6.6:1 contrast.
             on_accent: rgb(0x1A0F08),
-            success: rgb(0x1E7F53),
-            warning: rgb(0x9A6200),
-            danger: rgb(0xC9362B),
-            shadow: Color { r: 0.35, g: 0.2, b: 0.1, a: 0.16 },
+            success: rgb(0x167A4A),
+            warning: rgb(0x8A5A00),
+            danger: rgb(0xC02A20),
+            shadow: Color { r: 0.2, g: 0.2, b: 0.2, a: 0.14 },
         }
     }
 
@@ -130,7 +131,8 @@ impl Palette {
         )
     }
 
-    /// The flame gradient, left to right.
+    /// The accent gradient (accent to accent2), left to right. The method
+    /// name is kept for existing callers.
     pub fn flame(&self) -> Background {
         Background::Gradient(Gradient::Linear(
             Linear::new(Radians(std::f32::consts::FRAC_PI_2))
@@ -261,25 +263,15 @@ fn luminance(c: Color) -> f32 {
     0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
 }
 
-/// WCAG contrast ratio between two colours.
-fn contrast(a: Color, b: Color) -> f32 {
-    let (x, y) = (luminance(a), luminance(b));
-    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
-    (hi + 0.05) / (lo + 0.05)
+/// The fill of every accent button: a deeper orange than the foreground accent,
+/// so the button reads as solid in both themes. Its text comes from `on_button`.
+pub fn button_fill(_p: &Palette) -> Color {
+    rgb(0xC2410C)
 }
 
-/// The fill of a primary button: the accent itself when the button text reads
-/// well on it, otherwise a slightly darker shade, so the text stays at least
-/// 4.5:1. The brand accent is unchanged everywhere else.
-pub fn button_fill(p: &Palette) -> Color {
-    let mut fill = p.accent;
-    for _ in 0..24 {
-        if contrast(p.on_accent, fill) >= 4.5 {
-            break;
-        }
-        fill = Color { r: fill.r * 0.94, g: fill.g * 0.94, b: fill.b * 0.94, ..fill };
-    }
-    fill
+/// The text and icon colour on an accent button: black or white, whichever contrasts more.
+pub fn on_button(p: &Palette) -> Color {
+    readable_on(button_fill(p))
 }
 
 /// The primary button: one solid colour in every state (no gradient). Only
@@ -293,18 +285,25 @@ pub fn accent(theme: &Theme, status: button::Status) -> button::Style {
     };
     button::Style {
         background: Some(bg.into()),
-        text_color: p.on_accent,
+        text_color: if status == button::Status::Disabled { p.muted } else { readable_on(fill) },
         border: Border { radius: 8.0.into(), ..Default::default() },
         shadow: Shadow { color: shadow, offset: Vector::new(0.0, 2.0), blur_radius: 10.0 },
         ..Default::default()
     }
 }
 
+/// Black or white text, whichever reads better on  (WCAG relative luminance).
+pub fn readable_on(bg: Color) -> Color {
+    let lum = luminance(bg);
+    // Black text has contrast (lum + 0.05) / 0.05; white has 1.05 / (lum + 0.05). Pick the larger.
+    if (lum + 0.05) / 0.05 >= 1.05 / (lum + 0.05) { rgb(0x0A0A0B) } else { rgb(0xFFFFFF) }
+}
+
 pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::of(theme);
     button::Style {
         background: Some(if status == button::Status::Hovered { p.danger } else { alpha(p.danger, 0.85) }.into()),
-        text_color: p.on_accent,
+        text_color: readable_on(p.danger),
         border: Border { radius: 8.0.into(), ..Default::default() },
         ..Default::default()
     }
@@ -337,7 +336,7 @@ pub fn bare_input(theme: &Theme, status: text_input::Status) -> text_input::Styl
     }
 }
 
-/// The flame gradient bar. `shimmer` is a 0..1 phase for a running download:
+/// The accent gradient bar. `shimmer` is a 0..1 phase for a running download:
 /// a soft highlight sweeps across the filled part. `None` draws it still.
 pub fn progress(colour: Option<Color>, shimmer: Option<f32>) -> impl Fn(&Theme) -> progress_bar::Style {
     move |theme| {
@@ -405,7 +404,7 @@ mod tests {
                 assert!(r >= 4.5, "{name}: {c_name} text on card is only {r:.2}:1");
             }
             let fill = button_fill(&p);
-            let r = ratio(p.on_accent, fill);
+            let r = ratio(on_button(&p), fill);
             assert!(r >= 4.5, "{name}: button text on the button fill is only {r:.2}:1");
         }
     }

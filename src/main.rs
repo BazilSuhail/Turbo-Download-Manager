@@ -29,8 +29,16 @@ use iced::widget::{
 };
 use iced::{window, Alignment, Color, Element, Length, Radians, Subscription, Task, Theme, Vector};
 
+use tdm::actions;
 use tdm::engine::Limiter;
 use tdm::filetype::{self, Kind, Verdict};
+use tdm::media_helpers;
+use tdm::rss_store;
+use tdm::scheduler;
+use tdm::torrent_store::{self, TorrentSource};
+use tdm::transfer;
+use tdm::ui::components;
+use tdm::ui::keymap;
 use tdm::hosts::HostLimits;
 use tdm::ipc::{Advert, Incoming, Inbox};
 use tdm::model::{AUTO_RETRY_MAX, OptionsTab, ProxySettings, Settings, WindowGeometry};
@@ -58,6 +66,8 @@ const SPARK_LEN: usize = 48;
 const CONNECTED_WITHIN: Duration = Duration::from_secs(10 * 60);
 const URL_INPUT: &str = "url";
 const SEARCH_INPUT: &str = "search";
+/// The Ctrl+K command palette's filter box.
+const PALETTE_INPUT: &str = "palette";
 /// The "type N to confirm" box in the delete dialog.
 const CONFIRM_INPUT: &str = "confirm-delete";
 /// Select mode fades and the check boxes grow over this long.
@@ -101,6 +111,16 @@ enum Message {
     SelectFilter(Filter),
     TogglePause(u64),
     Remove(u64),
+    /// Pause, resume or remove one torrent, by the app's torrent id. Removing
+    /// keeps its files on disk.
+    TorrentPause(u64),
+    TorrentResume(u64),
+    TorrentRemove(u64),
+    /// Pick a .torrent file to add (the header's button).
+    OpenTorrentFile,
+    TorrentFilePicked(Option<PathBuf>),
+    /// Move a download into a queue; 0 takes it out of every queue.
+    MoveToQueue(u64, u32),
     /// Enter or leave select mode. Leaving clears every mark.
     ToggleSelectMode(bool),
     /// Tick or untick one download (entering select mode if needed).
@@ -202,6 +222,31 @@ enum Message {
     TypeOpenPage(u64),
     /// Close the type dialog and keep the file as it is.
     TypeKeep,
+    /// Open the Ctrl+K command palette.
+    PaletteOpen,
+    PaletteClose,
+    PaletteQuery(String),
+    /// Run the palette command with this keymap id, and close the palette.
+    PaletteRun(&'static str),
+    /// Enter in the palette: run the best match.
+    PaletteSubmit,
+    /// Step one download's speed limit through the presets.
+    CycleSpeedLimit(u64),
+    /// Convert a finished download to MP3, or to an MP4 with copied streams.
+    ConvertMp3(u64),
+    ConvertMp4(u64),
+    /// A media helper job finished: the success text, or the error.
+    MediaDone(Result<String, String>),
+    /// Download the address box's link with yt-dlp.
+    YtDlpAdd,
+    /// An RSS feed poll finished, with its new items or the error.
+    RssPolled(u64, Result<Vec<tdm::rss::Found>, String>),
+    /// The helper file picker finished for this helper.
+    HelperPicked(tdm::ui::options::HelperKind, Option<PathBuf>),
+    /// The save dialog for an export finished, with the JSON to write.
+    ExportPicked(Option<PathBuf>, String),
+    /// The open dialog for an import finished.
+    ImportPicked(Option<PathBuf>),
 }
 
 /// The type warning shown after a finished download, with what it needs to draw itself.
@@ -352,15 +397,35 @@ struct Entry {
     retries: u32,
     /// When a Failed download is due for its automatic retry. Session-only.
     retry_at: Option<Instant>,
+    /// Per-download cap in bytes per second, saved on the record.
+    speed_limit: Option<u64>,
 }
 
-/// What the status bar shows for one torrent.
-#[derive(Clone, Copy, Debug, Default)]
+/// One torrent in the list and the status bar.
+#[derive(Clone, Debug, Default)]
 struct TorrentRow {
+    /// The magnet's `dn=` name, the .torrent file's name, or "Torrent N".
+    name: String,
     done: u64,
     total: u64,
     peers: u32,
     down_bps: u64,
+    up_bps: u64,
+    /// Paused by the user here. The worker holds the real state.
+    paused: bool,
+    /// What to re-add on the next start. `None` for a row that cannot be saved.
+    source: Option<TorrentSource>,
+    /// The folder the torrent saves into.
+    save_dir: PathBuf,
+}
+
+/// The name a magnet link carries in its `dn=` parameter, if it has one.
+fn magnet_name(magnet: &str) -> Option<String> {
+    let url = reqwest::Url::parse(magnet).ok()?;
+    url.query_pairs()
+        .find(|(key, _)| key == "dn")
+        .map(|(_, value)| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 struct App {
@@ -403,6 +468,9 @@ struct App {
     next_torrent_id: u64,
     /// The budget last sent to the worker; the outer `None` means never sent.
     torrent_budget_sent: Option<Option<u64>>,
+    /// The proxy password last written to the keychain this session, so an
+    /// unchanged password is not written again on every save.
+    proxy_password_stored: std::cell::RefCell<Option<String>>,
     /// The stem typed into the front media prompt's name field; `None` until
     /// the field is edited. The extension is never part of it.
     prompt_name: Option<String>,
@@ -414,9 +482,8 @@ struct App {
     /// Set once the queue starts a download, cleared when the after-queue
     /// action runs, so that action fires once per run of the queue.
     queue_busy: bool,
-    /// Download queues with their own windows. Session-only for now: nothing
-    /// yet creates a queue or persists one, so it starts with the built-ins.
-    queues: tdm::scheduler::Scheduler,
+    /// The torrent notice, shown before torrents can first be turned on.
+    torrent_consent: bool,
     /// Wall-clock time of the previous tick, for detecting a sleep or resume.
     last_wall_tick: Option<SystemTime>,
     /// Current window width, so the sidebar can grow with the window.
@@ -461,6 +528,14 @@ struct App {
     pending_names: BTreeSet<PathBuf>,
     /// The window's last known size and position, saved on exit.
     window_geometry: Option<WindowGeometry>,
+    /// Queue membership by download path. Saved as `queue_id` on each record.
+    queue_paths: HashMap<PathBuf, u32>,
+    /// When each RSS feed was last polled, in unix seconds. Not saved, so a restart polls once.
+    rss_last_poll: HashMap<u64, u64>,
+    /// Set once a failed torrent-list save has been reported, so it is not repeated.
+    torrent_save_warned: bool,
+    /// The Ctrl+K palette's query, while the palette is open.
+    palette: Option<String>,
 }
 
 /// Sends `tracing` output to `<app dir>/logs/tdm.log`, appended. Filter comes
@@ -518,6 +593,86 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .run()
+}
+
+/// Puts the built-in queues back when a settings file predates them or lacks them.
+fn fill_builtin_queues(settings: &mut Settings) {
+    for builtin in scheduler::Scheduler::with_builtins().queues {
+        if settings.queues.get(builtin.id).is_none() {
+            settings.queues.add_queue(builtin);
+        }
+    }
+}
+
+/// Keeps this machine's security-relevant settings over the imported ones. An
+/// imported file must not change which scanner runs, which helper binaries run
+/// and their pins, torrent or RSS consent and feeds, what runs after the queue,
+/// the completion actions, or whether TDM starts at login. Queue items are
+/// session-only (download ids do not survive a machine change), so they are cleared.
+fn keep_local_security(imported: &mut Settings, current: &Settings) {
+    imported.scanner = current.scanner.clone();
+    imported.general.launch_on_startup = current.general.launch_on_startup;
+    imported.after_queue = current.after_queue;
+    imported.schedule.on_complete = current.schedule.on_complete;
+    let local = &current.downloads;
+    let downloads = &mut imported.downloads;
+    downloads.yt_dlp_path = local.yt_dlp_path.clone();
+    downloads.yt_dlp_sha256 = local.yt_dlp_sha256.clone();
+    downloads.ffmpeg_path = local.ffmpeg_path.clone();
+    downloads.ffmpeg_sha256 = local.ffmpeg_sha256.clone();
+    downloads.torrents_enabled = local.torrents_enabled;
+    downloads.torrents_dht_notice_accepted = local.torrents_dht_notice_accepted;
+    downloads.rss_feeds = local.rss_feeds.clone();
+    for queue in &mut imported.queues.queues {
+        queue.schedule.on_complete = current
+            .queues
+            .get(queue.id)
+            .map_or(scheduler::OnComplete::Nothing, |q| q.schedule.on_complete);
+        queue.items.clear();
+    }
+}
+
+/// The speed-limit preset label, as the row menu and toasts show it.
+fn speed_label(limit: Option<u64>) -> String {
+    match limit {
+        None => "unlimited".to_owned(),
+        Some(bps) => format!("{}/s", fmt_bytes(bps as f64)),
+    }
+}
+
+/// The message a palette command runs. `None` for a command with no mapping, or none to act on.
+fn palette_message(id: &str, selected: Option<u64>) -> Option<Message> {
+    Some(match id {
+        "add_url" => Message::Command(Cmd::AddUrl),
+        "add_batch" => Message::Command(Cmd::BatchAdd),
+        "paste_link" => Message::Command(Cmd::PasteUrl),
+        "grab_site" => Message::GrabOpen,
+        "open_torrent_file" => Message::OpenTorrentFile,
+        "pause_all" => Message::Command(Cmd::PauseAll),
+        "start_queue" => Message::Command(Cmd::StartQueue),
+        "stop_queue" => Message::Command(Cmd::StopQueue),
+        "resume_selected" => Message::Command(Cmd::Resume),
+        "pause_selected" => Message::Command(Cmd::Pause),
+        "retry_failed" => Message::Command(Cmd::RetryFailed),
+        "select_all" => Message::Command(Cmd::SelectMode),
+        "remove_selected" => Message::Command(Cmd::Delete),
+        "remove_marked" => Message::Command(Cmd::DeleteSelected),
+        "open_file" => Message::Command(Cmd::OpenFile),
+        "show_in_folder" => Message::Command(Cmd::ShowInFolder),
+        "verify_checksum" => Message::Command(Cmd::VerifySha256),
+        "copy_link" => Message::CopyLink(selected?),
+        "open_folder" => Message::Command(Cmd::OpenDownloadFolder),
+        "change_download_folder" => Message::Command(Cmd::ChangeDownloadFolder),
+        "toggle_sidebar" => Message::Command(Cmd::ToggleSidebar),
+        "toggle_theme" => Message::Command(Cmd::ToggleTheme),
+        "search_focus" => Message::Command(Cmd::Find),
+        "options" => Message::Command(Cmd::Options),
+        "schedule" => Message::Command(Cmd::Scheduler),
+        "export_list" => Message::Command(Cmd::ExportList),
+        "import_list" => Message::Command(Cmd::ImportList),
+        "clear_finished" => Message::Command(Cmd::DeleteCompleted),
+        _ => return None,
+    })
 }
 
 /// Cached SVG handles: a handle hashes its bytes on creation, which is
@@ -663,19 +818,31 @@ fn restore_proxy_password(proxy: &mut ProxySettings) {
 /// never loaded (keychain locked at boot) keeps its reference. On any keychain
 /// error the reference stays as it was. When no keychain answers, the password
 /// stays out of the file and the warning is logged once per session.
-fn keep_proxy_password(proxy: &mut ProxySettings) {
+fn keep_proxy_password(proxy: &mut ProxySettings, last_stored: &std::cell::RefCell<Option<String>>) {
     static SESSION_ONLY_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if proxy.password.is_empty() {
         if proxy.password_cleared {
             match secrets::delete(PROXY_PASSWORD_KEY) {
-                Ok(()) | Err(secrets::SecretError::NotFound) => proxy.password_ref.clear(),
+                Ok(()) | Err(secrets::SecretError::NotFound) => {
+                    proxy.password_ref.clear();
+                    *last_stored.borrow_mut() = None;
+                }
                 Err(e) => tracing::warn!("could not clear the proxy password in the keychain ({e})"),
             }
         }
         return;
     }
+    // Saves run on every settings change; a password already written this
+    // session is not written to the keychain again.
+    if last_stored.borrow().as_deref() == Some(proxy.password.as_str()) {
+        proxy.password_ref = secrets::reference(PROXY_PASSWORD_KEY);
+        return;
+    }
     match secrets::store(PROXY_PASSWORD_KEY, &proxy.password) {
-        Ok(()) => proxy.password_ref = secrets::reference(PROXY_PASSWORD_KEY),
+        Ok(()) => {
+            proxy.password_ref = secrets::reference(PROXY_PASSWORD_KEY);
+            *last_stored.borrow_mut() = Some(proxy.password.clone());
+        }
         Err(e) => {
             if !SESSION_ONLY_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!("the proxy password is kept for this session only ({e})");
@@ -703,6 +870,7 @@ impl App {
             }
         };
         restore_proxy_password(&mut settings.proxy);
+        fill_builtin_queues(&mut settings);
         let hosts = match store.load_hosts() {
             Ok(h) => h,
             Err(e) => {
@@ -751,11 +919,12 @@ impl App {
             torrent_rows: BTreeMap::new(),
             next_torrent_id: 0,
             torrent_budget_sent: None,
+            proxy_password_stored: std::cell::RefCell::new(None),
             prompt_name: None,
             prompt_dir: None,
             prompt_seq: 0,
             queue_busy: false,
-            queues: tdm::scheduler::Scheduler::with_builtins(),
+            torrent_consent: false,
             last_wall_tick: None,
             window_width: 900.0,
             open_menu: None,
@@ -783,16 +952,27 @@ impl App {
             focused: true,
             pending_names: BTreeSet::new(),
             window_geometry: settings.window,
+            queue_paths: HashMap::new(),
+            rss_last_poll: HashMap::new(),
+            torrent_save_warned: false,
+            palette: None,
             settings,
         };
         match app.store.load_list() {
             Ok(list) => {
                 for rec in list.downloads {
-                    app.push(rec, Status::Paused);
+                    // Queue membership comes back by file path, onto the new download id.
+                    let (dest, queue) = (rec.dest.clone(), rec.queue_id);
+                    let id = app.push(rec, Status::Paused);
+                    if let Some(q) = queue.filter(|q| app.settings.queues.get(*q).is_some()) {
+                        scheduler::set_membership(&mut app.queue_paths, dest, Some(q));
+                        app.settings.queues.move_to(id, q);
+                    }
                 }
             }
             Err(e) => tracing::warn!("the download list could not be loaded ({e}); starting empty"),
         }
+        app.restore_torrents();
         // Idempotent, and slow enough (registry, files) to keep off the UI
         // thread. Failure only means the browser cannot reach us yet.
         std::thread::spawn(|| {
@@ -811,6 +991,7 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "download".to_owned());
+        let speed_limit = rec.speed_limit_bps;
         let mut handle = Download::new(rec.url, rec.dest, self.settings.max_segments);
         for (k, v) in &rec.headers {
             handle.set_header(k.clone(), v.clone());
@@ -826,6 +1007,7 @@ impl App {
         handle.set_proxy(self.settings.proxy.clone());
         handle.set_limits(self.settings.connection.retries, self.settings.connection.timeout_secs);
         handle.set_mirrors(rec.mirrors.clone());
+        handle.set_speed_limit(speed_limit);
         let mut snapshot = handle.snapshot();
         snapshot.status = if rec.complete { Status::Finished } else { status };
         snapshot.total = rec.total;
@@ -838,6 +1020,7 @@ impl App {
             snapshot,
             category_id: rec.category_id,
             headers: rec.headers,
+            speed_limit,
             started: false,
             paused_by_schedule: false,
             last_done: 0,
@@ -858,10 +1041,18 @@ impl App {
 
     /// Queue `url` with optional mirror URLs for the same file.
     fn add_link_mirrored(&mut self, url: String, mirrors: Vec<String>) {
+        self.add_link_into(url, mirrors, None);
+    }
+
+    /// Queue `url` in `dir`, or in the default folder for its name when `dir` is `None`.
+    fn add_link_into(&mut self, url: String, mirrors: Vec<String>, dir: Option<PathBuf>) {
         // A manifest URL saved under its own name would leave the user with a
         // .m3u8 text file instead of a video.
         let name = tdm::media::container_name(&tdm::native_host::filename_from_url(&url));
-        let dest = self.free_dest(self.settings.destination_for(&name));
+        let dest = match dir {
+            Some(dir) => self.free_dest(dir.join(tdm::native_host::sanitize_filename(&name))),
+            None => self.free_dest(self.settings.destination_for(&name)),
+        };
         let category_id = self.settings.category_for(&name).map(|c| c.id);
         let status = self.added_status();
         self.push(
@@ -875,6 +1066,8 @@ impl App {
                 complete: false,
                 kind: None,
                 content_type: None,
+                speed_limit_bps: self.settings.downloads.default_speed_limit_bps,
+                queue_id: None,
             },
             status,
         );
@@ -908,6 +1101,8 @@ impl App {
             complete: false,
             kind: None,
             content_type: None,
+            speed_limit_bps: self.settings.downloads.default_speed_limit_bps,
+            queue_id: None,
         };
         self.push(record, Status::Queued);
     }
@@ -926,24 +1121,36 @@ impl App {
         unique_dest(dest, |p| is_taken(p, &others))
     }
 
+    /// Follow a download's queue membership when its file moves to a new path.
+    fn move_queue_key(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        if let Some(q) = scheduler::queue_for_path(&self.queue_paths, from) {
+            scheduler::set_membership(&mut self.queue_paths, from.to_path_buf(), None);
+            scheduler::set_membership(&mut self.queue_paths, to.to_path_buf(), Some(q));
+        }
+    }
+
+    /// The list as it is saved: one record per download, with its speed cap and queue.
+    fn download_records(&self) -> Vec<DownloadRecord> {
+        self.downloads
+            .iter()
+            .map(|e| DownloadRecord {
+                url: e.handle.url().to_owned(),
+                dest: e.handle.dest().to_owned(),
+                category_id: e.category_id,
+                headers: e.headers.clone(),
+                mirrors: e.handle.mirrors().to_vec(),
+                total: e.snapshot.total,
+                complete: e.snapshot.status == Status::Finished,
+                kind: e.snapshot.kind.map(|k| k.id().to_owned()),
+                content_type: e.snapshot.content_type.clone(),
+                speed_limit_bps: e.speed_limit,
+                queue_id: scheduler::queue_for_path(&self.queue_paths, e.handle.dest()),
+            })
+            .collect()
+    }
+
     fn save(&self) {
-        let list = DownloadList {
-            downloads: self
-                .downloads
-                .iter()
-                .map(|e| DownloadRecord {
-                    url: e.handle.url().to_owned(),
-                    dest: e.handle.dest().to_owned(),
-                    category_id: e.category_id,
-                    headers: e.headers.clone(),
-                    mirrors: e.handle.mirrors().to_vec(),
-                    total: e.snapshot.total,
-                    complete: e.snapshot.status == Status::Finished,
-                    kind: e.snapshot.kind.map(|k| k.id().to_owned()),
-                    content_type: e.snapshot.content_type.clone(),
-                })
-                .collect(),
-        };
+        let list = DownloadList { downloads: self.download_records() };
         if let Err(e) = self.store.save_list(&list) {
             tracing::error!("could not save the download list: {e}");
         }
@@ -951,7 +1158,11 @@ impl App {
 
     fn save_settings(&self) {
         let mut settings = self.settings.clone();
-        keep_proxy_password(&mut settings.proxy);
+        keep_proxy_password(&mut settings.proxy, &self.proxy_password_stored);
+        // Download ids do not survive a restart, so queue membership is not saved.
+        for queue in &mut settings.queues.queues {
+            queue.items.clear();
+        }
         if let Err(e) = self.store.save_settings(&settings) {
             tracing::error!("could not save settings: {e}");
         }
@@ -1011,13 +1222,18 @@ impl App {
             return Task::none();
         }
         let now = tdm::scheduler::local_now();
-        // A queued download whose own queue window is closed is shown to
-        // `next_to_start` as Paused, so it neither starts nor takes a slot.
+        let running: Vec<u64> = self.downloads.iter().filter(|e| e.snapshot.status == Status::Running).map(|e| e.id).collect();
+        let queued: Vec<u64> = self.downloads.iter().filter(|e| e.snapshot.status == Status::Queued).map(|e| e.id).collect();
+        // A queue at its concurrency limit holds back its extra queued members.
+        let held = self.settings.queues.over_capacity(&running, &queued);
+        // A queued download whose own queue window is closed, or that its
+        // queue has no room for, is shown to `next_to_start` as Paused, so it
+        // neither starts nor takes a slot.
         let statuses: Vec<Status> = self
             .downloads
             .iter()
             .map(|e| match e.snapshot.status {
-                Status::Queued if !self.queues.window_allows(e.id, now) => Status::Paused,
+                Status::Queued if !self.settings.queues.window_allows(e.id, now) || held.contains(&e.id) => Status::Paused,
                 other => other,
             })
             .collect();
@@ -1171,6 +1387,7 @@ impl App {
             || self.browser_guide
             || !self.prompts.is_empty()
             || self.grab.is_some()
+            || self.palette.is_some()
     }
 
     /// Something is mid-transition and needs every frame.
@@ -1226,6 +1443,18 @@ impl App {
                 if tdm::torrent_policy::magnet_ok(&url) {
                     self.url.clear();
                     self.add_magnet(url);
+                    return Task::none();
+                }
+                // The check browser capture makes. A link already in the list is
+                // not added silently; its toast offers Download to add it again.
+                let name = tdm::media::container_name(&tdm::native_host::filename_from_url(&url));
+                if self.duplicate_of(&url, &name, None).is_some() {
+                    self.url.clear();
+                    self.toast_with(
+                        ToastKind::Warning,
+                        format!("Already in the list: {}", middle_ellipsis(&name, 40)),
+                        Some(url),
+                    );
                     return Task::none();
                 }
                 self.add_link(url);
@@ -1377,6 +1606,9 @@ impl App {
                 let (removed, kept): (Vec<Entry>, Vec<Entry>) =
                     std::mem::take(&mut self.downloads).into_iter().partition(|e| gone.contains(&e.id));
                 self.downloads = kept;
+                for e in &removed {
+                    scheduler::set_membership(&mut self.queue_paths, e.handle.dest().to_owned(), None);
+                }
                 let handles: Vec<(u64, Download)> = removed
                     .into_iter()
                     .map(|e| {
@@ -1434,9 +1666,10 @@ impl App {
                 Task::none()
             }
             Message::ShowInFolder(id) => {
-                let dir = self.entry(id).and_then(|e| e.handle.dest().parent().map(PathBuf::from));
-                if let Some(dir) = dir {
-                    self.open_path(dir);
+                if let Some(file) = self.entry(id).map(|e| e.handle.dest().to_owned()) {
+                    if let Err(e) = actions::reveal_in_folder(&file) {
+                        self.toast(ToastKind::Error, format!("Could not show the file: {}", short_error(&e.to_string())));
+                    }
                 }
                 Task::none()
             }
@@ -1574,13 +1807,157 @@ impl App {
                 }
                 Task::none()
             }
+            Message::TorrentPause(id) => {
+                if let Some(svc) = self.torrents.as_ref() {
+                    svc.send(Req::Pause(id));
+                }
+                if let Some(row) = self.torrent_rows.get_mut(&id) {
+                    row.paused = true;
+                }
+                self.save_torrents();
+                Task::none()
+            }
+            Message::TorrentResume(id) => {
+                if let Some(svc) = self.torrents.as_ref() {
+                    svc.send(Req::Resume(id));
+                }
+                if let Some(row) = self.torrent_rows.get_mut(&id) {
+                    row.paused = false;
+                }
+                self.save_torrents();
+                Task::none()
+            }
+            Message::TorrentRemove(id) => {
+                if let Some(svc) = self.torrents.as_ref() {
+                    svc.send(Req::Remove(id));
+                }
+                self.torrent_rows.remove(&id);
+                self.save_torrents();
+                Task::none()
+            }
+            Message::OpenTorrentFile => {
+                if !tdm::torrent_host::may_start(&self.settings.downloads) {
+                    self.toast(ToastKind::Error, "Torrents are off. Turn them on in Options and accept the DHT notice first.");
+                    return Task::none();
+                }
+                // The native dialog runs off the UI thread, as the folder picker does.
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Open a torrent file")
+                            .add_filter("Torrent files", &["torrent"])
+                            .pick_file()
+                            .await
+                            .map(|file| file.path().to_path_buf())
+                    },
+                    Message::TorrentFilePicked,
+                )
+            }
+            Message::TorrentFilePicked(Some(path)) => {
+                self.add_torrent_file(path);
+                Task::none()
+            }
+            Message::TorrentFilePicked(None) => Task::none(),
+            Message::MoveToQueue(id, queue) => {
+                self.settings.queues.move_to(id, queue);
+                if let Some(path) = self.entry(id).map(|e| e.handle.dest().to_owned()) {
+                    scheduler::set_membership(&mut self.queue_paths, path, Some(queue));
+                }
+                self.save();
+                Task::none()
+            }
             Message::Shutdown => self.shutdown(),
             Message::Options(tdm::ui::options::Message::BrowseDownloadDir) => {
                 self.update(Message::ChangeDownloadFolder)
             }
+            // Turning torrents on for the first time needs the notice first.
+            Message::Options(tdm::ui::options::Message::TorrentsSwitch(true))
+                if !self.settings.downloads.torrents_dht_notice_accepted =>
+            {
+                self.torrent_consent = true;
+                Task::none()
+            }
+            Message::Options(tdm::ui::options::Message::TorrentConsentCancel) => {
+                self.torrent_consent = false;
+                Task::none()
+            }
+            Message::Options(tdm::ui::options::Message::TorrentConsentAccept) => {
+                tdm::ui::options::update(&mut self.settings, tdm::ui::options::Message::TorrentConsentAccept);
+                self.torrent_consent = false;
+                self.save_settings();
+                self.toast(ToastKind::Success, "Torrent downloads are on");
+                Task::none()
+            }
+            // The native dialogs for helper paths and the settings backup run here, off the UI thread.
+            Message::Options(tdm::ui::options::Message::HelperPathBrowse(kind)) => Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Choose the helper program")
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                move |path| Message::HelperPicked(kind, path),
+            ),
+            Message::Options(tdm::ui::options::Message::ExportSettings) => {
+                let json = transfer::export_json(&self.settings, &self.download_records());
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Export settings and downloads")
+                            .set_file_name("tdm-export.json")
+                            .add_filter("TDM export", &["json"])
+                            .save_file()
+                            .await
+                            .map(|file| file.path().to_path_buf())
+                    },
+                    move |path| Message::ExportPicked(path, json),
+                )
+            }
+            Message::Options(tdm::ui::options::Message::ImportSettings) => Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Import settings and downloads")
+                        .add_filter("TDM export", &["json"])
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::ImportPicked,
+            ),
             Message::Options(m) => {
                 let was_autostart = self.settings.general.launch_on_startup;
+                // A deleted queue's downloads lose their membership. Built-in queues are never deleted.
+                if let tdm::ui::options::Message::QueueDelete(id) = &m {
+                    let id = *id;
+                    if id != scheduler::MAIN_QUEUE_ID && id != scheduler::SYNC_QUEUE_ID {
+                        scheduler::forget_queue(&mut self.queue_paths, id);
+                    }
+                }
+                // A removed feed's seen set goes too, so a new feed that reuses its id starts clean.
+                if let tdm::ui::options::Message::RssRemove(id) = &m {
+                    if let Err(e) = tdm::rss_store::purge_seen(*id) {
+                        tracing::warn!("could not delete the seen list of feed {id}: {e}");
+                    }
+                }
+                // These change a setting the list reads on every start, so they are saved as they change.
+                // Text and slider edits (speed limit, RSS URL, rules, folder, interval) are saved when the
+                // Options dialog closes instead, so each keystroke does not write the settings file.
+                let persist = matches!(
+                    m,
+                    tdm::ui::options::Message::NotifyOnFinish(_)
+                        | tdm::ui::options::Message::OpenFolderOnFinish(_)
+                        | tdm::ui::options::Message::HelperPath(..)
+                        | tdm::ui::options::Message::HelperSha256(..)
+                        | tdm::ui::options::Message::RssAdd
+                        | tdm::ui::options::Message::RssRemove(_)
+                        | tdm::ui::options::Message::RssToggle(..)
+                        | tdm::ui::options::Message::QueueDelete(_)
+                );
                 tdm::ui::options::update(&mut self.settings, m);
+                if persist {
+                    self.save_settings();
+                }
                 // reg.exe runs here, so the change happens off the UI thread.
                 let autostart = if self.settings.general.launch_on_startup != was_autostart {
                     let on = self.settings.general.launch_on_startup;
@@ -1664,7 +2041,7 @@ impl App {
                     }
                     let (status, name, error) = (e.snapshot.status, e.name.clone(), e.snapshot.error.clone());
                     match (status, error) {
-                        (Status::Finished, _) if self.settings.downloads.show_complete_dialog => {
+                        (Status::Finished, _) if self.settings.downloads.notify_on_finish => {
                             self.toast(ToastKind::Success, format!("Finished: {}", middle_ellipsis(&name, 48)));
                         }
                         (Status::Failed, Some(err)) if !retrying => {
@@ -1674,6 +2051,14 @@ impl App {
                     }
                     if matches!(self.downloads[ix].snapshot.status, Status::Finished | Status::Failed) {
                         self.save_hosts();
+                    }
+                    if self.downloads[ix].snapshot.status == Status::Finished && self.settings.downloads.open_folder_on_finish {
+                        let dir = self.downloads[ix].handle.dest().parent().map(PathBuf::from);
+                        if let Some(dir) = dir {
+                            if let Err(e) = actions::open_folder(&dir) {
+                                self.toast(ToastKind::Error, format!("Could not open the folder: {}", short_error(&e.to_string())));
+                            }
+                        }
                     }
                     let finished = self.downloads[ix].snapshot.status == Status::Finished;
                     if finished && !self.focused && self.settings.downloads.flash_on_complete {
@@ -1720,6 +2105,7 @@ impl App {
                         let from = self.downloads[ix].handle.dest().to_owned();
                         match quarantine_file(&from) {
                             Ok(to) => {
+                                self.move_queue_key(&from, &to);
                                 let e = &mut self.downloads[ix];
                                 e.name = file_name_of(&to);
                                 e.handle.set_dest(to.clone());
@@ -1766,6 +2152,8 @@ impl App {
                 match (self.index_of(id), result) {
                     (Some(ix), Ok(to)) => {
                         let name = file_name_of(&to);
+                        let from = self.downloads[ix].handle.dest().to_owned();
+                        self.move_queue_key(&from, &to);
                         let e = &mut self.downloads[ix];
                         e.handle.set_dest(to);
                         e.name = name.clone();
@@ -1993,7 +2381,192 @@ impl App {
                 Task::none()
             }
             Message::Key(event) => self.key(event),
+            Message::PaletteOpen => {
+                self.palette = Some(String::new());
+                self.open_overlay();
+                iced::widget::operation::focus(PALETTE_INPUT)
+            }
+            Message::PaletteClose => {
+                self.palette = None;
+                Task::none()
+            }
+            Message::PaletteQuery(query) => {
+                if let Some(p) = &mut self.palette {
+                    *p = query;
+                }
+                Task::none()
+            }
+            Message::PaletteRun(id) => {
+                self.palette = None;
+                match palette_message(id, self.selected) {
+                    Some(msg) => self.update(msg),
+                    None => Task::none(),
+                }
+            }
+            Message::PaletteSubmit => {
+                let query = self.palette.clone().unwrap_or_default();
+                let cmds = keymap::commands();
+                match keymap::filter(&query, &cmds).first() {
+                    Some(&i) => self.update(Message::PaletteRun(cmds[i].id)),
+                    None => Task::none(),
+                }
+            }
+            Message::CycleSpeedLimit(id) => {
+                const PRESETS: [Option<u64>; 4] = [None, Some(256 * 1024), Some(1024 * 1024), Some(5 * 1024 * 1024)];
+                let Some(ix) = self.index_of(id) else { return Task::none() };
+                let current = self.downloads[ix].speed_limit;
+                let next = PRESETS.iter().position(|p| *p == current).map_or(1, |i| (i + 1) % PRESETS.len());
+                let limit = PRESETS[next];
+                let e = &mut self.downloads[ix];
+                e.speed_limit = limit;
+                e.handle.set_speed_limit(limit);
+                self.save();
+                self.toast(ToastKind::Info, format!("Speed limit: {}", speed_label(limit)));
+                Task::none()
+            }
+            Message::ConvertMp3(id) => self.convert_download(id, true),
+            Message::ConvertMp4(id) => self.convert_download(id, false),
+            Message::MediaDone(Ok(text)) => {
+                self.toast(ToastKind::Success, text);
+                Task::none()
+            }
+            Message::MediaDone(Err(e)) => {
+                self.toast(ToastKind::Error, format!("Helper job failed: {}", short_error(&e)));
+                Task::none()
+            }
+            Message::YtDlpAdd => {
+                let url = self.url.trim().to_owned();
+                if url.is_empty() {
+                    self.toast(ToastKind::Warning, "Type or paste a link in the address box first");
+                    return Task::none();
+                }
+                self.url.clear();
+                let dir = self.settings.download_dir.clone();
+                self.run_media(media_helpers::Job::YtDlp { url, dir })
+            }
+            Message::RssPolled(feed_id, result) => {
+                let Some(feed) = self.settings.downloads.rss_feeds.iter().find(|f| f.id == feed_id).cloned() else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(found) => {
+                        let mut added = 0usize;
+                        for item in found {
+                            if self.downloads.iter().any(|e| e.handle.url() == item.url) {
+                                continue;
+                            }
+                            self.add_link_into(item.url, Vec::new(), Some(feed.dir.clone()));
+                            added += 1;
+                        }
+                        if added == 0 {
+                            return Task::none();
+                        }
+                        self.save();
+                        self.toast(
+                            ToastKind::Success,
+                            format!("RSS: {added} new download{} from {}", plural(added), middle_ellipsis(&feed.url, 40)),
+                        );
+                        self.start_ready()
+                    }
+                    Err(e) => {
+                        self.toast(ToastKind::Error, format!("RSS feed failed: {}", short_error(&e)));
+                        Task::none()
+                    }
+                }
+            }
+            Message::HelperPicked(kind, Some(path)) => {
+                self.update(Message::Options(tdm::ui::options::Message::HelperPath(kind, path.display().to_string())))
+            }
+            Message::HelperPicked(_, None) => Task::none(),
+            Message::ExportPicked(Some(path), json) => {
+                match std::fs::write(&path, json) {
+                    Ok(()) => self.toast(
+                        ToastKind::Success,
+                        format!("Exported to {}", middle_ellipsis(&path.display().to_string(), 48)),
+                    ),
+                    Err(e) => self.toast(ToastKind::Error, format!("Could not export: {}", short_error(&e.to_string()))),
+                }
+                Task::none()
+            }
+            Message::ExportPicked(None, _) => Task::none(),
+            Message::ImportPicked(Some(path)) => self.import_file(&path),
+            Message::ImportPicked(None) => Task::none(),
         }
+    }
+
+    /// Runs one media helper job in the background. Its outcome arrives as `MediaDone`.
+    fn run_media(&mut self, job: media_helpers::Job) -> Task<Message> {
+        let summary = media_helpers::job_summary(&job);
+        self.toast(ToastKind::Info, middle_ellipsis(&summary, 60));
+        let settings = self.settings.downloads.clone();
+        Task::perform(
+            async move {
+                media_helpers::run_job(&settings, job)
+                    .await
+                    .map(|_| format!("Done: {summary}"))
+                    .map_err(|e| e.to_string())
+            },
+            Message::MediaDone,
+        )
+    }
+
+    /// Converts a finished download to MP3 or an MP4 copy beside the original.
+    /// An output that already exists is refused.
+    fn convert_download(&mut self, id: u64, mp3: bool) -> Task<Message> {
+        let Some(input) = self.entry(id).map(|e| e.handle.dest().to_owned()) else { return Task::none() };
+        let output = input.with_extension(if mp3 { "mp3" } else { "mp4" });
+        if output == input || output.exists() {
+            self.toast(ToastKind::Warning, format!("{} already exists", middle_ellipsis(&file_name_of(&output), 48)));
+            return Task::none();
+        }
+        let job = if mp3 {
+            media_helpers::Job::Mp3 { input, output }
+        } else {
+            media_helpers::Job::Mp4Copy { input, output }
+        };
+        self.run_media(job)
+    }
+
+    /// Reads a TDM export. Its settings replace ours, keeping this machine's
+    /// proxy password and window, and its downloads are added unless their link is already listed.
+    fn import_file(&mut self, path: &std::path::Path) -> Task<Message> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                self.toast(ToastKind::Error, format!("Could not read the file: {}", short_error(&e.to_string())));
+                return Task::none();
+            }
+        };
+        let import = match transfer::import_json(&text) {
+            Ok(import) => import,
+            Err(e) => {
+                self.toast(ToastKind::Error, format!("Not a TDM export: {}", short_error(&e)));
+                return Task::none();
+            }
+        };
+        if let Some(mut settings) = import.settings {
+            // Secrets never travel in an export, so this machine keeps its own.
+            settings.proxy = self.settings.proxy.clone();
+            settings.window = self.settings.window;
+            keep_local_security(&mut settings, &self.settings);
+            fill_builtin_queues(&mut settings);
+            self.settings = settings;
+            self.sync_theme();
+            self.apply_speed_cap();
+            self.save_settings();
+        }
+        let mut added = 0usize;
+        for mut rec in import.downloads {
+            if self.downloads.iter().any(|e| e.handle.url() == rec.url) {
+                continue;
+            }
+            rec.dest = self.free_dest(rec.dest);
+            self.push(rec, Status::Paused);
+            added += 1;
+        }
+        self.save();
+        self.toast(ToastKind::Success, format!("Imported {added} download{}", plural(added)));
+        self.start_ready()
     }
 
     /// Add the front browser download, started now or left paused in the queue.
@@ -2033,6 +2606,8 @@ impl App {
             complete: false,
             kind: None,
             content_type: None,
+            speed_limit_bps: self.settings.downloads.default_speed_limit_bps,
+            queue_id: None,
         };
         self.push(rec, if start { Status::Queued } else { Status::Paused });
         self.save();
@@ -2041,7 +2616,12 @@ impl App {
 
     /// The file of a list entry that `item` would duplicate, if any.
     fn existing_download(&self, item: &Incoming) -> Option<PathBuf> {
-        let name = capture_name(item);
+        self.duplicate_of(&item.url, &capture_name(item), item.size)
+    }
+
+    /// The file of a list entry that a download of `url` named `name` would
+    /// duplicate, if any. Shared by browser captures and links typed by hand.
+    fn duplicate_of(&self, url: &str, name: &str, size: Option<u64>) -> Option<PathBuf> {
         let records: Vec<DownloadRecord> = self
             .downloads
             .iter()
@@ -2055,9 +2635,11 @@ impl App {
                 complete: false,
                 kind: None,
                 content_type: None,
+                speed_limit_bps: None,
+                queue_id: None,
             })
             .collect();
-        find_duplicate(&records, &item.url, &name, item.size).map(|r| r.dest.clone())
+        find_duplicate(&records, url, name, size).map(|r| r.dest.clone())
     }
 
     /// Remove the front browser download, and forget the edits made to its prompt.
@@ -2106,33 +2688,165 @@ impl App {
     /// it is only called when the cap actually changes.
     /// Hands a magnet link to the torrent worker, starting the worker on first use.
     fn add_magnet(&mut self, magnet: String) {
-        if !tdm::torrent_host::may_start(&self.settings.downloads) {
-            self.toast(ToastKind::Error, "Torrents are off. Turn them on and accept the DHT notice first.");
-            return;
-        }
         if !tdm::torrent_policy::magnet_ok(&magnet) {
             self.toast(ToastKind::Error, "That magnet link is not valid.");
             return;
+        }
+        if self.torrent_listed(&TorrentSource::Magnet(magnet.clone())) {
+            self.toast(ToastKind::Info, "Already in the list");
+            return;
+        }
+        if !self.ensure_torrents() {
+            return;
+        }
+        self.next_torrent_id += 1;
+        let id = self.next_torrent_id;
+        let row = TorrentRow {
+            name: magnet_name(&magnet).unwrap_or_else(|| format!("Torrent {id}")),
+            source: Some(TorrentSource::Magnet(magnet.clone())),
+            save_dir: self.settings.download_dir.clone(),
+            ..TorrentRow::default()
+        };
+        let save_dir = row.save_dir.clone();
+        let sent = self.torrents.as_ref().is_some_and(|svc| svc.send(Req::Add { id, magnet, save_dir }));
+        self.torrent_started(id, row, sent);
+    }
+
+    /// Adds a .torrent file the user picked. Its size is checked here, so an
+    /// oversized file is refused before the worker reads it.
+    fn add_torrent_file(&mut self, path: PathBuf) {
+        let len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(e) => {
+                self.toast(ToastKind::Error, format!("Could not read the torrent file: {e}"));
+                return;
+            }
+        };
+        if !tdm::torrent_policy::torrent_file_ok(len) {
+            self.toast(ToastKind::Error, "That torrent file is empty or larger than 10 MiB.");
+            return;
+        }
+        if self.torrent_listed(&TorrentSource::File(path.clone())) {
+            self.toast(ToastKind::Info, "Already in the list");
+            return;
+        }
+        if !self.ensure_torrents() {
+            return;
+        }
+        self.next_torrent_id += 1;
+        let id = self.next_torrent_id;
+        let row = TorrentRow {
+            name: file_name_of(&path),
+            source: Some(TorrentSource::File(path.clone())),
+            save_dir: self.settings.download_dir.clone(),
+            ..TorrentRow::default()
+        };
+        let save_dir = row.save_dir.clone();
+        let sent = self.torrents.as_ref().is_some_and(|svc| svc.send(Req::AddFile { id, path, save_dir }));
+        self.torrent_started(id, row, sent);
+    }
+
+    /// True when a torrent with this source is already in the list.
+    fn torrent_listed(&self, source: &TorrentSource) -> bool {
+        self.torrent_rows.values().any(|row| row.source.as_ref() == Some(source))
+    }
+
+    /// Starts the torrent worker on first use. False, with a toast, when torrents
+    /// are off or the worker cannot start.
+    fn ensure_torrents(&mut self) -> bool {
+        if !tdm::torrent_host::may_start(&self.settings.downloads) {
+            self.toast(ToastKind::Error, "Torrents are off. Turn them on in Options and accept the DHT notice first.");
+            return false;
         }
         if self.torrents.is_none() {
             match TorrentService::start(&self.settings.downloads) {
                 Ok(svc) => self.torrents = Some(svc),
                 Err(e) => {
                     self.toast(ToastKind::Error, format!("Torrents unavailable: {e}"));
-                    return;
+                    return false;
                 }
             }
         }
-        self.next_torrent_id += 1;
-        let id = self.next_torrent_id;
-        let save_dir = self.settings.download_dir.clone();
-        let sent = self.torrents.as_ref().is_some_and(|svc| svc.send(Req::Add { id, magnet, save_dir }));
+        true
+    }
+
+    /// Lists a torrent the worker accepted, or drops the worker when the send failed.
+    fn torrent_started(&mut self, id: u64, row: TorrentRow, sent: bool) {
         if sent {
-            self.torrent_rows.insert(id, TorrentRow::default());
+            self.torrent_rows.insert(id, row);
+            self.save_torrents();
             self.toast(ToastKind::Info, "Torrent added");
         } else {
             self.torrents = None;
             self.toast(ToastKind::Error, "The torrent worker is not running");
+        }
+    }
+
+    /// Writes the torrent list, so a restart can re-add what is still in progress.
+    /// A failure is reported once per session.
+    fn save_torrents(&mut self) {
+        let items: Vec<torrent_store::SavedTorrent> = self
+            .torrent_rows
+            .values()
+            .filter_map(|row| {
+                Some(torrent_store::SavedTorrent {
+                    source: row.source.clone()?,
+                    save_dir: row.save_dir.clone(),
+                    paused: row.paused,
+                })
+            })
+            .collect();
+        if let Err(e) = torrent_store::save(&torrent_store::default_path(), &items) {
+            tracing::error!("could not save the torrent list: {e}");
+            if !self.torrent_save_warned {
+                self.torrent_save_warned = true;
+                self.toast(ToastKind::Error, format!("Could not save the torrent list: {}", short_error(&e.to_string())));
+            }
+        }
+    }
+
+    /// Re-adds the torrents saved last session, paused again where they were paused.
+    fn restore_torrents(&mut self) {
+        if !tdm::torrent_host::may_start(&self.settings.downloads) {
+            return;
+        }
+        for item in torrent_store::load(&torrent_store::default_path()) {
+            if self.torrent_listed(&item.source) {
+                continue;
+            }
+            if !self.ensure_torrents() {
+                return;
+            }
+            self.next_torrent_id += 1;
+            let id = self.next_torrent_id;
+            let (name, req) = match &item.source {
+                TorrentSource::Magnet(magnet) => (
+                    magnet_name(magnet).unwrap_or_else(|| format!("Torrent {id}")),
+                    Req::Add { id, magnet: magnet.clone(), save_dir: item.save_dir.clone() },
+                ),
+                TorrentSource::File(path) => (
+                    file_name_of(path),
+                    Req::AddFile { id, path: path.clone(), save_dir: item.save_dir.clone() },
+                ),
+            };
+            let sent = self.torrents.as_ref().is_some_and(|svc| svc.send(req));
+            if !sent {
+                self.torrents = None;
+                return;
+            }
+            if item.paused {
+                if let Some(svc) = self.torrents.as_ref() {
+                    svc.send(Req::Pause(id));
+                }
+            }
+            let row = TorrentRow {
+                name,
+                source: Some(item.source.clone()),
+                save_dir: item.save_dir.clone(),
+                paused: item.paused,
+                ..TorrentRow::default()
+            };
+            self.torrent_rows.insert(id, row);
         }
     }
 
@@ -2146,13 +2860,18 @@ impl App {
         }
         for note in notes {
             match note {
-                Note::Progress { id, done, total, peers, down_bps, .. } => {
+                Note::Progress { id, done, total, peers, down_bps, up_bps } => {
                     if let Some(row) = self.torrent_rows.get_mut(&id) {
-                        *row = TorrentRow { done, total, peers, down_bps };
+                        row.done = done;
+                        row.total = total;
+                        row.peers = peers;
+                        row.down_bps = down_bps;
+                        row.up_bps = up_bps;
                     }
                 }
                 Note::Finished(id) => {
                     self.torrent_rows.remove(&id);
+                    self.save_torrents();
                     self.toast(ToastKind::Success, "Torrent finished");
                 }
                 Note::Error { id, message } => {
@@ -2285,6 +3004,17 @@ impl App {
             self.queue_busy = false;
             tasks.push(self.after_queue());
         }
+        // Each enabled RSS feed polls on its own interval. A feed not yet polled this session is due at once.
+        let unix_now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        for feed in self.settings.downloads.rss_feeds.clone() {
+            let last = self.rss_last_poll.get(&feed.id).copied();
+            if rss_store::due(&feed, last, unix_now) {
+                // Recorded when the poll starts, so a slow poll is not started again.
+                self.rss_last_poll.insert(feed.id, unix_now);
+                let id = feed.id;
+                tasks.push(Task::perform(async move { rss_store::poll_feed(&feed).await }, move |r| Message::RssPolled(id, r)));
+            }
+        }
         // Apply the time-of-day cap on every tick, so the limit changes at a
         // window edge without waiting for the user to touch a setting.
         self.apply_speed_cap();
@@ -2336,7 +3066,8 @@ impl App {
                 || self.open_menu.take().is_some()
                 || self.row_menu.take().is_some()
                 || self.verify.take().is_some()
-                || self.batch.take().is_some();
+                || self.batch.take().is_some()
+                || self.palette.take().is_some();
             if !closed && self.grab.is_some() {
                 return self.update(Message::GrabClose);
             }
@@ -2350,6 +3081,11 @@ impl App {
                 return self.update(Message::ToggleSelectMode(false));
             }
             return Task::none();
+        }
+        // Ctrl+K opens the command palette, or closes it when it is already open.
+        if modifiers.command() && matches!(key.as_ref(), Key::Character("k")) {
+            let msg = if self.palette.is_some() { Message::PaletteClose } else { Message::PaletteOpen };
+            return self.update(msg);
         }
         // Everything else acts on the list, which a dialog covers.
         if self.any_overlay() {
@@ -2551,7 +3287,10 @@ impl App {
                 self.toast(ToastKind::Info, concat!("Turbo Download Manager ", env!("CARGO_PKG_VERSION")));
                 Task::none()
             }
-            Cmd::ImportList | Cmd::ExportList | Cmd::UserGuide | Cmd::CheckUpdates => Task::none(),
+            Cmd::ImportList => self.update(Message::Options(tdm::ui::options::Message::ImportSettings)),
+            Cmd::ExportList => self.update(Message::Options(tdm::ui::options::Message::ExportSettings)),
+            Cmd::CommandPalette => self.update(Message::PaletteOpen),
+            Cmd::UserGuide | Cmd::CheckUpdates => Task::none(),
         }
     }
 
@@ -2646,7 +3385,13 @@ impl App {
         }
         // Each dialog: its content, what dismisses it, its maximum width, and
         // whether its content scrolls.
-        let dialog = if self.type_prompt.is_some() {
+        let dialog = if self.torrent_consent {
+            // Over the Preferences dialog it was opened from, so it comes first.
+            let notice = tdm::ui::options::torrent_notice().map(Message::Options);
+            Some((notice, Message::Options(tdm::ui::options::Message::TorrentConsentCancel), 520.0, true))
+        } else if self.palette.is_some() {
+            Some((self.palette_dialog(&p), Message::PaletteClose, 560.0, false))
+        } else if self.type_prompt.is_some() {
             Some((self.type_dialog(&p), Message::TypeKeep, 560.0, true))
         } else if self.grab.is_some() {
             Some((self.grab_dialog(&p), Message::GrabClose, 560.0, true))
@@ -2750,6 +3495,19 @@ impl App {
             folder,
         );
 
+        // Only shown once a yt-dlp path is set in Preferences.
+        let ytdlp: Element<'_, Message> = if self.settings.downloads.yt_dlp_path.is_some() {
+            tip(
+                button(text("yt-dlp").size(13))
+                    .padding([8, 10])
+                    .style(theme::flat(false))
+                    .on_press(Message::YtDlpAdd),
+                "Download the link above with yt-dlp",
+            )
+        } else {
+            space(Length::Shrink, Length::Shrink).into()
+        };
+
         let link_bar = row![
             folder_button,
             text_input("Paste a link and press Enter", &self.url)
@@ -2759,6 +3517,13 @@ impl App {
                 .style(theme::input)
                 .size(13)
                 .padding([8, 12]),
+            tip(
+                button(text(".torrent").size(13))
+                    .padding([8, 10])
+                    .style(theme::flat(false))
+                    .on_press(Message::OpenTorrentFile),
+                "Open a .torrent file",
+            ),
             tip(
                 button(text("Grab site").size(13))
                     .padding([8, 10])
@@ -2773,7 +3538,8 @@ impl App {
                     .on_press(Message::Command(Cmd::BatchAdd)),
                 "Add a batch of links",
             ),
-            button(row![glyph(Icon::Add, 16.0, p.on_accent), text("Add").size(13).font(bold())].spacing(6).align_y(Alignment::Center))
+            ytdlp,
+            button(row![glyph(Icon::Add, 16.0, theme::on_button(&p)), text("Add").size(13).font(bold())].spacing(6).align_y(Alignment::Center))
                 .padding([8, 16])
                 .style(theme::accent)
                 .on_press(Message::AddUrl),
@@ -2824,8 +3590,11 @@ impl App {
                     let mut b = button(line).width(Length::Fill).padding([6, 10]).style(theme::flat(false));
                     if works {
                         b = b.on_press(Message::Command(*cmd));
+                        Element::from(b)
+                    } else {
+                        // Greyed commands say why in a tooltip, rather than doing nothing.
+                        tip(b, "Not available in this build yet")
                     }
-                    Element::from(b)
                 }
             });
         }
@@ -2979,9 +3748,9 @@ impl App {
             clear = clear.on_press(Message::ClearMarks);
         }
         let delete_label = if narrow {
-            row![glyph(Icon::Delete, 14.0, p.on_accent), text(total.to_string()).size(12).font(bold())]
+            row![glyph(Icon::Delete, 14.0, theme::on_button(&p)), text(total.to_string()).size(12).font(bold())]
         } else {
-            row![glyph(Icon::Delete, 14.0, p.on_accent), text(format!("Delete {total}")).size(12).font(bold())]
+            row![glyph(Icon::Delete, 14.0, theme::on_button(&p)), text(format!("Delete {total}")).size(12).font(bold())]
         };
         let mut delete = button(delete_label.spacing(6).align_y(Alignment::Center))
             .padding([5, 10])
@@ -3046,8 +3815,14 @@ impl App {
     fn download_list(&self, p: &Palette) -> Element<'_, Message> {
         let visible = self.visible();
         let visible_ids: Vec<u64> = visible.iter().map(|e| e.id).collect();
-        let content: Element<'_, Message> = if visible.is_empty() {
-            let (title, hint) = if self.downloads.is_empty() {
+        // Torrents are not in the download list, so they show under the filters
+        // that take in every unfinished item.
+        let torrents: Vec<(u64, &TorrentRow)> = match self.filter {
+            Filter::All | Filter::Unfinished => self.torrent_rows.iter().map(|(id, t)| (*id, t)).collect(),
+            Filter::Category(_) | Filter::Finished => Vec::new(),
+        };
+        let content: Element<'_, Message> = if visible.is_empty() && torrents.is_empty() {
+            let (title, hint) = if self.downloads.is_empty() && self.torrent_rows.is_empty() {
                 ("No downloads yet", "Paste a link above, or let your browser hand one over.")
             } else {
                 ("Nothing matches", "Try another category or search.")
@@ -3065,6 +3840,9 @@ impl App {
             .into()
         } else {
             let mut rows = column![].spacing(6).padding(iced::Padding { top: 10.0, right: 14.0, bottom: 10.0, left: 10.0 });
+            for (id, t) in torrents {
+                rows = rows.push(self.torrent_row(id, t, p));
+            }
             for e in visible {
                 rows = rows.push(self.list_row(e, p));
             }
@@ -3077,6 +3855,57 @@ impl App {
         }
         list = list.push(content);
         container(list).width(Length::Fill).height(Length::Fill).style(theme::chrome).into()
+    }
+
+    /// One torrent in the list: name, progress, speeds and peers, and its own pause,
+    /// resume and remove. Removing keeps the files on disk.
+    fn torrent_row<'a>(&'a self, id: u64, t: &'a TorrentRow, p: &Palette) -> Element<'a, Message> {
+        let frac = if t.total > 0 { (t.done as f32 / t.total as f32).clamp(0.0, 1.0) } else { 0.0 };
+        let (state, state_colour) = if t.paused { ("Paused", p.muted) } else { ("Torrent", p.accent) };
+        let detail = if t.total > 0 {
+            format!("{} of {}  ·  {:.0}%", fmt_bytes(t.done as f64), fmt_bytes(t.total as f64), frac * 100.0)
+        } else {
+            "Connecting\u{2026}".to_owned()
+        };
+        let speeds = format!(
+            "{}/s down  ·  {}/s up  ·  {} peers",
+            fmt_bytes(t.down_bps as f64),
+            fmt_bytes(t.up_bps as f64),
+            t.peers
+        );
+        let bar_colour = t.paused.then(|| alpha(p.muted, 0.7));
+        let bar = progress_bar(0.0..=1.0, frac).girth(6).style(theme::progress(bar_colour, None));
+
+        let shown = middle_ellipsis(&t.name, 60);
+        let name_text = container(text(shown.clone()).size(13).font(bold()).wrapping(text::Wrapping::None))
+            .width(Length::Fill)
+            .clip(true);
+        let name_el: Element<'a, Message> = if shown != t.name { tip(name_text, t.name.clone()) } else { name_text.into() };
+        let title = row![name_el, container(text(state).size(11).color(state_colour)).padding([2, 9]).style(theme::pill(state_colour))]
+            .spacing(8)
+            .align_y(Alignment::Center);
+        let info = column![
+            title,
+            bar,
+            text(detail).size(11).color(p.muted).wrapping(text::Wrapping::None),
+            text(speeds).size(11).color(p.muted).wrapping(text::Wrapping::None),
+        ]
+        .spacing(5)
+        .width(Length::Fill);
+
+        let toggle: Element<'a, Message> = if t.paused {
+            tip(icon_button(Icon::Resume, p.text, Message::TorrentResume(id)), "Resume")
+        } else {
+            tip(icon_button(Icon::Pause, p.text, Message::TorrentPause(id)), "Pause")
+        };
+        let remove = tip(
+            icon_button(Icon::Delete, p.text, Message::TorrentRemove(id)),
+            "Remove from the list. Files stay on disk.",
+        );
+        let line = row![glyph(Icon::File, 18.0, p.accent), info, toggle, remove]
+            .spacing(10)
+            .align_y(Alignment::Center);
+        container(line).padding([10, 12]).width(Length::Fill).style(theme::card).into()
     }
 
     fn list_row<'a>(&'a self, e: &'a Entry, p: &Palette) -> Element<'a, Message> {
@@ -3134,6 +3963,10 @@ impl App {
         if let (Status::Failed, Some(err)) = (s.status, &s.error) {
             detail = short_error(err);
         }
+        // The engine says why a download is held (for example an FTP refusal or a full disk).
+        if let (Status::Paused, Some(reason)) = (s.status, &s.paused_reason) {
+            detail = short_error(reason);
+        }
         if let (Status::Finished, Some(verdict)) = (s.status, &e.scan) {
             detail = match verdict {
                 tdm::scan::Verdict::Clean => "Virus scan: clean".to_owned(),
@@ -3165,7 +3998,11 @@ impl App {
         }
         let title = title.push(container(text(label).size(11).color(p.text)).padding([2, 9]).style(theme::pill(tint)));
         // A failed row's detail is short; the full error waits in a tooltip.
-        let failed_error = if s.status == Status::Failed { s.error.clone() } else { None };
+        let failed_error = match s.status {
+            Status::Failed => s.error.clone(),
+            Status::Paused => s.paused_reason.clone(),
+            _ => None,
+        };
         let detail_text = container(
             text(detail).size(11).color(if s.status == Status::Failed { p.danger } else { p.muted }).wrapping(text::Wrapping::None),
         )
@@ -3238,9 +4075,9 @@ impl App {
     /// right-click.
     fn row_actions<'a>(&'a self, e: &'a Entry, p: &Palette) -> Element<'a, Message> {
         let finished = e.snapshot.status == Status::Finished;
-        let action = |icon: Icon, label: &'static str, msg: Option<Message>| {
+        let action = |icon: Icon, label: &str, msg: Option<Message>| {
             let colour = if msg.is_some() { p.text } else { alpha(p.muted, 0.5) };
-            let mut b = button(row![glyph(icon, 14.0, colour), text(label).size(12).color(colour)].spacing(6).align_y(Alignment::Center))
+            let mut b = button(row![glyph(icon, 14.0, colour), text(label.to_owned()).size(12).color(colour)].spacing(6).align_y(Alignment::Center))
                 .padding([5, 10])
                 .style(theme::flat(false));
             if let Some(m) = msg {
@@ -3248,15 +4085,36 @@ impl App {
             }
             b
         };
-        let actions = row![
+        let speed = format!("Speed: {}", speed_label(e.speed_limit));
+        let mut actions = row![
             action(Icon::Open, "Open", finished.then_some(Message::OpenFile(e.id))),
             action(Icon::Folder, "Show in folder", Some(Message::ShowInFolder(e.id))),
             action(Icon::Shield, "Verify SHA-256", finished.then_some(Message::Verify(e.id))),
             action(Icon::Check, "Select", Some(Message::Mark(e.id))),
             action(Icon::Batch, "Copy link", Some(Message::CopyLink(e.id))),
+            action(Icon::Options, &speed, Some(Message::CycleSpeedLimit(e.id))),
+            action(Icon::File, "Convert to MP3", finished.then_some(Message::ConvertMp3(e.id))),
+            action(Icon::File, "Convert to MP4 (copy)", finished.then_some(Message::ConvertMp4(e.id))),
             action(Icon::Delete, "Delete", Some(Message::Remove(e.id))),
         ]
         .spacing(2);
+        // Queue chips: the queue this download is in is shown as selected.
+        let current = self.settings.queues.queue_of(e.id);
+        actions = actions.push(text("Move to:").size(12).color(p.muted));
+        for q in &self.settings.queues.queues {
+            actions = actions.push(
+                button(text(middle_ellipsis(&q.name, 18)).size(12))
+                    .padding([5, 8])
+                    .style(theme::flat(q.id == current))
+                    .on_press(Message::MoveToQueue(e.id, q.id)),
+            );
+        }
+        actions = actions.push(
+            button(text("No queue").size(12))
+                .padding([5, 8])
+                .style(theme::flat(current == 0))
+                .on_press(Message::MoveToQueue(e.id, 0)),
+        );
         container(scrollable(actions).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(3).scroller_width(3))))
             .padding(iced::Padding::default().left(46.0))
             .into()
@@ -3367,6 +4225,45 @@ impl App {
 
     /// Two wordings: a finished download offers to remove the file from disk;
     /// an unfinished one offers to drop its partial data.
+    /// The Ctrl+K command palette: a filter box over the commands, best match first.
+    fn palette_dialog(&self, p: &Palette) -> Element<'_, Message> {
+        let query: &str = self.palette.as_deref().unwrap_or("");
+        let cmds = keymap::commands();
+        let hits = keymap::filter(query, &cmds);
+        let mut list = column![].spacing(2);
+        for &i in hits.iter().take(12) {
+            let cmd = cmds[i];
+            let mut line = row![text(cmd.label).size(13).width(Length::Fill)].spacing(8).align_y(Alignment::Center);
+            if let Some(keys) = cmd.shortcut {
+                line = line.push(text(keys).size(11).color(p.muted));
+            }
+            list = list.push(
+                button(line)
+                    .width(Length::Fill)
+                    .padding([6, 10])
+                    .style(theme::flat(false))
+                    .on_press(Message::PaletteRun(cmd.id)),
+            );
+        }
+        if hits.is_empty() {
+            list = list.push(text("No command matches.").size(12).color(p.muted));
+        }
+        let input = text_input("Type a command", query)
+            .id(PALETTE_INPUT)
+            .on_input(Message::PaletteQuery)
+            .on_submit(Message::PaletteSubmit)
+            .style(theme::input)
+            .size(13)
+            .padding([8, 12]);
+        let body: Element<'_, Message> = column![input, scrollable(list).height(Length::Fixed(300.0))].spacing(10).into();
+        let actions: Element<'_, Message> = button(text("Close").size(13))
+            .padding([7, 18])
+            .style(theme::flat(false))
+            .on_press(Message::PaletteClose)
+            .into();
+        components::dialog_shell(p, "Command palette", body, actions)
+    }
+
     /// The type warning: what the file is, and what the user can do about it.
     fn type_dialog(&self, p: &Palette) -> Element<'_, Message> {
         let Some(t) = &self.type_prompt else { return space(Length::Shrink, Length::Shrink).into() };
@@ -4248,7 +5145,7 @@ fn check_box<'a>(on: f32, p: &Palette) -> Element<'a, Message> {
     let on = on.clamp(0.0, 1.0);
     let accent = p.accent;
     let edge = blend(p.muted, accent, on);
-    container(glyph(Icon::Check, 14.0, alpha(p.on_accent, on)))
+    container(glyph(Icon::Check, 14.0, alpha(theme::on_button(&p), on)))
         .center(20)
         .style(move |_| container::Style {
             background: Some(alpha(accent, on).into()),
@@ -4527,6 +5424,8 @@ mod tests {
                 complete: false,
                 kind: None,
                 content_type: None,
+                speed_limit_bps: None,
+                queue_id: None,
             },
             Status::Finished,
         );
@@ -4549,6 +5448,8 @@ mod tests {
                 complete: false,
                 kind: None,
                 content_type: None,
+                speed_limit_bps: None,
+                queue_id: None,
             },
             Status::Finished,
         );
@@ -4567,6 +5468,26 @@ mod tests {
 
     /// An App without the window, the capture server or a saved list, for
     /// driving `update` directly.
+    #[test]
+    fn imported_settings_keep_local_security_fields() {
+        let mut local = Settings::default();
+        local.scanner = "local-scan.exe".into();
+        local.downloads.yt_dlp_sha256 = "local-pin".into();
+        local.downloads.torrents_enabled = false;
+        let mut imported = Settings::default();
+        imported.scanner = "evil.exe".into();
+        imported.downloads.yt_dlp_sha256 = "evil-pin".into();
+        imported.downloads.torrents_enabled = true;
+        imported.general.launch_on_startup = true;
+        imported.queues.queues[0].items = vec![1, 2];
+        super::keep_local_security(&mut imported, &local);
+        assert_eq!(imported.scanner, "local-scan.exe");
+        assert_eq!(imported.downloads.yt_dlp_sha256, "local-pin");
+        assert!(!imported.downloads.torrents_enabled);
+        assert!(!imported.general.launch_on_startup);
+        assert!(imported.queues.queues.iter().all(|q| q.items.is_empty()));
+    }
+
     fn test_app() -> App {
         let settings = Settings::default();
         let now = Instant::now();
@@ -4600,11 +5521,12 @@ mod tests {
             torrent_rows: BTreeMap::new(),
             next_torrent_id: 0,
             torrent_budget_sent: None,
+            proxy_password_stored: std::cell::RefCell::new(None),
             prompt_name: None,
             prompt_dir: None,
             prompt_seq: 0,
             queue_busy: false,
-            queues: tdm::scheduler::Scheduler::with_builtins(),
+            torrent_consent: false,
             last_wall_tick: None,
             window_width: 900.0,
             open_menu: None,
@@ -4631,6 +5553,10 @@ mod tests {
             focused: true,
             pending_names: BTreeSet::new(),
             window_geometry: None,
+            queue_paths: HashMap::new(),
+            rss_last_poll: HashMap::new(),
+            torrent_save_warned: false,
+            palette: None,
         }
     }
 
@@ -4648,6 +5574,8 @@ mod tests {
                         complete: false,
                         kind: None,
                         content_type: None,
+                        speed_limit_bps: None,
+                        queue_id: None,
                     },
                     Status::Paused,
                 )
@@ -4820,6 +5748,8 @@ mod tests {
                         complete: false,
                         kind: None,
                         content_type: None,
+                        speed_limit_bps: None,
+                        queue_id: None,
                     },
                     Status::Queued,
                 )

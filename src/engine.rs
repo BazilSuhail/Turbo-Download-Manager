@@ -253,6 +253,13 @@ impl Validators {
     }
 }
 
+/// Shown when a saved resume is dropped because the server gave no validator.
+/// The download is not paused or failed by this; it starts again from zero.
+fn no_validator_notice() -> &'static str {
+    "the server does not support safe resume (it sent no ETag, Last-Modified or \
+     MDTM time to prove the file is unchanged), so the download will restart from the beginning"
+}
+
 fn header_text(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -388,6 +395,11 @@ pub struct Download {
     discarded: Arc<AtomicBool>,
     shared: Arc<Mutex<Snapshot>>,
     rate: Arc<Limiter>,
+    /// This download's own cap, set by [`Download::set_speed_limit`]. It lives
+    /// on the handle, so it survives pause and resume, and every byte is
+    /// charged to it as well as to the shared `rate`: the effective rate is the
+    /// stricter of the two.
+    own_rate: Arc<Limiter>,
     headers: Arc<Mutex<Vec<(String, String)>>>,
     /// The proxy choice from the settings. Manual and system proxies resolve to
     /// a fixed [`ProxyConfig`]; a PAC script is evaluated per URL on each run.
@@ -414,6 +426,7 @@ impl Download {
             discarded: Arc::new(AtomicBool::new(false)),
             shared: Arc::new(Mutex::new(Snapshot::default())),
             rate: Arc::new(Limiter::new(None)),
+            own_rate: Arc::new(Limiter::new(None)),
             headers: Arc::new(Mutex::new(Vec::new())),
             proxy: ProxySettings::default(),
             attempts: MAX_ATTEMPTS,
@@ -486,10 +499,12 @@ impl Download {
         headers.push((name, value.into()));
     }
 
-    /// Limit the transfer to `bytes_per_second` on average. `None` removes the limit.
-    /// Takes effect immediately for a running download.
-    pub fn set_speed_limit(&self, bytes_per_second: Option<u64>) {
-        self.rate.set(bytes_per_second);
+    /// Cap this download at `bps` bytes per second on average, in addition to
+    /// the shared limit. `None` removes this download's own cap; the shared
+    /// limit still applies. Takes effect immediately for a running download,
+    /// and the cap is kept on the handle, so it survives pause and resume.
+    pub fn set_speed_limit(&self, bps: Option<u64>) {
+        self.own_rate.set(bps);
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -819,6 +834,9 @@ impl Download {
         // Without an ETag or Last-Modified there is no way to tell that the file
         // is still the same, so a sidecar is never resumed.
         let has_validator = validators.etag.is_some() || validators.last_modified.is_some();
+        if saved.is_some() && !has_validator {
+            tracing::warn!("{}", no_validator_notice());
+        }
         let resumed = saved.filter(|s| {
             has_validator
                 && s.ranged == ranged
@@ -873,9 +891,10 @@ impl Download {
             .truncate(fresh)
             .open(&self.dest)
             .await?;
-        // Only the run that creates the file marks it, so a resume leaves the
-        // existing marker alone.
-        if on_disk.is_none() {
+        // A run that truncates the file writes new internet bytes, so it marks
+        // the file, even when an older file of that name was already there. A
+        // resume leaves the existing marker alone.
+        if fresh {
             let referrer = configured
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case("referer"))
@@ -905,6 +924,7 @@ impl Download {
                 segments: Arc::clone(&segments),
                 stop: Arc::clone(&self.stop),
                 rate: Arc::clone(&self.rate),
+                own_rate: Arc::clone(&self.own_rate),
                 headers: headers.clone(),
                 total,
                 is_ftp,
@@ -1130,6 +1150,7 @@ impl Download {
                 file.write_all(&bytes).await?;
                 done = done.saturating_add(bytes.len() as u64);
                 self.rate.account(bytes.len() as u64).await;
+                self.own_rate.account(bytes.len() as u64).await;
                 let mut snapshot = self.shared.lock().expect("snapshot lock");
                 snapshot.done = done;
                 snapshot.total = None;
@@ -1488,6 +1509,8 @@ struct Worker {
     segments: Arc<Mutex<Vec<Segment>>>,
     stop: Arc<AtomicBool>,
     rate: Arc<Limiter>,
+    /// The download's own cap, charged alongside `rate`.
+    own_rate: Arc<Limiter>,
     headers: Vec<(String, String)>,
     /// Total size, when the probe established one, so a segment response can
     /// be checked against it.
@@ -1718,6 +1741,7 @@ impl Worker {
                 break;
             }
             self.rate.account(take as u64).await;
+            self.own_rate.account(take as u64).await;
         }
 
         let mut segments = self.segments.lock().expect("segments lock");
@@ -1819,11 +1843,14 @@ fn verify_server_hash(
 /// the Web), so Windows warns before it runs. Failure is logged, not fatal.
 #[cfg(windows)]
 fn mark_of_the_web(dest: &Path, url: &str, referrer: Option<&str>) {
+    // The URL and referrer come from the page or the browser. A line break in
+    // either would start a new key in this INI-style stream, so drop them.
+    let line = |s: &str| s.replace(['\r', '\n'], "");
     let mut body = String::from("[ZoneTransfer]\r\nZoneId=3\r\n");
     if let Some(r) = referrer.filter(|r| !r.is_empty()) {
-        body.push_str(&format!("ReferrerUrl={r}\r\n"));
+        body.push_str(&format!("ReferrerUrl={}\r\n", line(r)));
     }
-    body.push_str(&format!("HostUrl={url}\r\n"));
+    body.push_str(&format!("HostUrl={}\r\n", line(url)));
     let mut ads = dest.as_os_str().to_owned();
     ads.push(":Zone.Identifier");
     if let Err(e) = std::fs::write(PathBuf::from(ads), body) {
@@ -2153,6 +2180,26 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(limiter.get(), Some(1024 * 1024));
+    }
+
+    #[test]
+    fn a_per_download_limit_stays_off_the_shared_limiter_and_survives_clones() {
+        let shared = Arc::new(Limiter::new(Some(4 * 1024 * 1024)));
+        let mut download = Download::new("https://example.test/a.bin", "a.bin", 4);
+        download.set_limiter(Arc::clone(&shared));
+
+        download.set_speed_limit(Some(256 * 1024));
+        // The shared cap is untouched: the own cap is a separate limiter.
+        assert_eq!(shared.get(), Some(4 * 1024 * 1024));
+        assert_eq!(download.own_rate.get(), Some(256 * 1024));
+
+        // A clone (as the UI holds it) shares the same cap, so the limit is
+        // on the handle, not on any one task.
+        let clone = download.clone();
+        assert_eq!(clone.own_rate.get(), Some(256 * 1024));
+
+        download.set_speed_limit(None);
+        assert_eq!(clone.own_rate.get(), None);
     }
 
     #[test]
@@ -2551,6 +2598,13 @@ mod tests {
         assert!(snap.paused_reason.is_some(), "the UI needs a reason to show");
         assert!(!dest.exists(), "nothing was allocated");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dropped_resume_without_validators_says_it_restarts() {
+        let msg = no_validator_notice();
+        assert!(msg.contains("does not support safe resume"), "{msg}");
+        assert!(msg.contains("restart from the beginning"), "{msg}");
     }
 
     #[test]

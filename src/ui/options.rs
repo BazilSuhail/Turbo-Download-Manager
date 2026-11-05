@@ -14,17 +14,28 @@
 
 use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Space};
 use iced::{Element, Length};
+use std::path::{Path, PathBuf};
 
 use crate::model::{
     self, DuplicateAction, OptionsTab, ProxyMode, Settings,
 };
-use crate::scheduler::{TimeOfDay, Weekday};
+use crate::scheduler::{MAIN_QUEUE_ID, Queue, SYNC_QUEUE_ID, TimeOfDay, Weekday};
 use crate::ui::theme;
 
 /// Suffix for a control we render but cannot honour yet.
 const NOT_WIRED: &str = "(not yet implemented)";
 const LABEL_W: f32 = 170.0;
 
+/// Messages the integrator must handle outside `update`:
+///
+/// * `BrowseDownloadDir` and `HelperPathBrowse(kind)`: open the native file or
+///   folder picker, then send `HelperPath(kind, chosen)` back.
+/// * `ExportSettings` and `ImportSettings`: open the save or open dialog and
+///   call `transfer::export_json` / `transfer::import_json`.
+///
+/// `update` applies every other variant to the settings, including the RSS
+/// feed list. The integrator saves feed changes and polls enabled feeds on
+/// their interval.
 #[derive(Debug, Clone)]
 pub enum Message {
     SelectTab(OptionsTab),
@@ -114,7 +125,66 @@ pub enum Message {
     ScheduleStart(String),
     ScheduleStop(String),
     ScheduleDay(Weekday, bool),
+
+    // Capture size floor (KiB; empty or 0 takes every size)
+    CaptureMinSize(String),
+
+    // Torrents. Turning on without the DHT notice accepted is intercepted by
+    // the app, which opens the notice; `TorrentsSwitch(true)` only arrives
+    // here once the notice is accepted.
+    TorrentsSwitch(bool),
+    TorrentConsentAccept,
+    TorrentConsentCancel,
+
+    // Queues
+    QueueAdd,
+    QueueRename(u32, String),
+    /// Built-in queues are never deleted; the update ignores them.
+    QueueDelete(u32),
+    /// Free text: a number of downloads at once. Anything else is ignored.
+    QueueConcurrency(u32, String),
+
+    // Downloads: default speed cap and finish actions
+    /// KiB/s as typed. Empty or 0 means unlimited; a non-number is ignored.
+    SpeedLimitChanged(String),
+    NotifyOnFinish(bool),
+    OpenFolderOnFinish(bool),
+
+    // Helpers (yt-dlp, ffmpeg). A helper runs only with a matching SHA-256.
+    /// Path as typed or chosen. Empty clears it.
+    HelperPath(HelperKind, String),
+    /// The integrator opens the file picker. Nothing changes here.
+    HelperPathBrowse(HelperKind),
+    /// Pinned SHA-256 as typed. Stored lowercase, trimmed.
+    HelperSha256(HelperKind, String),
+
+    // RSS feeds, keyed by feed id so a row's messages stay correct after a
+    // removal above it.
+    RssAdd,
+    RssRemove(u64),
+    RssToggle(u64, bool),
+    RssUrl(u64, String),
+    /// Comma-separated match rules as typed.
+    RssRules(u64, String),
+    /// Folder as typed.
+    RssFolder(u64, String),
+    /// Minutes as typed. Clamped to the model's range; a non-number is ignored.
+    RssInterval(u64, String),
+
+    // Backup. The integrator opens the dialogs.
+    ExportSettings,
+    ImportSettings,
 }
+
+/// Which external helper a row configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperKind {
+    YtDlp,
+    Ffmpeg,
+}
+
+/// Most downloads one queue may run at once. The field caps it here.
+const QUEUE_SLOTS_MAX: usize = 32;
 
 /// Apply one change. Numeric settings are clamped to the ranges in `model`, so
 /// no message can push the engine outside them.
@@ -266,7 +336,139 @@ pub fn update(s: &mut Settings, message: Message) {
         ScheduleDay(day, on) => s.schedule.days = s.schedule.days.with(day, on),
 
         BrowserProxyOnError(v) => s.proxy.use_browser_proxy_on_error = v,
+
+        CaptureMinSize(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                s.capture_min_size_kib = 0;
+            } else if let Ok(kib) = raw.parse::<u64>() {
+                s.capture_min_size_kib = kib;
+            }
+        }
+
+        // Turning off always works. Turning on is refused until the notice is
+        // accepted, so this arm cannot skip the consent dialog.
+        TorrentsSwitch(v) => {
+            if !v || s.downloads.torrents_dht_notice_accepted {
+                s.downloads.torrents_enabled = v;
+            }
+        }
+        TorrentConsentAccept => {
+            s.downloads.torrents_dht_notice_accepted = true;
+            s.downloads.torrents_enabled = true;
+        }
+        // The app closes the notice; nothing in the settings changes.
+        TorrentConsentCancel => {}
+
+        QueueAdd => {
+            let id = s.queues.next_free_id();
+            s.queues.add_queue(Queue::new(id, Queue::user_queue_name(id)));
+        }
+        QueueRename(id, name) => {
+            // A blank name is not kept, so the field never ends up unnamed.
+            if !name.trim().is_empty() {
+                if let Some(q) = s.queues.get_mut(id) {
+                    q.name = name;
+                }
+            }
+        }
+        QueueDelete(id) => {
+            if id != MAIN_QUEUE_ID && id != SYNC_QUEUE_ID {
+                s.queues.remove_queue(id);
+            }
+        }
+        QueueConcurrency(id, raw) => {
+            if let (Ok(n), Some(q)) = (raw.trim().parse::<usize>(), s.queues.get_mut(id)) {
+                q.max_concurrent = n.min(QUEUE_SLOTS_MAX);
+            }
+        }
+
+        SpeedLimitChanged(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                s.downloads.default_speed_limit_bps = None;
+            } else if let Ok(kib) = raw.parse::<u64>() {
+                // 0 reads as unlimited, as it does in the speed windows.
+                s.downloads.default_speed_limit_bps =
+                    (kib > 0).then(|| kib.min(u64::from(SPEED_KBPS_MAX)) * 1024);
+            }
+        }
+        NotifyOnFinish(v) => s.downloads.notify_on_finish = v,
+        OpenFolderOnFinish(v) => s.downloads.open_folder_on_finish = v,
+
+        HelperPath(kind, raw) => {
+            let raw = raw.trim();
+            let path = (!raw.is_empty()).then(|| PathBuf::from(raw));
+            match kind {
+                HelperKind::YtDlp => s.downloads.yt_dlp_path = path,
+                HelperKind::Ffmpeg => s.downloads.ffmpeg_path = path,
+            }
+        }
+        // The app opens the picker and sends `HelperPath` with the choice.
+        HelperPathBrowse(_) => {}
+        HelperSha256(kind, raw) => {
+            let hash = raw.trim().to_ascii_lowercase();
+            match kind {
+                HelperKind::YtDlp => s.downloads.yt_dlp_sha256 = hash,
+                HelperKind::Ffmpeg => s.downloads.ffmpeg_sha256 = hash,
+            }
+        }
+
+        RssAdd => {
+            let id = s.downloads.rss_feeds.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+            s.downloads.rss_feeds.push(model::RssFeed {
+                id,
+                url: String::new(),
+                rules: Vec::new(),
+                dir: s.download_dir.clone(),
+                enabled: true,
+                // Same as the model's default interval.
+                interval_minutes: 30,
+            });
+        }
+        RssRemove(id) => s.downloads.rss_feeds.retain(|f| f.id != id),
+        RssToggle(id, v) => {
+            if let Some(f) = rss_feed_mut(s, id) {
+                f.enabled = v;
+            }
+        }
+        RssUrl(id, v) => {
+            if let Some(f) = rss_feed_mut(s, id) {
+                f.url = v;
+            }
+        }
+        RssRules(id, raw) => {
+            if let Some(f) = rss_feed_mut(s, id) {
+                f.rules = split_rules(&raw);
+            }
+        }
+        RssFolder(id, raw) => {
+            if let Some(f) = rss_feed_mut(s, id) {
+                f.dir = raw.into();
+            }
+        }
+        RssInterval(id, raw) => {
+            if let (Ok(m), Some(f)) = (raw.trim().parse::<u32>(), rss_feed_mut(s, id)) {
+                f.interval_minutes = m.clamp(model::RSS_INTERVAL_MIN, model::RSS_INTERVAL_MAX);
+            }
+        }
+
+        // The app opens the save and open dialogs and runs the transfer.
+        ExportSettings | ImportSettings => {}
     }
+}
+
+fn rss_feed_mut(s: &mut Settings, id: u64) -> Option<&mut model::RssFeed> {
+    s.downloads.rss_feeds.iter_mut().find(|f| f.id == id)
+}
+
+/// Comma-separated rules. Blank entries are dropped.
+fn split_rules(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn clamp(v: u32, range: std::ops::RangeInclusive<u32>) -> u32 {
@@ -306,6 +508,100 @@ pub fn parse_port(raw: &str) -> Option<u16> {
 
 fn words(v: &str) -> Vec<String> {
     v.split_whitespace().map(str::to_owned).collect()
+}
+
+/// One helper: its path with a Browse button, and the SHA-256 that gates it.
+fn helper_block(kind: HelperKind, title: &'static str, path: Option<&Path>, sha: &str) -> Element<'static, Message> {
+    let shown = path.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let pinned = !sha.trim().is_empty();
+    column![
+        text(title).size(13),
+        row![
+            text_input("(not set)", &shown)
+                .on_input(move |v| Message::HelperPath(kind, v))
+                .style(theme::input)
+                .padding(6)
+                .width(Length::Fill),
+            button(text("Browse").size(13))
+                .padding([4, 12])
+                .style(theme::flat(false))
+                .on_press(Message::HelperPathBrowse(kind)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+        field("SHA-256 pin", sha, "64 hex characters", move |v| Message::HelperSha256(kind, v)),
+        if pinned {
+            note("Pinned. The helper runs only while the file's SHA-256 matches.")
+        } else {
+            note("Not pinned: this helper will not run.")
+        },
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// The RSS feed list: one card per feed. Edits go out as messages keyed by id.
+fn rss_section(feeds: &[model::RssFeed]) -> Element<'_, Message> {
+    let mut col = column![note(
+        "Each feed is polled on its interval (5 to 1440 minutes). Items that match a \
+         rule are saved to the feed's folder.",
+    )]
+    .spacing(8);
+    for f in feeds {
+        let id = f.id;
+        col = col.push(
+            container(
+                column![
+                    row![
+                        check("Enabled", f.enabled, move |v| Message::RssToggle(id, v)),
+                        Space::new().width(Length::Fill),
+                        button(text("Remove feed").size(12))
+                            .padding([4, 8])
+                            .style(theme::flat(false))
+                            .on_press(Message::RssRemove(id)),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    text_input("https://example.test/feed.xml", &f.url)
+                        .on_input(move |v| Message::RssUrl(id, v))
+                        .style(theme::input)
+                        .size(12)
+                        .padding(4),
+                    text_input("rules, separated by commas", &f.rules.join(", "))
+                        .on_input(move |v| Message::RssRules(id, v))
+                        .style(theme::input)
+                        .size(12)
+                        .padding(4),
+                    text_input("folder", &f.dir.to_string_lossy())
+                        .on_input(move |v| Message::RssFolder(id, v))
+                        .style(theme::input)
+                        .size(12)
+                        .padding(4),
+                    row![
+                        text("Check every").size(12).style(theme::muted),
+                        text_input("30", &f.interval_minutes.to_string())
+                            .on_input(move |v| Message::RssInterval(id, v))
+                            .style(theme::input)
+                            .size(12)
+                            .padding(4)
+                            .width(Length::Fixed(70.0)),
+                        text("minutes").size(12).style(theme::muted),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                ]
+                .spacing(6),
+            )
+            .padding(8)
+            .style(theme::card),
+        );
+    }
+    col = col.push(
+        button(text("Add feed").size(12))
+            .padding([4, 8])
+            .style(theme::flat(false))
+            .on_press(Message::RssAdd),
+    );
+    col.into()
 }
 
 /// The whole dialog: tab list on the left, the selected page on the right.
@@ -430,6 +726,31 @@ fn general(s: &Settings) -> Element<'_, Message> {
                 .padding(iced::Padding::default().left(16.0)),
         );
     }
+    col = col.push(space(8.0));
+    col = col.push(text("Backup").size(15));
+    col = col.push(note(
+        "Export writes settings and the download list to a JSON file. Passwords \
+         are never written to it.",
+    ));
+    col = col.push(
+        row![
+            button(text("Export").size(13))
+                .padding([4, 12])
+                .style(theme::flat(false))
+                .on_press(Message::ExportSettings),
+            button(text("Import").size(13))
+                .padding([4, 12])
+                .style(theme::flat(false))
+                .on_press(Message::ImportSettings),
+        ]
+        .spacing(8),
+    );
+
+    col = col.push(space(8.0));
+    col = col.push(text("Keyboard shortcuts").size(15));
+    for (keys, action) in crate::ui::keymap::shortcut_help() {
+        col = col.push(text(format!("{keys}  {action}")).size(12));
+    }
     col.into()
 }
 
@@ -453,6 +774,16 @@ fn file_types(s: &Settings) -> Element<'_, Message> {
     );
     col = col.push(note("Separate names with spaces."));
     col = col.push(reset_row(Message::ResetExceptionHosts));
+    col = col.push(space(8.0));
+    col = col.push(field(
+        "Smallest file to take over, in KiB",
+        &s.capture_min_size_kib.to_string(),
+        "0",
+        Message::CaptureMinSize,
+    ));
+    col = col.push(note(
+        "Browser downloads of a known size below this are left to the browser. 0 takes every size.",
+    ));
     col.into()
 }
 
@@ -639,6 +970,12 @@ fn downloads(s: &Settings) -> Element<'_, Message> {
         "(empty: use the engine's own)",
         Message::UserAgent,
     ));
+    col = col.push(field(
+        "Default speed limit, KiB/s",
+        &d.default_speed_limit_bps.map(|b| (b / 1024).to_string()).unwrap_or_default(),
+        "(empty: unlimited)",
+        Message::SpeedLimitChanged,
+    ));
 
     // One queue, so its schedule lives with the other queue settings.
     col = col.push(space(8.0));
@@ -679,7 +1016,140 @@ fn downloads(s: &Settings) -> Element<'_, Message> {
          download resumed by hand. Progress is saved, so the next window \
          continues rather than restarts.",
     ));
+
+    col = col.push(space(8.0));
+    col = col.push(text("Torrents").size(15));
+    col = col.push(check(
+        "Allow BitTorrent downloads (magnet links and .torrent files)",
+        d.torrents_enabled,
+        Message::TorrentsSwitch,
+    ));
+    col = col.push(note(
+        "Torrents use the DHT, which exposes your IP address to the network. \
+         Seeding is off, and uploads are capped at 256 KiB/s.",
+    ));
+
+    col = col.push(space(8.0));
+    col = col.push(text("When a download finishes").size(15));
+    col = col.push(check(
+        "Send a system notification",
+        d.notify_on_finish,
+        Message::NotifyOnFinish,
+    ));
+    col = col.push(check(
+        "Open the download's folder",
+        d.open_folder_on_finish,
+        Message::OpenFolderOnFinish,
+    ));
+
+    col = col.push(space(8.0));
+    col = col.push(text("Helpers").size(15));
+    col = col.push(note(
+        "A helper runs only when its SHA-256 is set and the file matches it. \
+         TDM refuses to run an unpinned helper, so set the hash before you use one.",
+    ));
+    col = col.push(helper_block(
+        HelperKind::YtDlp,
+        "yt-dlp",
+        d.yt_dlp_path.as_deref(),
+        &d.yt_dlp_sha256,
+    ));
+    col = col.push(helper_block(
+        HelperKind::Ffmpeg,
+        "ffmpeg",
+        d.ffmpeg_path.as_deref(),
+        &d.ffmpeg_sha256,
+    ));
+
+    col = col.push(space(8.0));
+    col = col.push(text("RSS feeds").size(15));
+    col = col.push(rss_section(&d.rss_feeds));
+
+    col = col.push(space(8.0));
+    col = col.push(text("Queues").size(15));
+    col = col.push(note(
+        "Each queue keeps its own order. Open a download's menu to move it \
+         into a queue. A queue with a time window runs only inside it.",
+    ));
+    for q in &s.queues.queues {
+        let id = q.id;
+        let built_in = id == MAIN_QUEUE_ID || id == SYNC_QUEUE_ID;
+        let delete: Element<'_, Message> = if built_in {
+            text("built-in").size(11).style(theme::muted).into()
+        } else {
+            button(text("Delete").size(12))
+                .padding([4, 8])
+                .style(theme::flat(false))
+                .on_press(Message::QueueDelete(id))
+                .into()
+        };
+        col = col.push(
+            row![
+                text_input("Queue name", &q.name)
+                    .on_input(move |v| Message::QueueRename(id, v))
+                    .style(theme::input)
+                    .size(12)
+                    .padding(4)
+                    .width(Length::FillPortion(3)),
+                text_input("1", &q.max_concurrent.to_string())
+                    .on_input(move |v| Message::QueueConcurrency(id, v))
+                    .style(theme::input)
+                    .size(12)
+                    .padding(4)
+                    .width(Length::Fixed(50.0)),
+                text("at a time").size(11).style(theme::muted).width(Length::FillPortion(2)),
+                delete,
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    col = col.push(
+        row![
+            button(text("Add queue").size(12))
+                .padding([4, 8])
+                .style(theme::flat(false))
+                .on_press(Message::QueueAdd),
+        ]
+        .align_y(iced::Alignment::Center),
+    );
     col.into()
+}
+
+/// The first-time torrent notice. The app shows it over the Preferences
+/// dialog and maps its messages into the Options ones.
+pub fn torrent_notice() -> Element<'static, Message> {
+    column![
+        text("Turn on BitTorrent downloads").size(16),
+        text(
+            "BitTorrent connects to other computers on the internet. It finds them \
+             through the distributed hash table (DHT), and that exposes your IP \
+             address to the network.",
+        )
+        .size(13)
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        text(
+            "Seeding is off, so TDM does not upload finished files to other users. \
+             Uploads are capped at 256 KiB/s while torrents run.",
+        )
+        .size(13)
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        text(
+            "TDM only uses magnet links and .torrent files that you add yourself. \
+             It does not search for torrents.",
+        )
+        .size(13)
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        row![
+            Space::new().width(Length::Fill),
+            button(text("Cancel").size(13)).padding([7, 18]).style(theme::flat(false)).on_press(Message::TorrentConsentCancel),
+            button(text("Accept").size(13)).padding([7, 18]).style(theme::accent).on_press(Message::TorrentConsentAccept),
+        ]
+        .spacing(8),
+    ]
+    .spacing(14)
+    .max_width(480)
+    .into()
 }
 
 /// Sunday first, matching the day mask's bit order.
@@ -1221,5 +1691,70 @@ mod tests {
         // Out of range is ignored rather than panicking.
         update(&mut s, Message::CategoryRemove(999));
         assert_eq!(s.categories.len(), names.len() - 1);
+    }
+
+    #[test]
+    fn speed_limit_is_kib_per_second_and_empty_or_zero_is_unlimited() {
+        let mut s = Settings::default();
+        update(&mut s, Message::SpeedLimitChanged("512".into()));
+        assert_eq!(s.downloads.default_speed_limit_bps, Some(512 * 1024));
+        update(&mut s, Message::SpeedLimitChanged("abc".into()));
+        assert_eq!(s.downloads.default_speed_limit_bps, Some(512 * 1024), "a non-number is ignored");
+        update(&mut s, Message::SpeedLimitChanged("  ".into()));
+        assert_eq!(s.downloads.default_speed_limit_bps, None);
+        update(&mut s, Message::SpeedLimitChanged("0".into()));
+        assert_eq!(s.downloads.default_speed_limit_bps, None);
+    }
+
+    #[test]
+    fn helper_paths_and_pins_are_stored_trimmed() {
+        let mut s = Settings::default();
+        update(&mut s, Message::HelperPath(HelperKind::YtDlp, " C:/tools/yt-dlp.exe ".into()));
+        assert_eq!(s.downloads.yt_dlp_path, Some(PathBuf::from("C:/tools/yt-dlp.exe")));
+        update(&mut s, Message::HelperPath(HelperKind::YtDlp, "  ".into()));
+        assert_eq!(s.downloads.yt_dlp_path, None);
+        update(&mut s, Message::HelperSha256(HelperKind::Ffmpeg, " ABCDEF ".into()));
+        assert_eq!(s.downloads.ffmpeg_sha256, "abcdef");
+        // Browse only asks the app; the settings do not change here.
+        update(&mut s, Message::HelperPathBrowse(HelperKind::Ffmpeg));
+        assert_eq!(s.downloads.ffmpeg_path, None);
+    }
+
+    #[test]
+    fn rss_feeds_are_edited_by_id_and_removed_cleanly() {
+        let mut s = Settings::default();
+        update(&mut s, Message::RssAdd);
+        update(&mut s, Message::RssAdd);
+        let (a, b) = (s.downloads.rss_feeds[0].id, s.downloads.rss_feeds[1].id);
+        assert_ne!(a, b, "ids are unique");
+
+        update(&mut s, Message::RssUrl(a, "https://example.test/a.xml".into()));
+        update(&mut s, Message::RssRules(a, " linux, , iso ,".into()));
+        assert_eq!(s.downloads.rss_feeds[0].rules, ["linux", "iso"]);
+        update(&mut s, Message::RssToggle(a, false));
+        assert!(!s.downloads.rss_feeds[0].enabled);
+
+        update(&mut s, Message::RssInterval(a, "1".into()));
+        assert_eq!(s.downloads.rss_feeds[0].interval_minutes, model::RSS_INTERVAL_MIN);
+        update(&mut s, Message::RssInterval(a, "99999".into()));
+        assert_eq!(s.downloads.rss_feeds[0].interval_minutes, model::RSS_INTERVAL_MAX);
+
+        update(&mut s, Message::RssRemove(a));
+        assert_eq!(s.downloads.rss_feeds.len(), 1);
+        assert_eq!(s.downloads.rss_feeds[0].id, b);
+        // An unknown id changes nothing.
+        update(&mut s, Message::RssUrl(9_999, "x".into()));
+        assert_eq!(s.downloads.rss_feeds[0].url, "");
+    }
+
+    #[test]
+    fn downloads_page_renders_with_feeds_and_helpers() {
+        let mut s = Settings::default();
+        update(&mut s, Message::RssAdd);
+        update(&mut s, Message::HelperSha256(HelperKind::YtDlp, "ab".into()));
+        s.options_tab = OptionsTab::Downloads;
+        let _ = view(&s);
+        s.options_tab = OptionsTab::General;
+        let _ = view(&s);
     }
 }

@@ -35,6 +35,8 @@ pub enum Cmd {
     ToggleSidebar,
     ToggleTheme,
     Find,
+    /// Open the Ctrl+K command palette.
+    CommandPalette,
     UserGuide,
     CheckUpdates,
     About,
@@ -44,7 +46,7 @@ impl Cmd {
     /// Commands this build cannot perform yet. They are drawn greyed rather
     /// than accepting a click that does nothing.
     pub fn implemented(self) -> bool {
-        !matches!(self, Cmd::ImportList | Cmd::ExportList | Cmd::UserGuide | Cmd::CheckUpdates)
+        !matches!(self, Cmd::UserGuide | Cmd::CheckUpdates)
     }
 }
 
@@ -120,6 +122,7 @@ pub const MENU_BAR: &[Menu] = &[
             cmd("Show or hide sidebar", Cmd::ToggleSidebar),
             cmd("Switch light / dark", Cmd::ToggleTheme),
             key("Search downloads", Cmd::Find, "Ctrl+F"),
+            key("Command palette\u{2026}", Cmd::CommandPalette, "Ctrl+K"),
         ],
     },
     Menu {

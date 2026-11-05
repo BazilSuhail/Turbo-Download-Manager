@@ -11,7 +11,9 @@
 //!   [`Scheduler::next_to_start`] which downloads to hand to the engine, and
 //!   perform the [`OnComplete`] action itself.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -410,7 +412,8 @@ pub struct Queue {
     /// queue" and is never a queue's own id.
     pub id: u32,
     pub name: String,
-    /// "Download N files at the same time". 0 means the queue starts nothing.
+    /// "Download N files at the same time". 0 is read as 1 (see `slots`); the
+    /// UI clamps to 1..=32 via `clamped_concurrency`.
     #[serde(default)]
     pub max_concurrent: usize,
     #[serde(default)]
@@ -477,6 +480,62 @@ impl Queue {
     }
 }
 
+/// Clamp a user-entered concurrency to the range the UI offers, 1..=32.
+/// Takes and returns `usize`, the type of [`Queue::max_concurrent`].
+pub fn clamped_concurrency(n: usize) -> usize {
+    n.clamp(1, 32)
+}
+
+/// Parallel slots a queue really has. A stored 0 is read as 1, so a queue
+/// can never go dead by accident. Same rule as [`clamped_concurrency`]'s floor.
+fn slots(queue: &Queue) -> usize {
+    queue.max_concurrent.max(1)
+}
+
+/// The queue a download's path belongs to. Keyed by path, not by runtime
+/// download id, so membership survives a restart. 0 means "no queue".
+pub fn queue_for_path(map: &HashMap<PathBuf, u32>, path: &Path) -> Option<u32> {
+    map.get(path).copied().filter(|&q| q != 0)
+}
+
+/// Records a path's queue. `None` (or queue 0) removes the entry.
+pub fn set_membership(map: &mut HashMap<PathBuf, u32>, path: PathBuf, queue: Option<u32>) {
+    match queue {
+        Some(q) if q != 0 => {
+            map.insert(path, q);
+        }
+        _ => {
+            map.remove(&path);
+        }
+    }
+}
+
+/// Drops every path that belonged to a queue being deleted.
+pub fn forget_queue(map: &mut HashMap<PathBuf, u32>, queue: u32) {
+    map.retain(|_, q| *q != queue);
+}
+
+/// Whether the clock lets a download in a queue with this schedule start now.
+/// Only what the clock actively forbids is held back: a window that is not
+/// open yet, or the closing (stop) window. A queue with a stop time but no
+/// start time never starts by itself, so it is held back only while closing.
+fn clock_allows(schedule: &Schedule, now: (Weekday, TimeOfDay)) -> bool {
+    if !schedule.enabled {
+        return true;
+    }
+    match due(schedule, now) {
+        Action::Start => true,
+        // A zero-length window (start == stop) is read by `due` as no window at
+        // all. Holding the queue back for it would block the queue forever, so
+        // it is treated like a queue with no start time.
+        Action::Nothing => {
+            let zero_length = schedule.start.map(TimeOfDay::clamped) == schedule.stop.map(TimeOfDay::clamped);
+            schedule.start.is_none() || zero_length
+        }
+        Action::Stop => false,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scheduler {
     #[serde(default)]
@@ -516,9 +575,13 @@ impl Scheduler {
         true
     }
 
-    /// Returns the removed queue so the caller can reset its members'
-    /// `queue_id` to 0 ("not in a queue").
+    /// Returns the removed queue. Built-in Main and Synchronization are never
+    /// removed (`None`). The caller clears the deleted queue's path entries
+    /// with [`forget_queue`].
     pub fn remove_queue(&mut self, id: u32) -> Option<Queue> {
+        if id == MAIN_QUEUE_ID || id == SYNC_QUEUE_ID {
+            return None;
+        }
         let pos = self.queues.iter().position(|q| q.id == id)?;
         Some(self.queues.remove(pos))
     }
@@ -544,7 +607,7 @@ impl Scheduler {
                 continue;
             }
             let active = queue.items.iter().filter(|i| running.contains(i)).count();
-            let free = queue.max_concurrent.saturating_sub(active);
+            let free = slots(queue).saturating_sub(active);
             out.extend(
                 queue
                     .items
@@ -573,14 +636,49 @@ impl Scheduler {
         self.queues
             .iter()
             .find(|q| q.items.contains(&id))
-            .is_none_or(|q| !q.schedule.enabled || due(&q.schedule, now) == Action::Start)
+            .is_none_or(|q| clock_allows(&q.schedule, now))
+    }
+
+    /// Queued members that must wait because their queue is at its
+    /// `max_concurrent`. Only `queued` ids take a slot, so a paused member
+    /// never holds back one that is ready to start.
+    pub fn over_capacity(&self, running: &[u64], queued: &[u64]) -> Vec<u64> {
+        let mut held = Vec::new();
+        for queue in &self.queues {
+            let active = queue.items.iter().filter(|i| running.contains(i)).count();
+            let mut free = slots(queue).saturating_sub(active);
+            for id in queue.items.iter().filter(|i| queued.contains(i)) {
+                if free > 0 {
+                    free -= 1;
+                } else {
+                    held.push(*id);
+                }
+            }
+        }
+        held
+    }
+
+    /// Puts download `id` into queue `queue` alone. Queue 0, or an unknown
+    /// queue, leaves it in no queue.
+    pub fn move_to(&mut self, id: u64, queue: u32) {
+        for q in &mut self.queues {
+            q.remove_item(id);
+        }
+        if let Some(q) = self.get_mut(queue) {
+            q.push(id);
+        }
+    }
+
+    /// The queue holding download `id`, or 0 for none.
+    pub fn queue_of(&self, id: u64) -> u32 {
+        self.queues.iter().find(|q| q.items.contains(&id)).map_or(0, |q| q.id)
     }
 
     pub fn next_to_start(&self, running: &[u64]) -> Vec<u64> {
         let mut out = Vec::new();
         for queue in &self.queues {
             let active = queue.items.iter().filter(|i| running.contains(i)).count();
-            let mut free = queue.max_concurrent.saturating_sub(active);
+            let mut free = slots(queue).saturating_sub(active);
             for &id in &queue.items {
                 if free == 0 {
                     break;
@@ -838,16 +936,40 @@ mod tests {
         assert_eq!(s.next_to_start(&[1, 2, 5]), Vec::<u64>::new());
         // Saturated on its own members only — the main queue is full at two.
         assert_eq!(s.next_to_start(&[1, 2]), vec![5]);
-        // max_concurrent 0 starts nothing, so only the main queue's slot is left.
+        // max_concurrent 0 is read as one slot, so the sync queue still starts 5.
         s.get_mut(SYNC_QUEUE_ID).expect("queue 2").max_concurrent = 0;
-        assert_eq!(s.next_to_start(&[1]), vec![2]);
-        assert_eq!(s.next_to_start(&[1, 2]), Vec::<u64>::new());
+        assert_eq!(s.next_to_start(&[1]), vec![2, 5]);
+        assert_eq!(s.next_to_start(&[1, 2, 5]), Vec::<u64>::new());
         // Order follows the item list, so a reorder changes what starts.
         let main = s.get_mut(MAIN_QUEUE_ID).expect("queue 1");
         main.move_up(4);
         main.move_up(4);
         assert_eq!(main.items, vec![1, 4, 2, 3]);
-        assert_eq!(s.next_to_start(&[1]), vec![4]);
+        // Main has one free slot after 1 runs, so 4 is next; sync's 5 starts too.
+        assert_eq!(s.next_to_start(&[1]), vec![4, 5]);
+    }
+
+    #[test]
+    fn moving_and_capacity_follow_the_queue() {
+        let mut s = Scheduler::with_builtins();
+        s.get_mut(MAIN_QUEUE_ID).expect("main").max_concurrent = 1;
+        s.move_to(1, MAIN_QUEUE_ID);
+        assert_eq!(s.queue_of(1), MAIN_QUEUE_ID);
+        // Moving 1 into the sync queue takes it out of the main queue.
+        s.move_to(1, SYNC_QUEUE_ID);
+        assert_eq!(s.queue_of(1), SYNC_QUEUE_ID);
+        assert!(s.get(MAIN_QUEUE_ID).expect("main").items.is_empty());
+        // One queued member and one slot: nothing is held back.
+        assert!(s.over_capacity(&[], &[1]).is_empty());
+        // Two queued members in a one-slot queue: the second waits.
+        s.move_to(3, MAIN_QUEUE_ID);
+        s.move_to(4, MAIN_QUEUE_ID);
+        assert_eq!(s.over_capacity(&[], &[3, 4]), vec![4]);
+        // A running member already holds the slot, so both queued ones wait.
+        assert_eq!(s.over_capacity(&[3], &[4]), vec![4]);
+        // Unknown queue or 0 means no queue at all.
+        s.move_to(9, 0);
+        assert_eq!(s.queue_of(9), 0);
     }
 
     #[test]
@@ -914,5 +1036,124 @@ mod tests {
         assert_eq!(Weekday::from_index(day.index()), Some(day));
         assert!(DayMask::all().contains(day));
         assert!(!DayMask::none().contains(day));
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::Weekday::*;
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn t(hour: u8, minute: u8) -> TimeOfDay {
+        TimeOfDay { hour, minute }
+    }
+
+    fn windowed(items: Vec<u64>, schedule: Schedule) -> Scheduler {
+        let mut q = Queue::new(10, "Windowed");
+        q.items = items;
+        q.schedule = schedule;
+        Scheduler { queues: vec![q] }
+    }
+
+    #[test]
+    fn membership_is_keyed_by_path_and_zero_means_no_queue() {
+        let mut map: HashMap<PathBuf, u32> = HashMap::new();
+        let file = PathBuf::from("C:/dl/a.zip");
+        assert_eq!(queue_for_path(&map, Path::new("C:/dl/a.zip")), None);
+        set_membership(&mut map, file.clone(), Some(7));
+        assert_eq!(queue_for_path(&map, Path::new("C:/dl/a.zip")), Some(7));
+        // Some(0) and None both mean "no queue": the entry is removed, not stored.
+        set_membership(&mut map, file.clone(), Some(0));
+        assert_eq!(queue_for_path(&map, &file), None);
+        assert!(map.is_empty());
+        set_membership(&mut map, file.clone(), Some(3));
+        set_membership(&mut map, file.clone(), None);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_queue_clears_only_its_members() {
+        let mut map = HashMap::new();
+        set_membership(&mut map, PathBuf::from("a"), Some(4));
+        set_membership(&mut map, PathBuf::from("b"), Some(5));
+        forget_queue(&mut map, 4);
+        assert_eq!(queue_for_path(&map, Path::new("a")), None);
+        assert_eq!(queue_for_path(&map, Path::new("b")), Some(5));
+    }
+
+    #[test]
+    fn built_in_queues_cannot_be_removed() {
+        let mut s = Scheduler::with_builtins();
+        assert!(s.remove_queue(MAIN_QUEUE_ID).is_none());
+        assert!(s.remove_queue(SYNC_QUEUE_ID).is_none());
+        assert!(s.get(MAIN_QUEUE_ID).is_some() && s.get(SYNC_QUEUE_ID).is_some());
+        assert!(s.add_queue(Queue::new(3, "Queue # 3")));
+        assert_eq!(s.remove_queue(3).map(|q| q.id), Some(3));
+    }
+
+    #[test]
+    fn zero_length_window_does_not_hold_a_queue_back() {
+        let t = TimeOfDay::new(8, 0).expect("valid time");
+        let schedule = Schedule {
+            enabled: true,
+            start: Some(t),
+            stop: Some(t),
+            days: DayMask::all(),
+            ..Schedule::default()
+        };
+        let nine = TimeOfDay::new(9, 0).expect("valid time");
+        assert!(clock_allows(&schedule, (Weekday::Monday, nine)));
+    }
+
+    #[test]
+    fn concurrency_is_clamped_for_the_ui() {
+        assert_eq!(clamped_concurrency(0), 1);
+        assert_eq!(clamped_concurrency(1), 1);
+        assert_eq!(clamped_concurrency(8), 8);
+        assert_eq!(clamped_concurrency(32), 32);
+        assert_eq!(clamped_concurrency(33), 32);
+        assert_eq!(clamped_concurrency(usize::MAX), 32);
+    }
+
+    #[test]
+    fn zero_concurrency_reads_as_one_slot() {
+        let mut s = Scheduler::with_builtins();
+        {
+            let q = s.get_mut(MAIN_QUEUE_ID).expect("main");
+            q.max_concurrent = 0;
+            q.items = vec![1, 2];
+        }
+        assert_eq!(s.next_to_start(&[]), vec![1]);
+        assert_eq!(s.over_capacity(&[], &[1, 2]), vec![2]);
+        assert_eq!(s.ready_now((Monday, t(12, 0)), &[]), vec![1]);
+    }
+
+    #[test]
+    fn overnight_window_wraps_from_saturday_into_sunday_morning() {
+        let sat_night = Schedule {
+            enabled: true,
+            days: DayMask::none().with(Saturday, true),
+            ..Schedule::default()
+        };
+        let s = windowed(vec![1], sat_night);
+        assert!(s.window_allows(1, (Saturday, t(23, 30))));
+        assert!(s.window_allows(1, (Sunday, t(3, 0))));
+        // Sunday night is not in the mask, and Monday morning belongs to Sunday.
+        assert!(!s.window_allows(1, (Sunday, t(23, 30))));
+        assert!(!s.window_allows(1, (Monday, t(3, 0))));
+    }
+
+    #[test]
+    fn a_stop_only_queue_is_not_blocked_before_its_stop_time() {
+        let stop_only = Schedule { enabled: true, start: None, ..Schedule::default() };
+        let s = windowed(vec![1], stop_only);
+        // Before 07:30 the clock has no opinion, so a manual start is allowed.
+        assert!(s.window_allows(1, (Monday, t(5, 0))));
+        // From the stop time on, the clock forbids starting.
+        assert!(!s.window_allows(1, (Monday, t(12, 0))));
+        // And it never starts by itself.
+        assert!(s.ready_now((Monday, t(5, 0)), &[]).is_empty());
     }
 }

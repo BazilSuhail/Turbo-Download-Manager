@@ -58,6 +58,12 @@ pub struct DownloadRecord {
     /// The Content-Type the server sent, kept for the type warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// Per-download cap in bytes per second, on top of the global limit. `None` means no cap of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_limit_bps: Option<u64>,
+    /// The queue this download belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -268,6 +274,8 @@ mod tests {
                 complete: false,
                 kind: Some("png".into()),
                 content_type: Some("text/html".into()),
+                speed_limit_bps: Some(256 * 1024),
+                queue_id: Some(2),
             }],
         };
         store.save_list(&list).unwrap();
@@ -279,6 +287,8 @@ mod tests {
         assert_eq!(back.downloads[0].total, Some(1234));
         assert_eq!(back.downloads[0].kind.as_deref(), Some("png"));
         assert_eq!(back.downloads[0].content_type.as_deref(), Some("text/html"));
+        assert_eq!(back.downloads[0].speed_limit_bps, Some(256 * 1024));
+        assert_eq!(back.downloads[0].queue_id, Some(2));
     }
 
     #[test]
@@ -300,6 +310,8 @@ mod tests {
                 complete: false,
                 kind: None,
                 content_type: None,
+                speed_limit_bps: None,
+                queue_id: None,
             }],
         };
         store.save_list(&list).unwrap();
@@ -333,6 +345,20 @@ mod tests {
     }
 
     #[test]
+    fn a_record_saved_before_speed_limit_and_queue_existed_still_loads() {
+        // Lists written before per-download limits and queues have neither field.
+        let store = temp_store("old-limit-queue");
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let old = r#"{"downloads":[{"url":"https://example.test/a.zip","dest":"D:\\dl\\a.zip","complete":true}]}"#;
+        std::fs::write(store.list_path(), old).unwrap();
+
+        let list = store.load_list().expect("old list loads");
+        assert_eq!(list.downloads[0].speed_limit_bps, None);
+        assert_eq!(list.downloads[0].queue_id, None);
+        assert!(list.downloads[0].complete);
+    }
+
+    #[test]
     fn an_absent_kind_is_not_written_to_disk() {
         // Keeps old readers happy: no new keys appear unless there is a value.
         let record = DownloadRecord {
@@ -345,6 +371,8 @@ mod tests {
             complete: true,
             kind: None,
             content_type: None,
+            speed_limit_bps: None,
+            queue_id: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("\"kind\""), "unexpected key in {json}");
@@ -409,6 +437,8 @@ mod tests {
             complete: false,
             kind: None,
             content_type: None,
+            speed_limit_bps: None,
+            queue_id: None,
         }
     }
 

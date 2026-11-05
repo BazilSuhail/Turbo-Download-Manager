@@ -35,7 +35,7 @@
     .pill {
       display: inline-flex; align-items: center; gap: 2px; padding: 3px;
       border-radius: 999px; font: 600 12px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
-      background: rgba(28, 26, 25, .9); color: #f5efe9;
+      background: rgba(0, 0, 0, .9); color: #f5f5f5;
       box-shadow: 0 6px 22px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.08);
       backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
       animation: in .18s cubic-bezier(.2,.8,.2,1);
@@ -44,7 +44,7 @@
       all: unset; box-sizing: border-box; cursor: pointer; border-radius: 999px;
       padding: 7px 11px; white-space: nowrap; transition: filter .15s, background .15s, opacity .15s;
     }
-    .go { background: linear-gradient(135deg, #FF7A1A, #FFB347); color: #1c1a19; }
+    .go { background: #FF7A1A; color: #0A0A0B; }
     .go img { width: 14px; height: 14px; margin-right: 6px; vertical-align: -3px; border-radius: 3px; }
     .go:hover { filter: brightness(1.08); }
     .go[aria-busy="true"] { opacity: .75; cursor: progress; }
@@ -52,9 +52,11 @@
     .go.err { background: #e5484d; color: #fff; }
     .x { padding: 7px 9px; opacity: .7; }
     .x:hover { opacity: 1; background: rgba(255,255,255,.08); }
-    button:focus-visible { outline: 2px solid #FFB347; outline-offset: 2px; }
+    button:focus-visible { outline: 2px solid #FF7A1A; outline-offset: 2px; }
     @media (prefers-color-scheme: light) {
-      .pill { background: rgba(255,255,255,.94); color: #1c1a19;
+      .go { background: #F06A10; color: #1A0F08; }
+      button:focus-visible { outline-color: #F06A10; }
+      .pill { background: rgba(255,255,255,.94); color: #111111;
               box-shadow: 0 6px 22px rgba(0,0,0,.18), inset 0 0 0 1px rgba(0,0,0,.08); }
       .x:hover { background: rgba(0,0,0,.06); }
     }
