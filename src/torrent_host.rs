@@ -23,6 +23,10 @@ use crate::torrent_worker::{Command, Event, Source, decode_line, encode_line};
 /// Events the worker may have queued before the app reads them.
 const EVENT_QUEUE: usize = 256;
 
+/// Upload cap in bytes per second. Seeding is off, so this only limits tit-for-tat
+/// uploads. It matches the worker's own default.
+pub const UPLOAD_CAP_BPS: u64 = 256 * 1024;
+
 /// How long the worker gets to exit after `Shutdown` before it is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -76,7 +80,7 @@ pub fn budget_for(cap: Option<u64>, http_smoothed: u64) -> Option<u64> {
 pub struct TorrentHost {
     child: Child,
     stdin: ChildStdin,
-    events: mpsc::Receiver<Event>,
+    events: Option<mpsc::Receiver<Event>>,
 }
 
 impl TorrentHost {
@@ -123,13 +127,15 @@ impl TorrentHost {
         Ok(Self {
             child,
             stdin,
-            events: rx,
+            events: Some(rx),
         })
     }
 
-    /// Events from the worker. The channel closes when the worker's stdout ends.
-    pub fn events(&mut self) -> &mut mpsc::Receiver<Event> {
-        &mut self.events
+    /// Takes the event receiver, so a caller can read events while it also
+    /// sends commands. The channel closes when the worker's stdout ends.
+    /// Returns `None` after the first call.
+    pub fn take_events(&mut self) -> Option<mpsc::Receiver<Event>> {
+        self.events.take()
     }
 
     async fn send(&mut self, cmd: &Command) -> Result<(), HostError> {

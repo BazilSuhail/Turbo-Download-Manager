@@ -10,6 +10,8 @@ pub mod hosts;
 pub mod ipc;
 pub mod lang;
 pub mod media;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod model;
 pub mod native_host;
 pub mod planner;
@@ -23,7 +25,9 @@ pub mod serverhash;
 pub mod store;
 pub mod torrent_host;
 pub mod torrent_policy;
+pub mod torrent_service;
 pub mod torrent_worker;
+pub mod tools;
 pub mod ui;
 
 pub use engine::{Download, Error, Snapshot, Status, next_to_start};

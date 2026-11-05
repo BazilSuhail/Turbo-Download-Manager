@@ -16,7 +16,7 @@
 
 mod batch;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -36,6 +36,7 @@ use tdm::ipc::{Advert, Incoming, Inbox};
 use tdm::model::{AUTO_RETRY_MAX, OptionsTab, ProxySettings, Settings, WindowGeometry};
 use tdm::secrets;
 use tdm::store::{find_duplicate, DownloadList, DownloadRecord, Store};
+use tdm::torrent_service::{Note, Req, TorrentService};
 use tdm::ui::assets::{self, Icon};
 use tdm::ui::fit::middle_ellipsis;
 use tdm::ui::menu::{Cmd, Item, MENU_BAR};
@@ -353,6 +354,15 @@ struct Entry {
     retry_at: Option<Instant>,
 }
 
+/// What the status bar shows for one torrent.
+#[derive(Clone, Copy, Debug, Default)]
+struct TorrentRow {
+    done: u64,
+    total: u64,
+    peers: u32,
+    down_bps: u64,
+}
+
 struct App {
     url: String,
     search: String,
@@ -386,6 +396,13 @@ struct App {
     grab: Option<Grab>,
     /// Browser downloads waiting for Download now or Add to queue.
     prompts: VecDeque<Incoming>,
+    /// The torrent worker, started on the first magnet while torrents are allowed.
+    torrents: Option<TorrentService>,
+    /// Torrents in progress, by the app's id.
+    torrent_rows: BTreeMap<u64, TorrentRow>,
+    next_torrent_id: u64,
+    /// The budget last sent to the worker; the outer `None` means never sent.
+    torrent_budget_sent: Option<Option<u64>>,
     /// The stem typed into the front media prompt's name field; `None` until
     /// the field is edited. The extension is never part of it.
     prompt_name: Option<String>,
@@ -730,6 +747,10 @@ impl App {
             browser_guide: false,
             grab: None,
             prompts: VecDeque::new(),
+            torrents: None,
+            torrent_rows: BTreeMap::new(),
+            next_torrent_id: 0,
+            torrent_budget_sent: None,
             prompt_name: None,
             prompt_dir: None,
             prompt_seq: 0,
@@ -1200,6 +1221,11 @@ impl App {
             Message::AddUrl => {
                 let url = self.url.trim().to_owned();
                 if url.is_empty() {
+                    return Task::none();
+                }
+                if tdm::torrent_policy::magnet_ok(&url) {
+                    self.url.clear();
+                    self.add_magnet(url);
                     return Task::none();
                 }
                 self.add_link(url);
@@ -2078,6 +2104,95 @@ impl App {
     /// Give the shared limiter the cap in force now: the speed limit, or a
     /// time-of-day window's cap. `set` restarts the limiter's measurement, so
     /// it is only called when the cap actually changes.
+    /// Hands a magnet link to the torrent worker, starting the worker on first use.
+    fn add_magnet(&mut self, magnet: String) {
+        if !tdm::torrent_host::may_start(&self.settings.downloads) {
+            self.toast(ToastKind::Error, "Torrents are off. Turn them on and accept the DHT notice first.");
+            return;
+        }
+        if !tdm::torrent_policy::magnet_ok(&magnet) {
+            self.toast(ToastKind::Error, "That magnet link is not valid.");
+            return;
+        }
+        if self.torrents.is_none() {
+            match TorrentService::start(&self.settings.downloads) {
+                Ok(svc) => self.torrents = Some(svc),
+                Err(e) => {
+                    self.toast(ToastKind::Error, format!("Torrents unavailable: {e}"));
+                    return;
+                }
+            }
+        }
+        self.next_torrent_id += 1;
+        let id = self.next_torrent_id;
+        let save_dir = self.settings.download_dir.clone();
+        let sent = self.torrents.as_ref().is_some_and(|svc| svc.send(Req::Add { id, magnet, save_dir }));
+        if sent {
+            self.torrent_rows.insert(id, TorrentRow::default());
+            self.toast(ToastKind::Info, "Torrent added");
+        } else {
+            self.torrents = None;
+            self.toast(ToastKind::Error, "The torrent worker is not running");
+        }
+    }
+
+    /// Reads what the torrent worker reported since the last tick.
+    fn drain_torrents(&mut self) {
+        let mut notes = Vec::new();
+        if let Some(svc) = self.torrents.as_ref() {
+            while let Some(note) = svc.try_next() {
+                notes.push(note);
+            }
+        }
+        for note in notes {
+            match note {
+                Note::Progress { id, done, total, peers, down_bps, .. } => {
+                    if let Some(row) = self.torrent_rows.get_mut(&id) {
+                        *row = TorrentRow { done, total, peers, down_bps };
+                    }
+                }
+                Note::Finished(id) => {
+                    self.torrent_rows.remove(&id);
+                    self.toast(ToastKind::Success, "Torrent finished");
+                }
+                Note::Error { id, message } => {
+                    if let Some(id) = id {
+                        self.torrent_rows.remove(&id);
+                    }
+                    self.toast(ToastKind::Error, format!("Torrent: {message}"));
+                }
+                Note::Stopped(reason) => {
+                    self.torrents = None;
+                    self.torrent_rows.clear();
+                    self.torrent_budget_sent = None;
+                    if reason != "stopped" {
+                        self.toast(ToastKind::Error, format!("Torrent worker stopped: {reason}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends the torrent budget (what HTTP leaves of the cap) when it has moved enough.
+    /// Upload is always capped, so the worker never falls back to unlimited.
+    fn push_torrent_budget(&mut self) {
+        let Some(svc) = self.torrents.as_ref() else { return };
+        let now = tdm::scheduler::local_now().1;
+        let cap = tdm::model::effective_limit(self.settings.speed_limit, &self.settings.speed_windows, now);
+        let recent: Vec<f64> = self.spark.iter().rev().take(5).copied().collect();
+        let http = if recent.is_empty() { 0 } else { (recent.iter().sum::<f64>() / recent.len() as f64) as u64 };
+        let budget = tdm::torrent_host::budget_for(cap, http);
+        let send = match self.torrent_budget_sent {
+            None => true,
+            Some(prev) => tdm::torrent_policy::should_send_budget(prev, budget, cap.unwrap_or(1)),
+        };
+        if send {
+            let up = budget.map_or(tdm::torrent_host::UPLOAD_CAP_BPS, |b| b.min(tdm::torrent_host::UPLOAD_CAP_BPS));
+            svc.send(Req::Limits { down: budget, up: Some(up) });
+            self.torrent_budget_sent = Some(budget);
+        }
+    }
+
     fn apply_speed_cap(&self) {
         let now = tdm::scheduler::local_now().1;
         let cap = tdm::model::effective_limit(self.settings.speed_limit, &self.settings.speed_windows, now);
@@ -2101,6 +2216,12 @@ impl App {
             Err(poisoned) => poisoned.into_inner().drain(..).collect(),
         };
         let had_capture = !captured.is_empty();
+        // Magnet links go to the torrent worker; everything else is a download prompt.
+        let (magnets, captured): (Vec<_>, Vec<_>) =
+            captured.into_iter().partition(|c| tdm::torrent_policy::magnet_ok(&c.url));
+        for magnet in magnets {
+            self.add_magnet(magnet.url);
+        }
         self.prompts.extend(captured);
         // A second launch asks the running window to show itself.
         if (had_capture && self.settings.bring_to_front_on_capture) | tdm::ipc::take_show_request() {
@@ -2167,6 +2288,8 @@ impl App {
         // Apply the time-of-day cap on every tick, so the limit changes at a
         // window edge without waiting for the user to touch a setting.
         self.apply_speed_cap();
+        self.drain_torrents();
+        self.push_torrent_budget();
         self.spark.push_back(self.downloads.iter().map(|e| e.speed).sum());
 
         // Past the schedule's stop time, running downloads come to a halt —
@@ -2498,6 +2621,9 @@ impl App {
     }
 
     fn shutdown(&mut self) -> Task<Message> {
+        if let Some(svc) = self.torrents.take() {
+            svc.shutdown();
+        }
         for entry in &self.downloads {
             entry.handle.pause();
         }
@@ -3171,6 +3297,17 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
+        if !self.torrent_rows.is_empty() {
+            let n = self.torrent_rows.len();
+            let done: u64 = self.torrent_rows.values().map(|r| r.done).sum();
+            let total: u64 = self.torrent_rows.values().map(|r| r.total).sum();
+            let peers: u32 = self.torrent_rows.values().map(|r| r.peers).sum();
+            let down: u64 = self.torrent_rows.values().map(|r| r.down_bps).sum();
+            let pct = if total == 0 { 0 } else { done * 100 / total };
+            let plural = if n == 1 { "" } else { "s" };
+            bar = bar.push(text(format!("{n} torrent{plural}  ·  {pct}%  ·  {peers} peers  ·  {}/s", fmt_bytes(down as f64)))
+                .size(12).color(p.muted).wrapping(text::Wrapping::None));
+        }
         if let Some(l) = self.settings.speed_limit {
             bar = bar.push(text(format!("cap {}/s", fmt_bytes(l as f64))).size(12).color(p.muted));
         }
@@ -4459,6 +4596,10 @@ mod tests {
             browser_guide: false,
             grab: None,
             prompts: VecDeque::new(),
+            torrents: None,
+            torrent_rows: BTreeMap::new(),
+            next_torrent_id: 0,
+            torrent_budget_sent: None,
             prompt_name: None,
             prompt_dir: None,
             prompt_seq: 0,

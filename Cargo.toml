@@ -28,7 +28,7 @@ md5 = "0.7"
 raw-window-handle = "0.6"
 rfd = "0.15"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "process"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "sync", "time", "net", "process"] }
 # Phase 0: durable store crate, file logging.
 tdm-store = { path = "crates/tdm-store" }
 tracing = "0.1.44"
@@ -52,6 +52,15 @@ zip = { version = "9.1.3", default-features = false, features = ["deflate", "def
 tar = { version = "0.4.46", default-features = false }
 flate2 = "1.1.10"
 lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz"] }
+
+[features]
+# Phase 6: MCP server over stdio (src/bin/tdm-mcp.rs). Off by default.
+mcp = []
+
+[[bin]]
+name = "tdm-mcp"
+path = "src/bin/tdm-mcp.rs"
+required-features = ["mcp"]
 
 [dev-dependencies]
 # Lab server for the engine integration tests (tests/engine_local_server.rs).
