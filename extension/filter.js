@@ -16,6 +16,15 @@ export function httpUrl(raw) {
   return u.protocol === "http:" || u.protocol === "https:" ? u : null;
 }
 
+/// A torrent link: a magnet link carrying an info hash, or an http(s) link whose
+/// path ends in .torrent. Only these are handed over when torrents are enabled.
+export function isTorrentLink(raw) {
+  const s = String(raw || "");
+  if (s.startsWith("magnet:?")) return s.includes("xt=urn:btih:");
+  const u = httpUrl(s);
+  return !!u && /\.torrent$/i.test(u.pathname);
+}
+
 /// Lowercase, dotless. Applied to both the host's list and the candidate.
 export function normalizeExtension(value) {
   return String(value).toLowerCase().replace(/^\./, "");

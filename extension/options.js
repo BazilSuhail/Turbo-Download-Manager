@@ -97,6 +97,20 @@ $("revokeMedia").addEventListener("click", async () => {
   refresh();
 });
 
+// Magnet and .torrent links go to the app only while this is on. Off by default
+// (a missing value reads as off in the background too).
+const TORRENTS_KEY = "torrentsEnabled";
+const torrentsOn = $("torrentsEnabled");
+api.storage.local
+  .get(TORRENTS_KEY)
+  .then((v) => {
+    torrentsOn.checked = v[TORRENTS_KEY] === true;
+  })
+  .catch(() => null);
+torrentsOn.addEventListener("change", () => {
+  api.storage.local.set({ [TORRENTS_KEY]: torrentsOn.checked }).catch(() => null);
+});
+
 // Sites where media detection runs, stored as origins under "mediaSites".
 // Empty by default (no detection). Unchecking the box clears the list.
 const MEDIA_SITES_KEY = "mediaSites";

@@ -28,7 +28,7 @@ md5 = "0.7"
 raw-window-handle = "0.6"
 rfd = "0.15"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "process"] }
 # Phase 0: durable store crate, file logging.
 tdm-store = { path = "crates/tdm-store" }
 tracing = "0.1.44"

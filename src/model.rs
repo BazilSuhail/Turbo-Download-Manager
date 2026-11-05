@@ -257,6 +257,12 @@ pub struct DownloadSettings {
     /// Unpack zip, tar, gzip and xz archives into their folder when they finish.
     #[serde(default = "default_true")]
     pub extract_archives: bool,
+    /// Torrents run only when this is on and `torrents_dht_notice_accepted` is on too.
+    #[serde(default)]
+    pub torrents_enabled: bool,
+    /// The user has read and accepted the DHT notice (peers see your IP address).
+    #[serde(default)]
+    pub torrents_dht_notice_accepted: bool,
 }
 
 impl Default for DownloadSettings {
@@ -274,6 +280,8 @@ impl Default for DownloadSettings {
             check_file_type: true,
             flash_on_complete: true,
             extract_archives: true,
+            torrents_enabled: false,
+            torrents_dht_notice_accepted: false,
         }
     }
 }

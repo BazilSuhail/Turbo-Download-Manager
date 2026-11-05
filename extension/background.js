@@ -20,6 +20,7 @@ import {
   belowMinSize,
   checkIncognitoAccess,
   httpUrl,
+  isTorrentLink,
   normalizeExtension,
   normalizeHost,
   pickApi,
@@ -233,6 +234,14 @@ async function downloadMessage(url, extra) {
 
 const setLast = (text) => api.storage.session.set({ lastAction: text });
 
+// Magnet and .torrent links are handed to the app only when the user turned
+// torrents on in the extension options. Read on every use, so a change applies
+// at once. Missing or non-true means off.
+async function torrentsEnabled() {
+  const { torrentsEnabled: on = false } = await api.storage.local.get("torrentsEnabled");
+  return on === true;
+}
+
 // Chromium only delivers private-window events to an extension the user allowed
 // in Incognito; this re-reads that grant (it can change at any time) and keeps
 // the popup's copy in storage.session.
@@ -248,6 +257,10 @@ async function decide(item) {
   if (!url) return false;
   const { enabled = true } = await api.storage.local.get("enabled");
   if (!enabled) return false;
+  if (isTorrentLink(raw) && !(await torrentsEnabled())) {
+    console.info("torrent download ignored: torrents are off in the extension options");
+    return false;
+  }
   // A private download is ours only if the user allowed TDM in Incognito; else the browser keeps it.
   if (item.incognito === true && !(await refreshIncognito())) return false;
   if (!(await claim(item.id))) return false;
@@ -284,7 +297,14 @@ async function decide(item) {
 // lists, the on/off toggle and the backoff clock. Resolves to the reply type,
 // "offline" or "unsupported" so the caller can show feedback.
 async function handOver(raw, extra = {}) {
-  if (!httpUrl(raw)) {
+  const torrent = isTorrentLink(raw);
+  if (torrent && !(await torrentsEnabled())) {
+    // The link itself is left out of the log on purpose.
+    console.info("torrent link ignored: torrents are off in the extension options");
+    await setLast("torrent link ignored: torrents are off in the extension options");
+    return "disabled";
+  }
+  if (!torrent && !httpUrl(raw)) {
     await setLast(`unsupported URL: ${raw}`);
     return "unsupported";
   }

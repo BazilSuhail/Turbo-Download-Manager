@@ -21,6 +21,9 @@ pub mod scheduler;
 pub mod secrets;
 pub mod serverhash;
 pub mod store;
+pub mod torrent_host;
+pub mod torrent_policy;
+pub mod torrent_worker;
 pub mod ui;
 
 pub use engine::{Download, Error, Snapshot, Status, next_to_start};
