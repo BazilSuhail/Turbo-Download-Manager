@@ -87,6 +87,7 @@ mod tests {
             dir: PathBuf::from("downloads"),
             enabled,
             interval_minutes,
+            rules_draft: None,
         }
     }
 

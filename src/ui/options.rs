@@ -424,6 +424,7 @@ pub fn update(s: &mut Settings, message: Message) {
                 enabled: true,
                 // Same as the model's default interval.
                 interval_minutes: 30,
+                rules_draft: None,
             });
         }
         RssRemove(id) => s.downloads.rss_feeds.retain(|f| f.id != id),
@@ -440,6 +441,7 @@ pub fn update(s: &mut Settings, message: Message) {
         RssRules(id, raw) => {
             if let Some(f) = rss_feed_mut(s, id) {
                 f.rules = split_rules(&raw);
+                f.rules_draft = Some(raw);
             }
         }
         RssFolder(id, raw) => {
@@ -566,7 +568,10 @@ fn rss_section(feeds: &[model::RssFeed]) -> Element<'_, Message> {
                         .style(theme::input)
                         .size(12)
                         .padding(4),
-                    text_input("rules, separated by commas", &f.rules.join(", "))
+                    text_input(
+                        "rules, separated by commas",
+                        f.rules_draft.as_deref().unwrap_or(&f.rules.join(", ")),
+                    )
                         .on_input(move |v| Message::RssRules(id, v))
                         .style(theme::input)
                         .size(12)

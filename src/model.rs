@@ -344,6 +344,9 @@ pub struct RssFeed {
     /// Minutes between polls. Clamped to `RSS_INTERVAL_MIN..=RSS_INTERVAL_MAX` when used.
     #[serde(default = "default_rss_interval")]
     pub interval_minutes: u32,
+    /// The rules text as typed, so a trailing comma survives a redraw. Never saved.
+    #[serde(skip)]
+    pub rules_draft: Option<String>,
 }
 
 impl RssFeed {
@@ -1258,6 +1261,7 @@ mod tests {
             dir: PathBuf::from("D:\\dl\\rss"),
             enabled: true,
             interval_minutes: 30,
+            rules_draft: None,
         };
         assert_eq!(feed.clamped_interval(), 30);
         feed.interval_minutes = 0;

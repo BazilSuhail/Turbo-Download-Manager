@@ -671,6 +671,7 @@ fn palette_message(id: &str, selected: Option<u64>) -> Option<Message> {
         "export_list" => Message::Command(Cmd::ExportList),
         "import_list" => Message::Command(Cmd::ImportList),
         "clear_finished" => Message::Command(Cmd::DeleteCompleted),
+        "command_palette" => Message::Command(Cmd::CommandPalette),
         _ => return None,
     })
 }
@@ -1269,8 +1270,13 @@ impl App {
         let (id, name) = (e.id, e.name.clone());
         let content_type = e.snapshot.content_type.clone();
         let verdict = filetype::verdict(kind, &name, content_type.as_deref(), false);
+        // A name with no extension cannot be judged, but its content's extension can still be offered.
+        let bare = !std::path::Path::new(&name).extension().is_some_and(|x| !x.is_empty());
+        let offer_rename = bare && kind.renamable() && !matches!(kind, Kind::Unknown | Kind::Text);
         match verdict {
-            Verdict::Match | Verdict::Unchecked => return,
+            Verdict::Match => return,
+            Verdict::Unchecked if !offer_rename => return,
+            Verdict::Unchecked => {}
             Verdict::WebPage => {
                 self.toast(ToastKind::Error, format!("{} is a web page, not the file you asked for", middle_ellipsis(&name, 48)));
             }

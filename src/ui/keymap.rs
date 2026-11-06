@@ -43,6 +43,7 @@ const COMMANDS: &[Command] = &[
     Command { id: "export_list", label: "Export list\u{2026}", shortcut: None },
     Command { id: "import_list", label: "Import list\u{2026}", shortcut: None },
     Command { id: "clear_finished", label: "Clear finished", shortcut: None },
+    Command { id: "command_palette", label: "Command palette\u{2026}", shortcut: Some("Ctrl+K") },
 ];
 
 /// Every command the palette offers, in display order.
@@ -96,6 +97,7 @@ pub fn shortcut_help() -> Vec<(&'static str, &'static str)> {
         ("Ctrl+N", "New download"),
         ("Ctrl+Shift+V", "Paste link from clipboard"),
         ("Ctrl+F", "Search downloads"),
+        ("Ctrl+K", "Open the command palette"),
         ("Ctrl+A", "Select downloads"),
         ("Ctrl+P", "Pause everything, or start the queue when nothing is running"),
         ("Ctrl+R", "Retry failed downloads"),

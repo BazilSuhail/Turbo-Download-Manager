@@ -243,8 +243,15 @@ pub async fn run(program: &Path, args: &[String], limit: Duration) -> Result<Out
     // resume after assignment). That was not done here: it changes the spawn
     // path, and it cannot be tested without a build.
     let job = job::Job::create()?;
-    let mut child = Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.args(args);
+    // Helper programs are console tools; keep their windows hidden.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -95,6 +95,13 @@ impl TorrentHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // A GUI app that starts a console program makes Windows open a console
+        // window for it. The worker has no window of its own, so suppress it.
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         let mut child = cmd.spawn().map_err(HostError::Spawn)?;
 
         let pipe_err = || HostError::Spawn(std::io::Error::other("worker pipe missing"));

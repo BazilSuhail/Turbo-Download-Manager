@@ -208,8 +208,14 @@ async fn add_source(
         .add_torrent(add, Some(opts))
         .await
         .map_err(|e| {
-            eprintln!("add failed: {e:#}");
-            "could not add torrent".to_owned()
+            let detail = format!("{e:#}");
+            eprintln!("add failed: {detail}");
+            // The engine will not overwrite a file that is already in the download folder.
+            if detail.contains("The file exists") {
+                "a file with this name is already in the download folder; move it or choose another folder".to_owned()
+            } else {
+                "could not add torrent".to_owned()
+            }
         })?;
     match response {
         AddTorrentResponse::Added(_, handle) => Ok(handle),

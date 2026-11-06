@@ -840,6 +840,40 @@ pub fn fixed_name(file_name: &str, kind: Kind) -> String {
     }
 }
 
+/// Canonical extension (no dot) for a MIME type such as `image/png`.
+///
+/// Parameters after `;` are ignored, and the match ignores case and surrounding spaces. Returns
+/// None for unknown types. Web page types (`text/html`, XHTML, ...) are never mapped.
+pub fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    Some(match mime.as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/avif" => "avif",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/mp4" => "m4a",
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
+        "application/x-7z-compressed" => "7z",
+        "application/vnd.microsoft.portable-executable" | "application/x-msdownload" => "exe",
+        "application/vnd.android.package-archive" => "apk",
+        "application/x-iso9660-image" => "iso",
+        _ => return None,
+    })
+}
+
 /// Read the first HEAD bytes and, for longer files, the last TAIL bytes, then sniff. Blocking.
 pub fn sniff_file(path: &Path) -> std::io::Result<Kind> {
     let mut file = File::open(path)?;
@@ -1379,6 +1413,63 @@ mod tests {
             verdict(sn(&[0u8, 0, 1, 0]), "blob.bin", None, false),
             Verdict::Unchecked
         );
+    }
+
+    #[test]
+    fn content_type_maps_each_known_type() {
+        let cases = [
+            ("image/jpeg", "jpg"),
+            ("image/jpg", "jpg"),
+            ("image/png", "png"),
+            ("image/gif", "gif"),
+            ("image/webp", "webp"),
+            ("image/avif", "avif"),
+            ("image/bmp", "bmp"),
+            ("image/svg+xml", "svg"),
+            ("video/mp4", "mp4"),
+            ("video/webm", "webm"),
+            ("audio/mpeg", "mp3"),
+            ("audio/ogg", "ogg"),
+            ("audio/mp4", "m4a"),
+            ("application/pdf", "pdf"),
+            ("application/zip", "zip"),
+            ("application/x-7z-compressed", "7z"),
+            ("application/vnd.microsoft.portable-executable", "exe"),
+            ("application/x-msdownload", "exe"),
+            ("application/vnd.android.package-archive", "apk"),
+            ("application/x-iso9660-image", "iso"),
+        ];
+        for (mime, ext) in cases {
+            assert_eq!(extension_for_content_type(mime), Some(ext), "{mime}");
+        }
+    }
+
+    #[test]
+    fn content_type_ignores_parameters_case_and_spaces() {
+        assert_eq!(extension_for_content_type("image/png; charset=binary"), Some("png"));
+        assert_eq!(extension_for_content_type("application/pdf;name=a.pdf"), Some("pdf"));
+        assert_eq!(extension_for_content_type("  IMAGE/PNG  "), Some("png"));
+        assert_eq!(extension_for_content_type("Video/MP4 ; codecs=\"avc1\""), Some("mp4"));
+    }
+
+    #[test]
+    fn content_type_unknown_and_web_types_are_none() {
+        for mime in [
+            "",
+            ";",
+            "text/html",
+            "text/html; charset=utf-8",
+            "application/xhtml+xml",
+            "text/xml",
+            "text/plain",
+            "application/javascript",
+            "application/octet-stream",
+            "image/svg",
+            "image/x-unknown",
+            "video/quicktime",
+        ] {
+            assert_eq!(extension_for_content_type(mime), None, "{mime:?}");
+        }
     }
 }
 

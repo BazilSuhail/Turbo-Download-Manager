@@ -363,6 +363,18 @@ impl fmt::Display for FtpUrl {
     }
 }
 
+/// A login failure. A 530 gets a hint, since the link may simply lack credentials.
+fn login_refused(reply: Reply, want: &'static str) -> FtpError {
+    if reply.code == 530 {
+        let text = format!(
+            "{} (this server needs a username and password: use ftp://user:password@host/path)",
+            reply.text.trim_end()
+        );
+        return FtpError::Permanent { code: 530, text };
+    }
+    reply.into_error(want)
+}
+
 impl FtpUrl {
     /// Parse an `ftp://` or `ftps://` URL. Missing credentials default to the
     /// anonymous login (`anonymous` / [`ANONYMOUS_PASSWORD`]).
@@ -570,10 +582,10 @@ impl FtpControl {
             331 | 332 => {
                 let reply = control.send(&format!("PASS {}", url.pass)).await?;
                 if reply.code / 100 != 2 {
-                    return Err(reply.into_error("230 after PASS"));
+                    return Err(login_refused(reply, "230 after PASS"));
                 }
             }
-            _ => return Err(reply.into_error("230 or 331 after USER")),
+            _ => return Err(login_refused(reply, "230 or 331 after USER")),
         }
         let reply = control.send("TYPE I").await?;
         if reply.code / 100 != 2 {
