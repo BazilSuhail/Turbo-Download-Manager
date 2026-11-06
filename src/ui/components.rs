@@ -99,11 +99,18 @@ pub fn secondary_button<'a, M: Clone + 'a>(p: &Palette, label: &'a str, on_press
         .padding([7, 18])
         .style(move |_, status| {
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let disabled = matches!(status, button::Status::Disabled);
             let fill = if hovered { p.border } else { p.raised };
+            let text_color = if disabled {
+                iced::Color { a: 0.6, ..p.muted }
+            } else {
+                readable_on(fill)
+            };
+            let edge = if hovered { p.accent } else { p.border };
             button::Style {
                 background: Some(fill.into()),
-                text_color: readable_on(fill),
-                border: Border { color: p.border, width: 1.0, radius: 8.0.into() },
+                text_color,
+                border: Border { color: edge, width: 1.0, radius: 8.0.into() },
                 ..Default::default()
             }
         })

@@ -119,7 +119,7 @@ async function download(button, item, title) {
     result === "accepted" ? "Sent ✓" : result === "offline" ? "App offline" : result === "declined" ? "Declined" : "Failed";
   setTimeout(() => {
     button.className = "btn primary";
-    button.textContent = "Download";
+    button.textContent = "Download media with TDM";
   }, 2500);
 }
 
@@ -147,7 +147,7 @@ async function loadMedia() {
     li.querySelector(".title").title = item.url;
     li.querySelector(".where").textContent = new URL(item.url).hostname;
     const button = li.querySelector("button");
-    button.setAttribute("aria-label", `Download ${label(item.url, title)} with TDM`);
+    button.setAttribute("aria-label", `Download media with TDM: ${label(item.url, title)}`);
     button.addEventListener("click", () => download(button, item, title));
     list.append(li);
   }

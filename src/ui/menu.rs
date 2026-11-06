@@ -93,8 +93,8 @@ pub const MENU_BAR: &[Menu] = &[
             cmd("Pause", Cmd::Pause),
             key("Retry failed downloads", Cmd::RetryFailed, "Ctrl+R"),
             key("Select downloads", Cmd::SelectMode, "Ctrl+A"),
-            key("Delete\u{2026}", Cmd::Delete, "Del"),
-            cmd("Delete selected\u{2026}", Cmd::DeleteSelected),
+            key("Delete download\u{2026}", Cmd::Delete, "Del"),
+            cmd("Delete selected downloads\u{2026}", Cmd::DeleteSelected),
             Item::Separator,
             cmd("Open file", Cmd::OpenFile),
             key("Show in folder", Cmd::ShowInFolder, "F2"),
@@ -106,7 +106,6 @@ pub const MENU_BAR: &[Menu] = &[
             cmd("Clear finished", Cmd::DeleteCompleted),
             Item::Separator,
             cmd("Schedule\u{2026}", Cmd::Scheduler),
-            cmd("Preferences\u{2026}", Cmd::Options),
         ],
     },
     Menu {
@@ -123,6 +122,8 @@ pub const MENU_BAR: &[Menu] = &[
             cmd("Switch light / dark", Cmd::ToggleTheme),
             key("Search downloads", Cmd::Find, "Ctrl+F"),
             key("Command palette\u{2026}", Cmd::CommandPalette, "Ctrl+K"),
+            Item::Separator,
+            cmd("Preferences\u{2026}", Cmd::Options),
         ],
     },
     Menu {

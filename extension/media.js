@@ -19,7 +19,7 @@
   const MIN_W = 120; // smaller elements are icons/previews, not something to save
   const MIN_H = 60;
   const MISS_RETRY_MS = 2000;
-  const LABEL = "Download with TDM";
+  const LABEL = "Download media with TDM";
   // Images are offered only when large enough to be a picture worth saving.
   const IMG_MIN_W = 160;
   const IMG_MIN_H = 120;
@@ -44,17 +44,17 @@
       all: unset; box-sizing: border-box; cursor: pointer; border-radius: 999px;
       padding: 7px 11px; white-space: nowrap; transition: filter .15s, background .15s, opacity .15s;
     }
-    .go { background: #FF7A1A; color: #0A0A0B; }
+    .go { background: #C2410C; color: #fff; }
     .go img { width: 14px; height: 14px; margin-right: 6px; vertical-align: -3px; border-radius: 3px; }
     .go:hover { filter: brightness(1.08); }
     .go[aria-busy="true"] { opacity: .75; cursor: progress; }
-    .go.ok { background: #2fbf71; color: #fff; }
-    .go.err { background: #e5484d; color: #fff; }
+    .go.ok { background: #15803d; color: #fff; }
+    .go.err { background: #b91c1c; color: #fff; }
     .x { padding: 7px 9px; opacity: .7; }
     .x:hover { opacity: 1; background: rgba(255,255,255,.08); }
     button:focus-visible { outline: 2px solid #FF7A1A; outline-offset: 2px; }
     @media (prefers-color-scheme: light) {
-      .go { background: #F06A10; color: #1A0F08; }
+      .go { background: #C2410C; color: #fff; }
       button:focus-visible { outline-color: #F06A10; }
       .pill { background: rgba(255,255,255,.94); color: #111111;
               box-shadow: 0 6px 22px rgba(0,0,0,.18), inset 0 0 0 1px rgba(0,0,0,.08); }

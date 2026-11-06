@@ -73,7 +73,7 @@ pub const TOOLBAR: &[ToolbarIcon] = &[
     ToolbarIcon { cmd: Cmd::Pause, icon: Icon::Pause, label: "Pause" },
     ToolbarIcon { cmd: Cmd::PauseAll, icon: Icon::StopAll, label: "Pause everything" },
     ToolbarIcon { cmd: Cmd::SelectMode, icon: Icon::Check, label: "Select downloads" },
-    ToolbarIcon { cmd: Cmd::Delete, icon: Icon::Delete, label: "Delete" },
+    ToolbarIcon { cmd: Cmd::Delete, icon: Icon::Delete, label: "Delete download" },
     ToolbarIcon { cmd: Cmd::DeleteCompleted, icon: Icon::DeleteCompleted, label: "Clear finished" },
     ToolbarIcon { cmd: Cmd::StartQueue, icon: Icon::StartQueue, label: "Start queue" },
     ToolbarIcon { cmd: Cmd::StopQueue, icon: Icon::StopQueue, label: "Stop queue" },

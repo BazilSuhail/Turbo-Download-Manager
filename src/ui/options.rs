@@ -563,31 +563,34 @@ fn rss_section(feeds: &[model::RssFeed]) -> Element<'_, Message> {
                             .on_press(Message::RssRemove(id)),
                     ]
                     .align_y(iced::Alignment::Center),
+                    text("Feed URL").size(11).style(theme::muted),
                     text_input("https://example.test/feed.xml", &f.url)
                         .on_input(move |v| Message::RssUrl(id, v))
                         .style(theme::input)
-                        .size(12)
-                        .padding(4),
+                        .size(13)
+                        .padding(6),
+                    text("Rules").size(11).style(theme::muted),
                     text_input(
                         "rules, separated by commas",
                         f.rules_draft.as_deref().unwrap_or(&f.rules.join(", ")),
                     )
                         .on_input(move |v| Message::RssRules(id, v))
                         .style(theme::input)
-                        .size(12)
-                        .padding(4),
+                        .size(13)
+                        .padding(6),
+                    text("Folder").size(11).style(theme::muted),
                     text_input("folder", &f.dir.to_string_lossy())
                         .on_input(move |v| Message::RssFolder(id, v))
                         .style(theme::input)
-                        .size(12)
-                        .padding(4),
+                        .size(13)
+                        .padding(6),
                     row![
                         text("Check every").size(12).style(theme::muted),
                         text_input("30", &f.interval_minutes.to_string())
                             .on_input(move |v| Message::RssInterval(id, v))
                             .style(theme::input)
-                            .size(12)
-                            .padding(4)
+                            .size(13)
+                            .padding(6)
                             .width(Length::Fixed(70.0)),
                         text("minutes").size(12).style(theme::muted),
                     ]
@@ -701,7 +704,9 @@ fn general(s: &Settings) -> Element<'_, Message> {
                 Message::LightTheme(t.0)
             })
             .text_size(13)
-            .padding(6),
+            .padding(6)
+            .style(theme::pick)
+            .menu_style(theme::pick_menu),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
@@ -802,8 +807,8 @@ fn save_to(s: &Settings) -> Element<'_, Message> {
     ));
     col = col.push(
         row![
-            text("Pick the download folder with the native dialog").size(13).style(theme::muted).width(Length::Fill),
-            button(text("Browse").size(13)).padding([4, 12]).style(theme::flat(false)).on_press(Message::BrowseDownloadDir),
+            Space::new().width(Length::Fill),
+            button(text("Browse...").size(13)).padding([4, 12]).style(theme::flat(false)).on_press(Message::BrowseDownloadDir),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
@@ -825,7 +830,6 @@ fn save_to(s: &Settings) -> Element<'_, Message> {
         "(empty: keep partial data beside the file)",
         Message::TempDir,
     ));
-    col = col.push(dead_button("Pick the temporary folder", "Browse"));
     col = col.push(note(
         "A temporary folder on a different drive turns every finished download \
          into a cross-drive copy.",
@@ -964,19 +968,22 @@ fn downloads(s: &Settings) -> Element<'_, Message> {
             text("When a link is already in the list:").size(13).width(Length::Fixed(LABEL_W)),
             pick_list(&DuplicateAction::ALL[..], Some(d.duplicate_action), Message::Duplicate)
                 .text_size(13)
-                .padding(6),
+                .padding(6)
+                .style(theme::pick)
+                .menu_style(theme::pick_menu),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
     );
     col = col.push(field(
-        "User-Agent for links added by hand",
+        "User-Agent",
         &d.user_agent,
         "(empty: use the engine's own)",
         Message::UserAgent,
     ));
+    col = col.push(note("Sent for links you add by hand."));
     col = col.push(field(
-        "Default speed limit, KiB/s",
+        "Default speed limit (KiB/s)",
         &d.default_speed_limit_bps.map(|b| (b / 1024).to_string()).unwrap_or_default(),
         "(empty: unlimited)",
         Message::SpeedLimitChanged,
@@ -992,17 +999,18 @@ fn downloads(s: &Settings) -> Element<'_, Message> {
         Message::ScheduleEnabled,
     ));
     col = col.push(field(
-        "Start at (HH:MM, empty for none)",
+        "Start at",
         &sc.start.map(|t| t.to_string()).unwrap_or_default(),
         "23:00",
         Message::ScheduleStart,
     ));
     col = col.push(field(
-        "Stop at (HH:MM, empty for none)",
+        "Stop at",
         &sc.stop.map(|t| t.to_string()).unwrap_or_default(),
         "07:30",
         Message::ScheduleStop,
     ));
+    col = col.push(note("Times are HH:MM. Leave empty for no automatic start or stop."));
     // Seven buttons do not fit beside a 250 px label, so the label goes above.
     col = col.push(text("On these days").size(13));
     let mut days = row![].spacing(4);
@@ -1011,7 +1019,7 @@ fn downloads(s: &Settings) -> Element<'_, Message> {
         days = days.push(
             button(text(label).size(12))
                 .padding([4, 8])
-                .style(theme::flat(on))
+                .style(theme::chip(on))
                 .on_press(Message::ScheduleDay(day, !on)),
         );
     }
@@ -1093,14 +1101,14 @@ fn downloads(s: &Settings) -> Element<'_, Message> {
                 text_input("Queue name", &q.name)
                     .on_input(move |v| Message::QueueRename(id, v))
                     .style(theme::input)
-                    .size(12)
-                    .padding(4)
+                    .size(13)
+                    .padding(6)
                     .width(Length::FillPortion(3)),
-                text_input("1", &q.max_concurrent.to_string())
+                text_input("Max", &q.max_concurrent.to_string())
                     .on_input(move |v| Message::QueueConcurrency(id, v))
                     .style(theme::input)
-                    .size(12)
-                    .padding(4)
+                    .size(13)
+                    .padding(6)
                     .width(Length::Fixed(50.0)),
                 text("at a time").size(11).style(theme::muted).width(Length::FillPortion(2)),
                 delete,
@@ -1125,7 +1133,20 @@ fn downloads(s: &Settings) -> Element<'_, Message> {
 /// dialog and maps its messages into the Options ones.
 pub fn torrent_notice() -> Element<'static, Message> {
     column![
-        text("Turn on BitTorrent downloads").size(16),
+        row![
+            iced::widget::svg(iced::widget::svg::Handle::from_memory(crate::ui::assets::Icon::Shield.svg()))
+                .width(20)
+                .height(20)
+                .style(|t: &iced::Theme, _| iced::widget::svg::Style {
+                    color: Some(theme::Palette::of(t).warning),
+                }),
+            text("Turn on BitTorrent downloads").size(16).font(iced::Font {
+                weight: iced::font::Weight::Semibold,
+                ..iced::Font::DEFAULT
+            }),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
         text(
             "BitTorrent connects to other computers on the internet. It finds them \
              through the distributed hash table (DHT), and that exposes your IP \
@@ -1147,8 +1168,12 @@ pub fn torrent_notice() -> Element<'static, Message> {
         .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
         row![
             Space::new().width(Length::Fill),
-            button(text("Cancel").size(13)).padding([7, 18]).style(theme::flat(false)).on_press(Message::TorrentConsentCancel),
-            button(text("Accept").size(13)).padding([7, 18]).style(theme::accent).on_press(Message::TorrentConsentAccept),
+            button(text("Cancel").size(13)).padding([7, 18]).style(theme::ghost).on_press(Message::TorrentConsentCancel),
+            button(text("Accept").size(13).font(iced::Font {
+                weight: iced::font::Weight::Semibold,
+                ..iced::Font::DEFAULT
+            }))
+            .padding([7, 18]).style(theme::accent).on_press(Message::TorrentConsentAccept),
         ]
         .spacing(8),
     ]
@@ -1219,7 +1244,9 @@ fn connection(s: &Settings) -> Element<'_, Message> {
             text("When the queue is done").size(13).width(Length::Fixed(LABEL_W)),
             pick_list(&model::AfterQueue::ALL[..], Some(s.after_queue), Message::AfterQueueChoice)
                 .text_size(13)
-                .padding(6),
+                .padding(6)
+                .style(theme::pick)
+                .menu_style(theme::pick_menu),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
@@ -1228,7 +1255,7 @@ fn connection(s: &Settings) -> Element<'_, Message> {
     col = col.push(text("Speed windows").size(13));
     col = col.push(note(
         "While a window is open its limit replaces the global one. A window whose start is \
-         later than its end runs past midnight. 0 KB/s means unlimited inside the window.",
+         later than its end runs past midnight. 0 KiB/s means unlimited inside the window.",
     ));
     for (i, w) in s.speed_windows.iter().enumerate() {
         col = col.push(speed_window_row(i, w));
@@ -1249,13 +1276,13 @@ fn speed_window_row(index: usize, w: &model::SpeedWindow) -> Element<'static, Me
     let kbps = w.limit.map_or(0, |b| (b / 1024) as u32);
     column![
         row![
-            mini_stepper("From hour", u32::from(w.start.hour), 0..=23, move |h| Message::SpeedWindowStart(index, h)),
-            mini_stepper("To hour", u32::from(w.end.hour), 0..=23, move |h| Message::SpeedWindowEnd(index, h)),
+            mini_stepper("From (hour)", u32::from(w.start.hour), 0..=23, move |h| Message::SpeedWindowStart(index, h)),
+            mini_stepper("To (hour)", u32::from(w.end.hour), 0..=23, move |h| Message::SpeedWindowEnd(index, h)),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center),
         row![
-            mini_stepper("KB/s", kbps, 0..=SPEED_KBPS_MAX, move |k| Message::SpeedWindowKbps(index, k)),
+            mini_stepper("Limit (KiB/s)", kbps, 0..=SPEED_KBPS_MAX, move |k| Message::SpeedWindowKbps(index, k)),
             button(text("Remove").size(12))
                 .padding([3, 10])
                 .style(theme::flat(false))
@@ -1308,8 +1335,14 @@ fn proxy(s: &Settings) -> Element<'_, Message> {
         let on = p.mode == mode;
         col = col.push(
             button(
-                row![text(if on { "\u{25C9}" } else { "\u{25CB}" }).size(13), text(mode.title()).size(13)]
-                    .spacing(8),
+                row![
+                    text(if on { "\u{25C9}" } else { "\u{25CB}" }).size(13).style(move |t: &iced::Theme| {
+                        let p = theme::Palette::of(t);
+                        iced::widget::text::Style { color: Some(if on { p.accent } else { p.muted }) }
+                    }),
+                    text(mode.title()).size(13),
+                ]
+                .spacing(8),
             )
             .padding([4, 6])
             .style(theme::flat(on))
@@ -1428,6 +1461,7 @@ where
     checkbox(value)
         .label(label)
         .on_toggle(on_toggle)
+        .style(theme::checkbox)
         .size(16)
         .text_size(13)
         .text_wrapping(iced::widget::text::Wrapping::WordOrGlyph)
@@ -1439,6 +1473,7 @@ where
 fn dead_check<'a>(label: &str, value: bool) -> Element<'a, Message> {
     checkbox(value)
         .label(format!("{label}  {NOT_WIRED}"))
+        .style(theme::checkbox)
         .size(16)
         .text_size(13)
         .text_wrapping(iced::widget::text::Wrapping::WordOrGlyph)
@@ -1447,18 +1482,6 @@ fn dead_check<'a>(label: &str, value: bool) -> Element<'a, Message> {
 
 fn dead_label<'a>(label: &str) -> Element<'a, Message> {
     text(format!("{label}  {NOT_WIRED}")).size(13).style(theme::muted).into()
-}
-
-/// A button for a picker we do not have. Rendered without `on_press`, so it
-/// cannot be clicked.
-fn dead_button<'a>(label: &str, caption: &str) -> Element<'a, Message> {
-    row![
-        text(format!("{label}  {NOT_WIRED}")).size(13).style(theme::muted).width(Length::Fill),
-        button(text(caption.to_owned()).size(13)).padding([4, 12]).style(theme::flat(false)),
-    ]
-    .spacing(8)
-    .align_y(iced::Alignment::Center)
-    .into()
 }
 
 fn field<'a, F>(label: &'a str, value: &str, placeholder: &'a str, on_input: F) -> Element<'a, Message>
@@ -1506,7 +1529,7 @@ fn stepper_row<'a>(
 fn reset_row(message: Message) -> Element<'static, Message> {
     row![
         Space::new().width(Length::Fill),
-        button(text("Default").size(13)).padding([4, 12]).style(theme::flat(false)).on_press(message),
+        button(text("Reset").size(13)).padding([4, 12]).style(theme::flat(false)).on_press(message),
     ]
     .into()
 }

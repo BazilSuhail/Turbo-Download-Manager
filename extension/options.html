@@ -42,7 +42,7 @@
       <section class="card">
         <h2>Capture</h2>
         <div class="row spread">
-          <label for="enabled"><strong>Capture downloads automatically</strong></label>
+          <label for="enabled"><strong>Auto-capture downloads</strong></label>
           <span class="switch"><input id="enabled" type="checkbox" role="switch" /><span></span></span>
         </div>
         <p class="hint">With this off, nothing is intercepted; the right-click items, the popup and the video button still work.</p>
@@ -56,7 +56,7 @@
         <p class="hint" id="captureMinHint">Leave empty to use the value set in the TDM app. 0 captures every size. Only applies when the browser knows the file size.</p>
         <div class="row spread">
           <p class="hint" id="incogText">Checking private windows…</p>
-          <button id="incogBtn" class="btn" type="button" hidden>Open settings</button>
+          <button id="incogBtn" class="btn" type="button" hidden>Open browser extension settings</button>
         </div>
       </section>
 
@@ -66,16 +66,16 @@
           <strong>Send cookies with downloads</strong>
           <span class="buttons">
             <span id="cookieState" class="granted"></span>
-            <button id="grantCookies" class="btn primary" type="button">Allow cookies</button>
+            <button id="grantCookies" class="btn primary" type="button">Allow cookie access</button>
           </span>
         </div>
         <p class="hint">Without it, downloads that need your session (anything behind a login) may fail once handed over.</p>
 
         <div class="row spread">
-          <strong>Media detection</strong>
+          <strong>Enable media detection</strong>
           <span class="buttons">
             <span id="mediaState" class="granted"></span>
-            <button id="grantMedia" class="btn primary" type="button">Grant media detection</button>
+            <button id="grantMedia" class="btn primary" type="button">Enable media detection</button>
             <button id="revokeMedia" class="btn" type="button">Turn off</button>
           </span>
         </div>
@@ -95,7 +95,7 @@
         </div>
         <p class="hint">
           Off by default. Only pages on the sites listed below are watched for
-          streamed media. Needs Media detection above. One site per line, for
+          streamed media. Needs Enable media detection above. One site per line, for
           example https://example.com. Already-open tabs need a reload.
         </p>
         <textarea id="mediaSites" rows="4" spellcheck="false" aria-label="Sites to detect videos on" placeholder="https://example.com" disabled></textarea>
@@ -104,9 +104,10 @@
       <section class="card">
         <h2>Torrents</h2>
         <div class="row spread">
-          <label for="torrentsEnabled"><strong>Send magnet links and .torrent files to Turbo (torrents are off in the app until you turn them on there too)</strong></label>
+          <label for="torrentsEnabled"><strong>Send magnet links and .torrent files to TDM</strong></label>
           <span class="switch"><input id="torrentsEnabled" type="checkbox" role="switch" /><span></span></span>
         </div>
+        <p class="hint">Torrents are off in the TDM app until you turn them on there too.</p>
       </section>
 
       <section class="card">

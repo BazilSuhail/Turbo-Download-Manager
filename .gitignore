@@ -1,5 +1,6 @@
 # Build output and packaged installers (rebuild or attach them to a release)
 /target/
+/target-*/
 /installer/
 extension/dist/
 

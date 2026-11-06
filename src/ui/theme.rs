@@ -7,7 +7,10 @@
 
 use iced::border::Radius;
 use iced::gradient::Linear;
-use iced::widget::{button, container, progress_bar, text, text_input};
+use iced::widget::overlay::menu;
+use iced::widget::{
+    button, checkbox as checkbox_w, container, pick_list, progress_bar, text, text_editor, text_input,
+};
 use iced::{Background, Border, Color, Gradient, Radians, Shadow, Theme, Vector};
 
 pub const fn rgb(value: u32) -> Color {
@@ -30,14 +33,14 @@ pub struct Palette {
     /// Hover and selection fill, menus.
     pub raised: Color,
     pub border: Color,
+    /// Control edges (inputs, unchecked boxes): at least 3:1 against the card.
+    pub border_strong: Color,
     pub text: Color,
     /// Secondary text. Still held to body-text contrast.
     pub muted: Color,
     /// Gradient start and end of the accent.
     pub accent: Color,
     pub accent2: Color,
-    /// Text drawn on the accent.
-    pub on_accent: Color,
     pub success: Color,
     pub warning: Color,
     pub danger: Color,
@@ -52,12 +55,11 @@ impl Palette {
             card: rgb(0x111113),
             raised: rgb(0x1B1B1E),
             border: rgb(0x2A2A2E),
+            border_strong: rgb(0x6B6B73),
             text: rgb(0xF2F2F3),
             muted: rgb(0x9B9BA3),
             accent: rgb(0xFF7A1A),
             accent2: rgb(0xFFB347),
-            // Near-black text on the orange buttons: about 8:1 contrast, where white is about 2.6:1.
-            on_accent: rgb(0x0A0A0B),
             success: rgb(0x34C77B),
             warning: rgb(0xE5A93A),
             danger: rgb(0xF2665C),
@@ -72,12 +74,11 @@ impl Palette {
             card: rgb(0xFFFFFF),
             raised: rgb(0xEEEEF2),
             border: rgb(0xDCDCE2),
+            border_strong: rgb(0x8A8A94),
             text: rgb(0x111114),
             muted: rgb(0x5F5F68),
             accent: rgb(0xF06A10),
             accent2: rgb(0xFFA83A),
-            // Dark text on the orange buttons: about 6.6:1 contrast.
-            on_accent: rgb(0x1A0F08),
             success: rgb(0x167A4A),
             warning: rgb(0x8A5A00),
             danger: rgb(0xC02A20),
@@ -98,11 +99,11 @@ impl Palette {
             card: m(self.card, other.card),
             raised: m(self.raised, other.raised),
             border: m(self.border, other.border),
+            border_strong: m(self.border_strong, other.border_strong),
             text: m(self.text, other.text),
             muted: m(self.muted, other.muted),
             accent: m(self.accent, other.accent),
             accent2: m(self.accent2, other.accent2),
-            on_accent: m(self.on_accent, other.on_accent),
             success: m(self.success, other.success),
             warning: m(self.warning, other.warning),
             danger: m(self.danger, other.danger),
@@ -140,6 +141,11 @@ impl Palette {
                 .add_stop(1.0, self.accent2),
         ))
     }
+}
+
+/// True when the palette is the light one (or past the halfway point of the fade).
+pub fn is_light(p: &Palette) -> bool {
+    p.bg.r > 0.5
 }
 
 pub fn alpha(c: Color, a: f32) -> Color {
@@ -208,8 +214,42 @@ pub fn flat(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
         };
         button::Style {
             background: fill,
-            text_color: if status == button::Status::Disabled { alpha(p.muted, 0.6) } else { p.text },
+            text_color: if status == button::Status::Disabled { alpha(p.muted, 0.85) } else { p.text },
             border: Border { radius: 8.0.into(), ..Default::default() },
+            ..Default::default()
+        }
+    }
+}
+
+/// [`flat`] with a 1px edge: for Cancel and other quiet dialog buttons.
+pub fn ghost(theme: &Theme, status: button::Status) -> button::Style {
+    let p = Palette::of(theme);
+    button::Style {
+        border: Border { color: p.border, width: 1.0, radius: 8.0.into() },
+        ..flat(false)(theme, status)
+    }
+}
+
+/// A toggle chip: filled and edged in the accent when `active`.
+pub fn chip(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let p = Palette::of(theme);
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let background = if active {
+            Some(blend(p.card, p.accent, if hovered { 0.26 } else { 0.18 }).into())
+        } else if hovered {
+            Some(p.raised.into())
+        } else {
+            None
+        };
+        button::Style {
+            background,
+            text_color: if status == button::Status::Disabled { alpha(p.muted, 0.85) } else { p.text },
+            border: Border {
+                color: if active { p.accent } else { p.border },
+                width: 1.0,
+                radius: 99.0.into(),
+            },
             ..Default::default()
         }
     }
@@ -223,6 +263,7 @@ pub fn row_button(selected: bool, marked: f32) -> impl Fn(&Theme, button::Status
     move |theme, status| {
         let p = Palette::of(theme);
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let pressed = status == button::Status::Pressed;
         let base = if selected {
             p.raised
         } else if hovered {
@@ -232,7 +273,9 @@ pub fn row_button(selected: bool, marked: f32) -> impl Fn(&Theme, button::Status
         };
         let edged = selected || marked > 0.0;
         button::Style {
-            background: Some(blend(base, p.accent, 0.12 * marked).into()),
+            background: Some(
+                blend(blend(base, p.accent, 0.12 * marked), p.accent, if pressed { 0.08 } else { 0.0 }).into(),
+            ),
             text_color: p.text,
             border: Border {
                 color: if edged { p.accent } else { p.border },
@@ -247,11 +290,25 @@ pub fn row_button(selected: bool, marked: f32) -> impl Fn(&Theme, button::Status
 pub fn side_button(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let p = Palette::of(theme);
-        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let hovered = status == button::Status::Hovered;
+        let pressed = status == button::Status::Pressed;
+        let background = if pressed {
+            Some(p.border.into())
+        } else if selected {
+            Some(blend(p.surface, p.accent, 0.14).into())
+        } else if hovered {
+            Some(alpha(p.raised, 0.6).into())
+        } else {
+            None
+        };
         button::Style {
-            background: (selected || hovered).then(|| alpha(p.raised, if selected { 1.0 } else { 0.6 }).into()),
+            background,
             text_color: p.text,
-            border: Border { radius: 8.0.into(), ..Default::default() },
+            border: Border {
+                color: if selected { p.accent } else { Color::TRANSPARENT },
+                width: if selected { 1.0 } else { 0.0 },
+                radius: 8.0.into(),
+            },
             ..Default::default()
         }
     }
@@ -280,12 +337,14 @@ pub fn accent(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::of(theme);
     let fill = button_fill(&p);
     let (bg, shadow) = match status {
-        button::Status::Disabled => (alpha(p.muted, 0.3), Color::TRANSPARENT),
+        button::Status::Disabled => (alpha(p.muted, 0.18), Color::TRANSPARENT),
+        button::Status::Hovered => (blend(fill, Color::BLACK, 0.12), alpha(fill, 0.25)),
+        button::Status::Pressed => (blend(fill, Color::BLACK, 0.18), alpha(fill, 0.25)),
         _ => (fill, alpha(fill, 0.25)),
     };
     button::Style {
         background: Some(bg.into()),
-        text_color: if status == button::Status::Disabled { p.muted } else { readable_on(fill) },
+        text_color: if status == button::Status::Disabled { alpha(p.text, 0.6) } else { readable_on(bg) },
         border: Border { radius: 8.0.into(), ..Default::default() },
         shadow: Shadow { color: shadow, offset: Vector::new(0.0, 2.0), blur_radius: 10.0 },
         ..Default::default()
@@ -301,9 +360,21 @@ pub fn readable_on(bg: Color) -> Color {
 
 pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
     let p = Palette::of(theme);
+    let (bg, text_color) = match status {
+        button::Status::Disabled => (alpha(p.muted, 0.3), p.muted),
+        button::Status::Hovered => {
+            let c = blend(p.danger, p.text, 0.1);
+            (c, readable_on(c))
+        }
+        button::Status::Pressed => {
+            let c = blend(p.danger, Color::BLACK, 0.15);
+            (c, readable_on(c))
+        }
+        _ => (p.danger, readable_on(p.danger)),
+    };
     button::Style {
-        background: Some(if status == button::Status::Hovered { p.danger } else { alpha(p.danger, 0.85) }.into()),
-        text_color: readable_on(p.danger),
+        background: Some(bg.into()),
+        text_color,
         border: Border { radius: 8.0.into(), ..Default::default() },
         ..Default::default()
     }
@@ -312,18 +383,90 @@ pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
 /// Inputs sit on the card colour with a border that lights up on focus.
 pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let p = Palette::of(theme);
-    let edge = match status {
-        text_input::Status::Focused { .. } => p.accent,
-        text_input::Status::Hovered => p.muted,
-        _ => p.border,
+    let focus = if is_light(&p) { button_fill(&p) } else { p.accent };
+    let (edge, width) = match status {
+        text_input::Status::Focused { .. } => (focus, 2.0),
+        text_input::Status::Hovered => (p.muted, 1.0),
+        text_input::Status::Disabled => (p.border, 1.0),
+        _ => (p.border_strong, 1.0),
     };
+    let disabled = status == text_input::Status::Disabled;
     text_input::Style {
-        background: p.card.into(),
-        border: Border { color: edge, width: 1.0, radius: 8.0.into() },
+        background: if disabled { p.surface } else { p.card }.into(),
+        border: Border { color: edge, width, radius: 8.0.into() },
         icon: p.muted,
-        placeholder: p.muted,
-        value: p.text,
+        placeholder: if disabled { alpha(p.muted, 0.8) } else { p.muted },
+        value: if disabled { alpha(p.text, 0.6) } else { p.text },
         selection: alpha(p.accent, 0.35),
+    }
+}
+
+/// A multi-line editor styled like [`input`].
+pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let p = Palette::of(theme);
+    let focus = if is_light(&p) { button_fill(&p) } else { p.accent };
+    let (edge, width) = match status {
+        text_editor::Status::Focused { .. } => (focus, 2.0),
+        text_editor::Status::Hovered => (p.muted, 1.0),
+        text_editor::Status::Disabled => (p.border, 1.0),
+        text_editor::Status::Active => (p.border_strong, 1.0),
+    };
+    let disabled = status == text_editor::Status::Disabled;
+    text_editor::Style {
+        background: if disabled { p.surface } else { p.card }.into(),
+        border: Border { color: edge, width, radius: 8.0.into() },
+        placeholder: if disabled { alpha(p.muted, 0.8) } else { p.muted },
+        value: if disabled { alpha(p.text, 0.6) } else { p.text },
+        selection: alpha(p.accent, 0.35),
+    }
+}
+
+/// Dialog checkbox: a filled box when checked, a 3:1 edge when not.
+pub fn checkbox(theme: &Theme, status: checkbox_w::Status) -> checkbox_w::Style {
+    let p = Palette::of(theme);
+    let fill = button_fill(&p);
+    let (checked, hovered, disabled) = match status {
+        checkbox_w::Status::Active { is_checked } => (is_checked, false, false),
+        checkbox_w::Status::Hovered { is_checked } => (is_checked, true, false),
+        checkbox_w::Status::Disabled { is_checked } => (is_checked, false, true),
+    };
+    let (background, edge) = match (checked, disabled) {
+        (true, true) => (alpha(fill, 0.55), alpha(fill, 0.55)),
+        (true, false) => (fill, if hovered { p.accent } else { fill }),
+        (false, true) => (p.raised, alpha(p.muted, 0.7)),
+        (false, false) => (p.card, if hovered { p.accent } else { p.border_strong }),
+    };
+    checkbox_w::Style {
+        background: background.into(),
+        icon_color: Color::WHITE,
+        border: Border { color: edge, width: 1.5, radius: 4.0.into() },
+        text_color: Some(if disabled { alpha(p.muted, 0.85) } else { p.text }),
+    }
+}
+
+/// Drop-down field.
+pub fn pick(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let p = Palette::of(theme);
+    let lit = matches!(status, pick_list::Status::Hovered | pick_list::Status::Opened { .. });
+    pick_list::Style {
+        text_color: p.text,
+        placeholder_color: p.muted,
+        handle_color: p.muted,
+        background: p.card.into(),
+        border: Border { color: if lit { p.accent } else { p.border }, width: 1.0, radius: 8.0.into() },
+    }
+}
+
+/// The list a [`pick`] opens.
+pub fn pick_menu(theme: &Theme) -> menu::Style {
+    let p = Palette::of(theme);
+    menu::Style {
+        background: p.card.into(),
+        border: Border { color: p.border, width: 1.0, radius: 8.0.into() },
+        text_color: p.text,
+        selected_text_color: p.text,
+        selected_background: p.raised.into(),
+        shadow: Shadow { color: p.shadow, offset: Vector::new(0.0, 4.0), blur_radius: 12.0 },
     }
 }
 
@@ -343,6 +486,11 @@ pub fn progress(colour: Option<Color>, shimmer: Option<f32>) -> impl Fn(&Theme) 
         let p = Palette::of(theme);
         let bar = match (colour, shimmer) {
             (Some(c), _) => c.into(),
+            (None, None) if is_light(&p) => Background::Gradient(Gradient::Linear(
+                Linear::new(Radians(std::f32::consts::FRAC_PI_2))
+                    .add_stop(0.0, button_fill(&p))
+                    .add_stop(1.0, p.accent),
+            )),
             (None, None) => p.flame(),
             (None, Some(phase)) => {
                 let mut g = Linear::new(Radians(std::f32::consts::FRAC_PI_2)).add_stop(0.0, p.accent);
@@ -360,7 +508,7 @@ pub fn progress(colour: Option<Color>, shimmer: Option<f32>) -> impl Fn(&Theme) 
             }
         };
         progress_bar::Style {
-            background: alpha(p.border, 0.7).into(),
+            background: p.border.into(),
             bar,
             border: Border { radius: 99.0.into(), ..Default::default() },
         }
@@ -406,6 +554,14 @@ mod tests {
             let fill = button_fill(&p);
             let r = ratio(on_button(&p), fill);
             assert!(r >= 4.5, "{name}: button text on the button fill is only {r:.2}:1");
+        }
+    }
+
+    #[test]
+    fn border_strong_is_visible_on_cards() {
+        for (name, p) in [("dark", Palette::dark()), ("light", Palette::light())] {
+            let r = ratio(p.border_strong, p.card);
+            assert!(r >= 3.0, "{name}: border_strong on card is only {r:.2}:1");
         }
     }
 

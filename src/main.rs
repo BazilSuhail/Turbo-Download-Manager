@@ -37,7 +37,6 @@ use tdm::rss_store;
 use tdm::scheduler;
 use tdm::torrent_store::{self, TorrentSource};
 use tdm::transfer;
-use tdm::ui::components;
 use tdm::ui::keymap;
 use tdm::hosts::HostLimits;
 use tdm::ipc::{Advert, Incoming, Inbox};
@@ -78,6 +77,8 @@ const MARK_FLASH: Duration = Duration::from_millis(180);
 const CHECK_SLOT: f32 = 28.0;
 /// Height of the bulk action bar when fully open. It unrolls to this.
 const BAR_HEIGHT: f32 = 44.0;
+/// Approximate height of the status bar, so toasts sit above it.
+const STATUS_BAR_HEIGHT: f32 = 32.0;
 
 /// Left-hand tree selection: everything, one category, or a status folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3394,31 +3395,31 @@ impl App {
         let dialog = if self.torrent_consent {
             // Over the Preferences dialog it was opened from, so it comes first.
             let notice = tdm::ui::options::torrent_notice().map(Message::Options);
-            Some((notice, Message::Options(tdm::ui::options::Message::TorrentConsentCancel), 520.0, true))
+            Some((notice, Some(Message::Options(tdm::ui::options::Message::TorrentConsentCancel)), 520.0, true))
         } else if self.palette.is_some() {
-            Some((self.palette_dialog(&p), Message::PaletteClose, 560.0, false))
+            Some((self.palette_dialog(&p), Some(Message::PaletteClose), 560.0, false))
         } else if self.type_prompt.is_some() {
-            Some((self.type_dialog(&p), Message::TypeKeep, 560.0, true))
+            Some((self.type_dialog(&p), Some(Message::TypeKeep), 560.0, true))
         } else if self.grab.is_some() {
-            Some((self.grab_dialog(&p), Message::GrabClose, 560.0, true))
+            Some((self.grab_dialog(&p), Some(Message::GrabClose), 560.0, true))
         } else if !self.prompts.is_empty() {
-            Some((self.capture_dialog(&p), Message::CaptureCancel, 560.0, true))
+            // A stray backdrop click must not discard the capture: it needs an explicit Cancel.
+            Some((self.capture_dialog(&p), None, 560.0, true))
         } else if self.verify.is_some() {
-            Some((self.verify_dialog(&p), Message::CloseVerify, 560.0, true))
+            Some((self.verify_dialog(&p), Some(Message::CloseVerify), 560.0, true))
         } else if self.batch.is_some() {
-            Some((self.batch_dialog(&p), Message::BatchClose, 560.0, true))
+            Some((self.batch_dialog(&p), Some(Message::BatchClose), 560.0, true))
         } else if self.confirm_delete.is_some() {
-            Some((self.delete_dialog(&p), Message::CancelDelete, 480.0, true))
+            Some((self.delete_dialog(&p), Some(Message::CancelDelete), 480.0, true))
         } else if self.settings_open {
-            Some((self.options_dialog(), Message::SettingsOpen(false), 720.0, false))
+            Some((self.options_dialog(), Some(Message::SettingsOpen(false)), 720.0, false))
         } else if self.browser_guide {
-            Some((self.browser_dialog(&p), Message::CloseBrowserGuide, 560.0, true))
+            Some((self.browser_dialog(&p), Some(Message::CloseBrowserGuide), 560.0, true))
         } else {
             None
         };
         if let Some((content, dismiss, max_w, scroll)) = dialog {
-            layers = layers.push(self.modal(content, dismiss, max_w, scroll));
-        }
+            layers = layers.push(self.modal(content, dismiss, max_w, scroll));        }
         if !self.toasts.is_empty() {
             layers = layers.push(self.toast_layer(&p));
         }
@@ -3448,35 +3449,31 @@ impl App {
         let mut tools = row![].spacing(2).align_y(Alignment::Center);
         for t in assets::TOOLBAR {
             let on = self.can(t.cmd);
-            let colour = if on { p.text } else { alpha(p.muted, 0.45) };
+            let colour = if on { p.text } else { alpha(p.muted, 0.7) };
             let mut b = button(glyph(t.icon, 18.0, colour)).padding(7).style(theme::flat(false));
             if on {
                 b = b.on_press(Message::Command(t.cmd));
             }
             tools = tools.push(tip(b, t.label));
         }
-        let search = container(
-            row![
-                glyph(Icon::Search, 15.0, p.muted),
-                text_input("Search downloads", &self.search)
-                    .id(SEARCH_INPUT)
-                    .on_input(Message::SearchChanged)
-                    // Enter is captured here, so the list never sees it.
-                    .on_submit(Message::SearchSubmit)
-                    .style(theme::bare_input)
-                    .size(13)
-                    .padding([6, 4]),
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center),
-        )
-        .padding([0, 10])
-        .width(Length::Fixed(if compact { 180.0 } else { 260.0 }))
-        .style(move |t: &Theme| container::Style {
-            border: iced::Border { color: Palette::of(t).border, width: 1.0, radius: 99.0.into() },
-            background: Some(Palette::of(t).card.into()),
-            ..Default::default()
-        });
+        let search = row![
+            glyph(Icon::Search, 15.0, p.muted),
+            text_input("Search downloads", &self.search)
+                .id(SEARCH_INPUT)
+                .on_input(Message::SearchChanged)
+                // Enter is captured here, so the list never sees it.
+                .on_submit(Message::SearchSubmit)
+                .style(|t: &Theme, s| {
+                    let mut st = theme::input(t, s);
+                    st.border.radius = 99.0.into();
+                    st
+                })
+                .size(13)
+                .padding([6, 12])
+                .width(Length::Fixed(if compact { 160.0 } else { 240.0 })),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
         let toolbar = row![
             scrollable(tools)
                 .width(Length::Fill)
@@ -3489,7 +3486,7 @@ impl App {
         // Where new downloads are saved. Click to choose another folder. The
         // full path is in the tooltip; narrow windows show only the icon.
         let folder = self.settings.download_dir.display().to_string();
-        let mut folder_row = row![glyph(Icon::Folder, 14.0, p.accent)].spacing(6).align_y(Alignment::Center);
+        let mut folder_row = row![glyph(Icon::Folder, 14.0, p.text)].spacing(6).align_y(Alignment::Center);
         if !compact {
             folder_row = folder_row.push(text(middle_ellipsis(&folder, 32)).size(12).font(iced::Font::MONOSPACE));
         }
@@ -3588,7 +3585,7 @@ impl App {
                     // Commands this build cannot perform are greyed rather
                     // than silently swallowing a click.
                     let works = self.can(*cmd);
-                    let colour = if works { p.text } else { alpha(p.muted, 0.6) };
+                    let colour = if works { p.text } else { alpha(p.muted, 0.75) };
                     let mut line = row![text(*label).size(13).color(colour).wrapping(text::Wrapping::None)].spacing(12);
                     if let Some(a) = accel {
                         line = line.push(space(Length::Fill, Length::Shrink)).push(text(*a).size(11).color(p.muted));
@@ -3607,7 +3604,8 @@ impl App {
         let panel = container(col).width(290).style(theme::card);
         // Title buttons are text plus 20px padding; the mark and wordmark
         // before them are about 90px.
-        let left = 16.0 + 90.0 + MENU_BAR[..index].iter().map(|m| m.title.len() as f32 * 7.4 + 22.0).sum::<f32>();
+        let left = (16.0 + 90.0 + MENU_BAR[..index].iter().map(|m| m.title.len() as f32 * 7.4 + 22.0).sum::<f32>())
+            .min((self.window_width - 290.0 - 8.0).max(0.0));
         stack![
             mouse_area(space(Length::Fill, Length::Fill)).on_press(Message::MenuOpen(None)),
             column![
@@ -3663,7 +3661,7 @@ impl App {
             button(
                 row![
                     space(Length::Fixed(indent), Length::Shrink),
-                    glyph(icon, 16.0, if selected { p.accent } else { p.muted }),
+                    glyph(icon, 16.0, if selected { p.accent } else { p.text }),
                     name,
                     container(text(n.to_string()).size(11).color(if selected { p.text } else { p.muted }))
                         .padding([1, 7])
@@ -3696,8 +3694,8 @@ impl App {
                     heading("BROWSERS"),
                     space(Length::Fill, Length::Shrink),
                     button(text("Add").size(11))
-                        .padding([2, 7])
-                        .style(theme::flat(false))
+                        .padding([2, 8])
+                        .style(theme::accent)
                         .on_press(Message::OpenBrowserGuide),
                 ]
                 .align_y(Alignment::Center)
@@ -3753,10 +3751,11 @@ impl App {
         if total > 0 {
             clear = clear.on_press(Message::ClearMarks);
         }
+        let on_danger = theme::readable_on(p.danger);
         let delete_label = if narrow {
-            row![glyph(Icon::Delete, 14.0, theme::on_button(&p)), text(total.to_string()).size(12).font(bold())]
+            row![glyph(Icon::Delete, 14.0, on_danger), text(total.to_string()).size(12).font(bold())]
         } else {
-            row![glyph(Icon::Delete, 14.0, theme::on_button(&p)), text(format!("Delete {total}")).size(12).font(bold())]
+            row![glyph(Icon::Delete, 14.0, on_danger), text(format!("Delete {total}")).size(12).font(bold())]
         };
         let mut delete = button(delete_label.spacing(6).align_y(Alignment::Center))
             .padding([5, 10])
@@ -3766,7 +3765,7 @@ impl App {
         }
         let delete: Element<'_, Message> = if narrow { tip(delete, "Delete the ticked downloads") } else { delete.into() };
 
-        let tick = checkbox(self.bulk_delete_files).on_toggle(Message::BulkDeleteFiles).size(16);
+        let tick = checkbox(self.bulk_delete_files).on_toggle(Message::BulkDeleteFiles).size(16).style(theme::checkbox);
         let tick: Element<'_, Message> = if narrow {
             tip(tick, "Also delete files from disk")
         } else {
@@ -3887,7 +3886,8 @@ impl App {
             .width(Length::Fill)
             .clip(true);
         let name_el: Element<'a, Message> = if shown != t.name { tip(name_text, t.name.clone()) } else { name_text.into() };
-        let title = row![name_el, container(text(state).size(11).color(state_colour)).padding([2, 9]).style(theme::pill(state_colour))]
+        let state_text = if t.paused { p.muted } else { p.text };
+        let title = row![name_el, container(text(state).size(11).color(state_text)).padding([2, 9]).style(theme::pill(state_colour))]
             .spacing(8)
             .align_y(Alignment::Center);
         let info = column![
@@ -3944,10 +3944,10 @@ impl App {
         });
 
         let icon = e.category_id.map_or(Icon::File, |id| assets::category_icon(Some(id)));
-        let badge = container(glyph(icon, 18.0, p.accent))
+        let badge = container(glyph(icon, 18.0, theme::button_fill(p)))
             .center(36)
             .style(move |t: &Theme| container::Style {
-                background: Some(alpha(Palette::of(t).accent, 0.12).into()),
+                background: Some(alpha(Palette::of(t).accent, 0.18).into()),
                 border: iced::Border { radius: 10.0.into(), ..Default::default() },
                 ..Default::default()
             });
@@ -4082,7 +4082,7 @@ impl App {
     fn row_actions<'a>(&'a self, e: &'a Entry, p: &Palette) -> Element<'a, Message> {
         let finished = e.snapshot.status == Status::Finished;
         let action = |icon: Icon, label: &str, msg: Option<Message>| {
-            let colour = if msg.is_some() { p.text } else { alpha(p.muted, 0.5) };
+            let colour = if msg.is_some() { p.text } else { alpha(p.muted, 0.75) };
             let mut b = button(row![glyph(icon, 14.0, colour), text(label.to_owned()).size(12).color(colour)].spacing(6).align_y(Alignment::Center))
                 .padding([5, 10])
                 .style(theme::flat(false));
@@ -4111,14 +4111,14 @@ impl App {
             actions = actions.push(
                 button(text(middle_ellipsis(&q.name, 18)).size(12))
                     .padding([5, 8])
-                    .style(theme::flat(q.id == current))
+                    .style(theme::chip(q.id == current))
                     .on_press(Message::MoveToQueue(e.id, q.id)),
             );
         }
         actions = actions.push(
             button(text("No queue").size(12))
                 .padding([5, 8])
-                .style(theme::flat(current == 0))
+                .style(theme::chip(current == 0))
                 .on_press(Message::MoveToQueue(e.id, 0)),
         );
         container(scrollable(actions).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(3).scroller_width(3))))
@@ -4196,15 +4196,17 @@ impl App {
 
     /// A dimmed backdrop that fades in, with the dialog settling from a
     /// slight zoom. Clicking the backdrop dismisses.
-    fn modal<'a>(&self, content: Element<'a, Message>, dismiss: Message, max_w: f32, scroll: bool) -> Element<'a, Message> {
+    fn modal<'a>(&self, content: Element<'a, Message>, dismiss: Option<Message>, max_w: f32, scroll: bool) -> Element<'a, Message> {
         let t = ease(self.overlay_anim.interpolate(0.0, 1.0, self.now));
-        let backdrop = mouse_area(
+        let mut backdrop = mouse_area(
             container(space(Length::Fill, Length::Fill)).style(move |_| container::Style {
                 background: Some(Color { a: 0.5 * t, ..Color::BLACK }.into()),
                 ..Default::default()
             }),
-        )
-        .on_press(dismiss);
+        );
+        if let Some(d) = dismiss {
+            backdrop = backdrop.on_press(d);
+        }
         // Cap the card so a wide window cannot stretch a dialog across the
         // screen. It fills up to `max_w`, then stays centred. A scrolling
         // dialog takes the window's height, so its content scrolls inside it.
@@ -4237,7 +4239,7 @@ impl App {
         let cmds = keymap::commands();
         let hits = keymap::filter(query, &cmds);
         let mut list = column![].spacing(2);
-        for &i in hits.iter().take(12) {
+        for (rank, &i) in hits.iter().take(12).enumerate() {
             let cmd = cmds[i];
             let mut line = row![text(cmd.label).size(13).width(Length::Fill)].spacing(8).align_y(Alignment::Center);
             if let Some(keys) = cmd.shortcut {
@@ -4247,7 +4249,8 @@ impl App {
                 button(line)
                     .width(Length::Fill)
                     .padding([6, 10])
-                    .style(theme::flat(false))
+                    // The first hit is what Enter runs, so it is shown as selected.
+                    .style(theme::flat(rank == 0))
                     .on_press(Message::PaletteRun(cmd.id)),
             );
         }
@@ -4261,13 +4264,18 @@ impl App {
             .style(theme::input)
             .size(13)
             .padding([8, 12]);
-        let body: Element<'_, Message> = column![input, scrollable(list).height(Length::Fixed(300.0))].spacing(10).into();
-        let actions: Element<'_, Message> = button(text("Close").size(13))
-            .padding([7, 18])
-            .style(theme::flat(false))
-            .on_press(Message::PaletteClose)
-            .into();
-        components::dialog_shell(p, "Command palette", body, actions)
+        // The modal already draws the card, so this is a plain column.
+        column![
+            text("Command palette").size(16).font(bold()),
+            input,
+            scrollable(list).height(Length::Fixed(300.0)),
+            row![
+                space(Length::Fill, Length::Shrink),
+                button(text("Close").size(13)).padding([7, 18]).style(theme::ghost).on_press(Message::PaletteClose),
+            ],
+        ]
+        .spacing(10)
+        .into()
     }
 
     /// The type warning: what the file is, and what the user can do about it.
@@ -4288,8 +4296,7 @@ impl App {
             ),
             text(format!("The content is {}.", t.kind.label())).size(13).wrapping(text::Wrapping::WordOrGlyph),
         ]
-        .spacing(14)
-        .max_width(440);
+        .spacing(14);
         if let Some(ct) = &t.content_type {
             body = body.push(tip_long(
                 text(format!("The server said it was {}.", middle_ellipsis(ct, 36))).size(12).color(p.muted),
@@ -4299,7 +4306,7 @@ impl App {
         if entry.scanning {
             body = body.push(text("Renaming is available once the virus scan finishes.").size(12).color(p.muted));
         }
-        let open_page = button(text("Open the page in browser").size(13)).padding([7, 18]);
+        let open_page = button(text("Open page").size(13)).padding([7, 18]);
         let open_page = if web {
             open_page.style(theme::accent).on_press(Message::TypeOpenPage(t.id))
         } else {
@@ -4353,7 +4360,8 @@ impl App {
                     })
                     .on_toggle(Message::ConfirmDeleteToggleFile)
                     .size(16)
-                    .text_size(13),
+                    .text_size(13)
+                    .style(theme::checkbox),
                 row![
                     space(Length::Fill, Length::Shrink),
                     button(text("Cancel").size(13)).padding([7, 18]).style(theme::flat(false)).on_press(Message::CancelDelete),
@@ -4362,7 +4370,6 @@ impl App {
                 .spacing(8),
             ]
             .spacing(14)
-            .max_width(440)
             .into();
         }
 
@@ -4386,8 +4393,7 @@ impl App {
             .align_y(Alignment::Center),
             names,
         ]
-        .spacing(14)
-        .max_width(440);
+        .spacing(14);
         if confirm.running > 0 {
             body = body.push(text(format!("{} running {} will be stopped", confirm.running, if confirm.running == 1 { "download" } else { "downloads" })).size(13).color(p.danger));
         }
@@ -4402,7 +4408,8 @@ impl App {
                 .label("Also delete the files from disk")
                 .on_toggle(Message::ConfirmDeleteToggleFile)
                 .size(16)
-                .text_size(13),
+                .text_size(13)
+                .style(theme::checkbox),
         );
         if tier == Tier::Typed {
             // Enter submits only once the count is right, so a stray Enter cannot delete.
@@ -4478,7 +4485,8 @@ impl App {
                 .wrapping(text::Wrapping::WordOrGlyph)
                 .height(140)
                 .size(13)
-                .padding(10),
+                .padding(10)
+                .style(theme::editor),
             text("Mirror links (optional, one per line). If a connection keeps failing, TDM tries these.")
                 .size(12)
                 .color(p.muted),
@@ -4488,7 +4496,8 @@ impl App {
                 .wrapping(text::Wrapping::WordOrGlyph)
                 .height(70)
                 .size(13)
-                .padding(10),
+                .padding(10)
+                .style(theme::editor),
             summary_line,
             row![
                 space(Length::Fill, Length::Shrink),
@@ -4532,9 +4541,17 @@ impl App {
                 } else {
                     (Icon::Close, "Mismatch \u{2014} the file differs from the published hash", p.danger)
                 };
-                container(row![glyph(icon, 14.0, c), text(label).size(12).color(c)].spacing(6).align_y(Alignment::Center))
-                    .padding([4, 10])
-                    .style(theme::pill(c))
+                container(
+                    row![
+                        glyph(icon, 14.0, c),
+                        text(label).size(12).color(c).width(Length::Fill).wrapping(text::Wrapping::WordOrGlyph),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding([4, 10])
+                .style(theme::pill(c))
                     .into()
             }
             _ => space(Length::Shrink, Length::Shrink).into(),
@@ -4618,7 +4635,7 @@ impl App {
         let size = item.size.map_or("unknown size".to_owned(), |s| fmt_bytes(s as f64));
         let folder = self.settings.destination_for(&name).parent().map(|d| d.display().to_string()).unwrap_or_default();
         let more = self.prompts.len() - 1;
-        column![
+        let mut body = column![
             row![glyph(Icon::Add, 20.0, p.accent), text("Download file").size(16).font(bold())]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -4638,16 +4655,20 @@ impl App {
                 ),
             ]
             .spacing(4),
-            text(if more > 0 { format!("{more} more waiting") } else { String::new() }).size(11).color(p.muted),
+        ]
+        .spacing(10);
+        if more > 0 {
+            body = body.push(text(format!("{more} more waiting")).size(11).color(p.muted));
+        }
+        body.push(
             row![
                 space(Length::Fill, Length::Shrink),
-                button(text("Cancel").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureCancel),
+                button(text("Cancel").size(13)).padding([7, 16]).style(theme::ghost).on_press(Message::CaptureCancel),
                 button(text("Add to queue").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureQueue),
-                button(text("Download now").size(13)).padding([7, 16]).style(theme::accent).on_press(Message::CaptureStart),
+                button(text("Download now").size(13).font(bold())).padding([7, 16]).style(theme::accent).on_press(Message::CaptureStart),
             ]
             .spacing(8),
-        ]
-        .spacing(10)
+        )
         .max_width(520)
         .into()
     }
@@ -4658,7 +4679,7 @@ impl App {
         let name = capture_name(item);
         let folder = existing.parent().map(|d| d.display().to_string()).unwrap_or_default();
         let more = self.prompts.len() - 1;
-        column![
+        let mut body = column![
             row![glyph(Icon::Shield, 20.0, p.warning), text("Already downloaded").size(16).font(bold())]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -4671,16 +4692,20 @@ impl App {
                 text(format!("Saved in: {}", middle_ellipsis(&folder, 52))).size(12).color(p.muted).wrapping(text::Wrapping::None),
                 folder,
             ),
-            text(if more > 0 { format!("{more} more waiting") } else { String::new() }).size(11).color(p.muted),
+        ]
+        .spacing(10);
+        if more > 0 {
+            body = body.push(text(format!("{more} more waiting")).size(11).color(p.muted));
+        }
+        body.push(
             row![
                 space(Length::Fill, Length::Shrink),
-                button(text("Cancel").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureCancel),
+                button(text("Cancel").size(13)).padding([7, 16]).style(theme::ghost).on_press(Message::CaptureCancel),
                 button(text("Open folder").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureOpenExisting),
-                button(text("Download again").size(13)).padding([7, 16]).style(theme::accent).on_press(Message::CaptureAgain),
+                button(text("Download again").size(13).font(bold())).padding([7, 16]).style(theme::accent).on_press(Message::CaptureAgain),
             ]
             .spacing(8),
-        ]
-        .spacing(10)
+        )
         .max_width(520)
         .into()
     }
@@ -4730,7 +4755,7 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        column![
+        let mut body = column![
             row![glyph(Icon::Add, 20.0, p.accent), text("Download file").size(16).font(bold())]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -4741,22 +4766,26 @@ impl App {
                 item.url.clone(),
             ),
             column![text(format!("Size: {size}")).size(12).color(p.muted), location].spacing(4),
-            text(if more > 0 { format!("{more} more waiting") } else { String::new() }).size(11).color(p.muted),
+        ]
+        .spacing(10);
+        if more > 0 {
+            body = body.push(text(format!("{more} more waiting")).size(11).color(p.muted));
+        }
+        body.push(
             row![
                 space(Length::Fill, Length::Shrink),
-                button(text("Cancel").size(13)).padding([7, 16]).style(theme::flat(false)).on_press(Message::CaptureCancel),
+                button(text("Cancel").size(13)).padding([7, 16]).style(theme::ghost).on_press(Message::CaptureCancel),
                 button(text("Add to queue").size(13))
                     .padding([7, 16])
                     .style(theme::flat(false))
                     .on_press_maybe(valid.then_some(Message::CaptureQueue)),
-                button(text("Download now").size(13))
+                button(text("Download now").size(13).font(bold()))
                     .padding([7, 16])
                     .style(theme::accent)
                     .on_press_maybe(valid.then_some(Message::CaptureStart)),
             ]
             .spacing(8),
-        ]
-        .spacing(10)
+        )
         .max_width(520)
         .into()
     }
@@ -4825,7 +4854,9 @@ impl App {
         }
         let step = |n: &'static str, title: &'static str, detail: &'static str| {
             row![
-                container(text(n).size(12)).padding([2, 9]).style(theme::pill(p.accent)),
+                container(text(n).size(12).color(if theme::is_light(p) { theme::button_fill(p) } else { p.text }))
+                    .padding([2, 9])
+                    .style(theme::pill(p.accent)),
                 column![text(title).size(13), text(detail).size(11).color(p.muted)].spacing(2),
             ]
             .spacing(10)
@@ -4866,7 +4897,8 @@ impl App {
                     .label("Capture downloads from the browser extension")
                     .on_toggle(Message::ToggleCapture)
                     .size(16)
-                    .text_size(13),
+                    .text_size(13)
+                    .style(theme::checkbox),
                 space(Length::Fill, Length::Shrink),
                 button(text("Done").size(13).font(bold())).padding([7, 18]).style(theme::accent).on_press(Message::SettingsOpen(false)),
             ]
@@ -4888,10 +4920,10 @@ impl App {
             let left = t.life().saturating_sub(age);
             let a = enter.min(left.as_secs_f32() / TOAST_FADE.as_secs_f32()).clamp(0.0, 1.0);
             let (icon, c) = match t.kind {
-                ToastKind::Info => (Icon::Check, p.accent),
+                ToastKind::Info => (Icon::More, p.accent),
                 ToastKind::Success => (Icon::Finished, p.success),
                 ToastKind::Warning => (Icon::Shield, p.warning),
-                ToastKind::Error => (Icon::Close, p.danger),
+                ToastKind::Error => (Icon::Shield, p.danger),
             };
             let icon = if t.offer.is_some() { Icon::Add } else { icon };
             let mut line = row![
@@ -4902,14 +4934,25 @@ impl App {
             .align_y(Alignment::Center);
             if t.offer.is_some() {
                 line = line.push(
-                    button(text("Download").size(12).font(bold())).padding([4, 10]).style(theme::accent).on_press(Message::ToastAction(t.id)),
+                    button(text("Download").size(12).font(bold()).color(alpha(theme::on_button(p), a)))
+                        .padding([4, 10])
+                        .style(move |th: &Theme, s| {
+                            let mut st = theme::accent(th, s);
+                            st.background = st.background.map(|b| match b {
+                                iced::Background::Color(c) => iced::Background::Color(alpha(c, c.a * a)),
+                                other => other,
+                            });
+                            st.border.color = alpha(st.border.color, st.border.color.a * a);
+                            st
+                        })
+                        .on_press(Message::ToastAction(t.id)),
                 );
             }
             line = line.push(
                 button(glyph(Icon::Close, 12.0, alpha(p.muted, a))).padding(4).style(theme::flat(false)).on_press(Message::DismissToast(t.id)),
             );
             let (bg, border, shadow) = (alpha(p.card, a), alpha(c, 0.5 * a), alpha(p.shadow, a));
-            let card = container(line).padding([10, 12]).width(320).style(move |_| container::Style {
+            let card = container(line).padding([10, 12]).max_width(320).width(Length::Fill).style(move |_| container::Style {
                 background: Some(bg.into()),
                 border: iced::Border { color: border, width: 1.0, radius: 12.0.into() },
                 shadow: iced::Shadow { color: shadow, offset: Vector::new(0.0, 6.0), blur_radius: 20.0 },
@@ -4921,7 +4964,7 @@ impl App {
         container(col)
             .align_right(Length::Fill)
             .align_bottom(Length::Fill)
-            .padding(iced::Padding { top: 0.0, right: 16.0, bottom: 40.0, left: 16.0 })
+            .padding(iced::Padding { top: 0.0, right: 16.0, bottom: STATUS_BAR_HEIGHT + 8.0, left: 16.0 })
             .into()
     }
 
@@ -5149,9 +5192,9 @@ fn bold() -> iced::Font {
 /// fade with a row's tick animation.
 fn check_box<'a>(on: f32, p: &Palette) -> Element<'a, Message> {
     let on = on.clamp(0.0, 1.0);
-    let accent = p.accent;
+    let accent = theme::button_fill(p);
     let edge = blend(p.muted, accent, on);
-    container(glyph(Icon::Check, 14.0, alpha(theme::on_button(&p), on)))
+    container(glyph(Icon::Check, 14.0, alpha(theme::on_button(p), on)))
         .center(20)
         .style(move |_| container::Style {
             background: Some(alpha(accent, on).into()),
