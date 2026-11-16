@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import "./media-core.js";
 
-const { filenameFromTitle, isStreamed, mediaKind, pickStream, scan, sourcesOf } = globalThis.TdmMedia;
+const { buttonLabel, describeChoice, isDecorative, kindName, filenameFromTitle, isStreamed, mediaKind, pickStream, scan, sourcesOf } = globalThis.TdmMedia;
 
 // Kind by extension, then by Content-Type; never for non-http schemes
 assert.equal(mediaKind("https://e.test/v/master.m3u8?token=1"), "hls");
@@ -88,3 +88,25 @@ assert.deepEqual(scan(doc), {
     { url: "https://e.test/s.mp3", kind: "audio" },
   ],
 });
+
+// Button labels and menu rows
+assert.equal(buttonLabel("https://e.test/a.mp4?x=1", "video"), "Download video (MP4)");
+assert.equal(buttonLabel("https://e.test/a.mp3"), "Download audio (MP3)");
+assert.equal(buttonLabel("https://e.test/m.m3u8", "hls"), "Download HLS stream");
+assert.equal(buttonLabel("https://e.test/m.mpd"), "Download DASH stream");
+assert.equal(buttonLabel("https://e.test/play?id=1", "video"), "Download video");
+assert.equal(kindName("https://e.test/a.webm", "video"), "WEBM video");
+assert.equal(kindName("https://e.test/x", undefined), "file");
+const row = describeChoice({ url: "https://cdn.e.test/path/My%20Clip.mp4", kind: "video" });
+assert.equal(row.label, "MP4 video");
+assert.equal(row.detail, "My Clip.mp4 · cdn.e.test");
+assert.ok(describeChoice({ url: "https://e.test/" + "a".repeat(200) + ".mp4", kind: "video" }).detail.length <= 38);
+assert.equal(describeChoice({ url: "https://e.test/", kind: "hls" }).detail, "e.test");
+
+// Decorative background clips
+assert.equal(isDecorative({ muted: true, loop: true, controls: false, autoplay: true, width: 1920, height: 1080 }), true);
+assert.equal(isDecorative({ muted: true, loop: true, controls: false, autoplay: false, width: 300, height: 200 }), true);
+assert.equal(isDecorative({ muted: true, loop: true, controls: false, autoplay: false, width: 1920, height: 1080 }), false);
+assert.equal(isDecorative({ muted: true, loop: true, controls: true, autoplay: true, width: 300, height: 200 }), false);
+assert.equal(isDecorative({ muted: false, loop: true, controls: false, autoplay: true, width: 300, height: 200 }), false);
+assert.equal(isDecorative({ muted: true, loop: false, controls: false, autoplay: true, width: 300, height: 200 }), false);

@@ -203,6 +203,9 @@ pub struct Snapshot {
     /// The digest the server announced with the probe, for the checksum step.
     /// The downloaded bytes do not depend on it.
     pub server_hash: Option<crate::serverhash::ExpectedHash>,
+    /// Per-connection ranges as (start, end inclusive, bytes done), in file
+    /// order, at most 32. Empty for streams of unknown size.
+    pub parts: Vec<(u64, u64, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -929,6 +932,7 @@ impl Download {
                 total,
                 is_ftp,
                 attempts: self.attempts,
+                retry_after: Mutex::new(None),
             };
             tasks.spawn(async move { (index, worker.run().await) });
         };
@@ -1216,7 +1220,18 @@ impl Download {
     ) -> Result<u64, Error> {
         let snapshot_segments = segments.lock().expect("segments lock").clone();
         let done: u64 = snapshot_segments.iter().map(|s| s.done).sum();
-        self.shared.lock().expect("snapshot lock").done = done;
+        {
+            let mut parts: Vec<(u64, u64, u64)> = snapshot_segments
+                .iter()
+                .filter(|s| s.end != u64::MAX)
+                .map(|s| (s.start, s.end, s.done))
+                .collect();
+            parts.sort_unstable();
+            parts.truncate(32);
+            let mut shared = self.shared.lock().expect("snapshot lock");
+            shared.done = done;
+            shared.parts = parts;
+        }
 
         if last_saved.as_ref() == Some(&snapshot_segments) {
             return Ok(done);
@@ -1517,6 +1532,34 @@ struct Worker {
     total: Option<u64>,
     is_ftp: bool,
     attempts: u32,
+    /// Set by `fetch_once` from a `Retry-After` header on a 429/503, and
+    /// consumed by the retry loop as the minimum wait.
+    retry_after: Mutex<Option<Duration>>,
+}
+
+/// Bytes staged per segment before one seek+write+flush.
+const WRITE_BUFFER: usize = 512 * 1024;
+
+/// Longest wait a server's `Retry-After` can impose on one retry.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+
+/// Parse a `Retry-After` given in delta-seconds (HTTP-dates are ignored).
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(|s| Duration::from_secs(s).min(MAX_RETRY_WAIT))
+}
+
+/// Exponential backoff with jitter: 0.5 s, 1 s, 2 s ... capped at 30 s, with
+/// the top half randomised so parallel segments do not retry in lockstep. A
+/// server-supplied `Retry-After` is a floor.
+fn backoff_delay(attempt: u32, retry_after: Option<Duration>, jitter: u64) -> Duration {
+    let base = 500u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(6)).min(30_000);
+    let ms = base / 2 + jitter % (base / 2 + 1);
+    Duration::from_millis(ms).max(retry_after.unwrap_or_default())
+}
+
+fn jitter_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
 }
 
 impl Worker {
@@ -1565,10 +1608,39 @@ impl Worker {
                     // Switch to the next mirror before retrying, so a bad node
                     // is not hit again on every attempt.
                     current = (current + 1) % self.urls.len();
-                    tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+                    let hint = self.retry_after.lock().expect("retry_after lock").take();
+                    tokio::time::sleep(backoff_delay(attempt, hint, jitter_seed())).await;
                 }
             }
         }
+    }
+
+    /// Write the staged bytes at `pos`, then record them as done.
+    async fn flush_buf(&self, buf: &mut Vec<u8>, pos: &mut u64) -> Result<(), Error> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // Write first, clamp after: a split can move our end while the write
+        // is in flight. Bytes written past the new end are identical to what
+        // the new owner writes at the same offsets, so they are harmless, but
+        // they must not be counted as ours.
+        {
+            let mut file = self.file.lock().await;
+            file.seek(std::io::SeekFrom::Start(*pos)).await.map_err(write_error)?;
+            file.write_all(buf).await.map_err(write_error)?;
+            file.flush().await.map_err(write_error)?;
+        }
+        let mut segments = self.segments.lock().expect("segments lock");
+        let seg = &mut segments[self.index];
+        let keep = seg
+            .end
+            .saturating_add(1)
+            .saturating_sub(seg.start.saturating_add(seg.done))
+            .min(buf.len() as u64);
+        seg.done += keep;
+        *pos += buf.len() as u64;
+        buf.clear();
+        Ok(())
     }
 
     /// Bytes this segment has written so far.
@@ -1641,6 +1713,14 @@ impl Worker {
         }
         let resp = request.send().await?;
         let status = resp.status().as_u16();
+        if matches!(status, 429 | 503) {
+            let hint = resp
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after);
+            *self.retry_after.lock().expect("retry_after lock") = hint;
+        }
         if self.ranged && status != 206 {
             // Only a 200 means "I ignored your Range" (or, with If-Range sent,
             // "the file changed"). Anything else is an ordinary HTTP failure,
@@ -1691,58 +1771,56 @@ impl Worker {
             }
         }
 
-        let mut pos = from;
+        // Bytes are staged in `buf` and hit the disk in large writes. `done`
+        // (what the sidecar persists) only advances after a flush, so a resume
+        // never skips bytes that are not on disk.
+        let mut buf: Vec<u8> = Vec::with_capacity(WRITE_BUFFER);
+        let mut buf_pos = from;
         let mut body = resp.bytes_stream();
-        // The limit is per read, not per body: a read that waits longer than
-        // the timeout is a stall, however large the segment is.
-        while let Some(chunk) = tokio::time::timeout(self.timeout, body.next())
-            .await
-            .map_err(|_| Error::Stalled)?
-        {
-            if self.stop.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            let chunk = chunk?;
-
-            // Our end may have moved while this request was in flight: the
-            // coordinator can hand the back half of this range to a new
-            // connection. Anything past the new end belongs to that worker, so
-            // write only up to it and stop. Writing the whole chunk would
-            // duplicate bytes the other connection is already fetching.
-            let (take, shrunk) = {
-                let segments = self.segments.lock().expect("segments lock");
-                let seg = &segments[self.index];
-                // `end` is u64::MAX for an open-ended stream, so the +1 has to
-                // saturate rather than wrap.
-                let wanted = seg
-                    .end
-                    .saturating_add(1)
-                    .saturating_sub(seg.start.saturating_add(seg.done));
-                let take = (chunk.len() as u64).min(wanted) as usize;
-                (take, take < chunk.len())
-            };
-
-            if take > 0 {
-                // Flush before recording progress, never after. A buffered
-                // write is not on disk yet; if the 500 ms checkpoint ran in
-                // between it would persist a `done` ahead of the bytes that
-                // actually exist, and a resume would skip them.
-                {
-                    let mut file = self.file.lock().await;
-                    file.seek(std::io::SeekFrom::Start(pos)).await.map_err(write_error)?;
-                    file.write_all(&chunk[..take]).await.map_err(write_error)?;
-                    file.flush().await.map_err(write_error)?;
+        let result: Result<(), Error> = async {
+            // The limit is per read, not per body: a read that waits longer than
+            // the timeout is a stall, however large the segment is.
+            while let Some(chunk) = tokio::time::timeout(self.timeout, body.next())
+                .await
+                .map_err(|_| Error::Stalled)?
+            {
+                if self.stop.load(Ordering::SeqCst) {
+                    return Ok(());
                 }
-                pos += take as u64;
-                let mut segments = self.segments.lock().expect("segments lock");
-                segments[self.index].done += take as u64;
+                let chunk = chunk?;
+
+                // Our end may have moved while this request was in flight: the
+                // coordinator can hand the back half of this range to a new
+                // connection. Write only up to the new end and stop.
+                let (take, shrunk) = {
+                    let segments = self.segments.lock().expect("segments lock");
+                    let seg = &segments[self.index];
+                    let wanted = seg
+                        .end
+                        .saturating_add(1)
+                        .saturating_sub(seg.start.saturating_add(seg.done))
+                        .saturating_sub(buf.len() as u64);
+                    let take = (chunk.len() as u64).min(wanted) as usize;
+                    (take, take < chunk.len())
+                };
+                buf.extend_from_slice(&chunk[..take]);
+                if buf.len() >= WRITE_BUFFER {
+                    self.flush_buf(&mut buf, &mut buf_pos).await?;
+                }
+                if shrunk {
+                    break;
+                }
+                self.rate.account(take as u64).await;
+                self.own_rate.account(take as u64).await;
             }
-            if shrunk {
-                break;
-            }
-            self.rate.account(take as u64).await;
-            self.own_rate.account(take as u64).await;
+            Ok(())
         }
+        .await;
+        // Always land what was received (stop, pause, error, end of body)
+        // before deciding the outcome, so retries resume from real progress.
+        let flushed = self.flush_buf(&mut buf, &mut buf_pos).await;
+        result?;
+        flushed?;
 
         let mut segments = self.segments.lock().expect("segments lock");
         let seg = &mut segments[self.index];
@@ -1871,6 +1949,21 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_grows_stays_jittered_and_honours_retry_after() {
+        for jitter in [0, 7, u64::MAX] {
+            let d1 = backoff_delay(1, None, jitter);
+            assert!(d1 >= Duration::from_millis(250) && d1 <= Duration::from_millis(500));
+            let d3 = backoff_delay(3, None, jitter);
+            assert!(d3 >= Duration::from_millis(1000) && d3 <= Duration::from_millis(2000));
+            assert!(backoff_delay(99, None, jitter) <= Duration::from_secs(30));
+        }
+        assert_eq!(backoff_delay(1, Some(Duration::from_secs(5)), 0), Duration::from_secs(5));
+        assert_eq!(parse_retry_after(" 3 "), Some(Duration::from_secs(3)));
+        assert_eq!(parse_retry_after("99999"), Some(MAX_RETRY_WAIT));
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+    }
 
     #[test]
     fn only_transient_statuses_are_retried() {

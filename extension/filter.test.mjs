@@ -1,6 +1,7 @@
 // Self-check for the capture decision. Run: node extension/filter.test.mjs
 // Silence plus exit code 0 means pass.
 import assert from "node:assert/strict";
+import { captureSuspended, logEntry, mergeHosts } from "./filter.js";
 import { belowMinSize, extensionOf, hostExcepted, httpUrl, isTorrentLink, normalizeExtension, shouldCapture } from "./filter.js";
 
 const lists = { captureExtensions: ["zip", "exe"], exceptionHosts: ["example.com"] };
@@ -75,3 +76,23 @@ assert.equal(belowMinSize(2000, 1000), false);
 assert.equal(belowMinSize(-1, 1000), false, "unknown size (-1) is not below");
 assert.equal(belowMinSize(0, 1000), false, "unknown size (0) is not below");
 assert.equal(belowMinSize(500, 0), false, "no floor set");
+
+// Pause ("let the browser handle it"): only a future numeric timestamp suspends
+assert.equal(captureSuspended(1000, 2000), true);
+assert.equal(captureSuspended(2000, 2000), false);
+assert.equal(captureSuspended(1000, undefined), false);
+assert.equal(captureSuspended(1000, "2000"), false);
+assert.equal(captureSuspended(1000, NaN), false);
+
+// User exclusions merge with the app's, de-duplicated and lower-cased
+assert.deepEqual(mergeHosts(["a.com"], ["A.com", " b.org "]), ["a.com", "b.org"]);
+assert.deepEqual(mergeHosts(undefined, null), []);
+assert.equal(
+  shouldCapture(httpUrl("https://cdn.b.org/x.zip"), "x.zip", { captureExtensions: ["zip"], exceptionHosts: mergeHosts([], ["b.org"]) }),
+  false,
+);
+
+// Capture log keeps host and file name, never the URL or its query
+const row = logEntry(5, "https://e.test/p/x.zip?token=secret", "x.zip", "captured", "sent to TDM");
+assert.deepEqual(row, { t: 5, host: "e.test", file: "x.zip", outcome: "captured", reason: "sent to TDM" });
+assert.equal(JSON.stringify(row).includes("secret"), false);

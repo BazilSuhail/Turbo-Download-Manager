@@ -144,5 +144,61 @@
     return { title: doc.title || "", items, streamed };
   }
 
-  root.TdmMedia = { filenameFromTitle, isStreamed, mediaKind, pickStream, scan, sourcesOf };
+  const KIND_NAMES = { hls: "HLS stream", dash: "DASH stream", video: "video", audio: "audio" };
+
+  /// Short name for what a URL/kind will send: "MP4 video", "HLS stream", ...
+  function kindName(raw, kind) {
+    const u = http(raw);
+    const ext = u ? extension(u) : "";
+    const k = kind || mediaKind(raw);
+    if ((k === "video" || k === "audio") && BY_EXTENSION.has(ext)) return `${ext.toUpperCase()} ${k}`;
+    return KIND_NAMES[k] || "file";
+  }
+
+  /// Button text for a choice: "Download video (MP4)", "Download HLS stream".
+  function buttonLabel(raw, kind) {
+    const k = kind || mediaKind(raw);
+    if (k === "hls" || k === "dash") return `Download ${KIND_NAMES[k]}`;
+    const u = http(raw);
+    const ext = u ? extension(u) : "";
+    const what = k === "audio" ? "audio" : k === "video" ? "video" : "media";
+    return BY_EXTENSION.has(ext) ? `Download ${what} (${ext.toUpperCase()})` : `Download ${what}`;
+  }
+
+  /// "kind label + shortened filename/host" for a menu row.
+  function describeChoice(item, max = 38) {
+    const u = http(item && item.url);
+    let name = "";
+    if (u) {
+      try {
+        name = decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || "");
+      } catch (_) {
+        name = u.pathname.split("/").filter(Boolean).pop() || "";
+      }
+      name = name.replace(UNSAFE, " ").trim();
+    }
+    const tail = name ? `${name} · ${u.hostname}` : u ? u.hostname : "";
+    const short = tail.length > max ? `${tail.slice(0, max - 1)}…` : tail;
+    return { label: kindName(item && item.url, item && item.kind), detail: short };
+  }
+
+  /// Muted looping autoplay without controls: a decorative background clip.
+  function isDecorative(v) {
+    if (!v || v.controls) return false;
+    const small = (v.width || 0) * (v.height || 0) < 640 * 360;
+    return !!(v.muted && v.loop && v.autoplay) || (!!v.muted && !!v.loop && small);
+  }
+
+  root.TdmMedia = {
+    buttonLabel,
+    describeChoice,
+    filenameFromTitle,
+    isDecorative,
+    isStreamed,
+    kindName,
+    mediaKind,
+    pickStream,
+    scan,
+    sourcesOf,
+  };
 })(globalThis);

@@ -14,12 +14,13 @@
   globalThis.__tdmMediaPill = true;
 
   const api = globalThis.browser ?? globalThis.chrome;
-  const { isStreamed, pickStream, sourcesOf } = globalThis.TdmMedia;
+  const { buttonLabel, describeChoice, isDecorative, isStreamed, mediaKind, pickStream, sourcesOf } = globalThis.TdmMedia;
 
   const MIN_W = 120; // smaller elements are icons/previews, not something to save
   const MIN_H = 60;
   const MISS_RETRY_MS = 2000;
   const LABEL = "Download media with TDM";
+  const DECORATIVE_HOVER_MS = 600; // muted looping background clips need a deliberate hover
   // Images are offered only when large enough to be a picture worth saving.
   const IMG_MIN_W = 160;
   const IMG_MIN_H = 120;
@@ -50,6 +51,17 @@
     .go[aria-busy="true"] { opacity: .75; cursor: progress; }
     .go.ok { background: #15803d; color: #fff; }
     .go.err { background: #b91c1c; color: #fff; }
+    .more { padding: 7px 7px; opacity: .8; }
+    .more:hover { opacity: 1; background: rgba(255,255,255,.08); }
+    .menu { position: absolute; top: calc(100% + 6px); right: 0; min-width: 220px; max-width: 320px;
+      padding: 4px; border-radius: 12px; background: rgba(0,0,0,.94); color: #f5f5f5;
+      font: 500 12px/1.3 system-ui, -apple-system, "Segoe UI", sans-serif;
+      box-shadow: 0 8px 26px rgba(0,0,0,.4), inset 0 0 0 1px rgba(255,255,255,.1); }
+    .menu[hidden] { display: none; }
+    .menu button { display: block; width: 100%; padding: 7px 9px; border-radius: 8px; white-space: normal; }
+    .menu button:hover, .menu button:focus-visible { background: rgba(255,255,255,.12); }
+    .menu small { display: block; opacity: .65; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .menu .best b::after { content: " · best"; color: #FF9A4D; font-weight: 500; }
     .x { padding: 7px 9px; opacity: .7; }
     .x:hover { opacity: 1; background: rgba(255,255,255,.08); }
     button:focus-visible { outline: 2px solid #FF7A1A; outline-offset: 2px; }
@@ -58,7 +70,9 @@
       button:focus-visible { outline-color: #F06A10; }
       .pill { background: rgba(255,255,255,.94); color: #111111;
               box-shadow: 0 6px 22px rgba(0,0,0,.18), inset 0 0 0 1px rgba(0,0,0,.08); }
-      .x:hover { background: rgba(0,0,0,.06); }
+      .x:hover, .more:hover { background: rgba(0,0,0,.06); }
+      .menu { background: rgba(255,255,255,.97); color: #111; box-shadow: 0 8px 26px rgba(0,0,0,.2), inset 0 0 0 1px rgba(0,0,0,.1); }
+      .menu button:hover, .menu button:focus-visible { background: rgba(0,0,0,.07); }
     }
     @keyframes in { from { opacity: 0; transform: translateY(-4px) scale(.96); } }
     @media (prefers-reduced-motion: reduce) { .pill { animation: none; } button { transition: none; } }
@@ -97,8 +111,21 @@
   close.textContent = "×";
   close.title = "Hide the TDM button for this media";
   close.setAttribute("aria-label", close.title);
-  pill.append(go, close);
-  root.append(pill);
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "more";
+  more.textContent = "▾";
+  more.hidden = true;
+  more.title = "Choose which stream or file to send";
+  more.setAttribute("aria-label", more.title);
+  more.setAttribute("aria-haspopup", "menu");
+  more.setAttribute("aria-expanded", "false");
+  const menu = document.createElement("div");
+  menu.className = "menu";
+  menu.setAttribute("role", "menu");
+  menu.hidden = true;
+  pill.append(go, more, close);
+  root.append(pill, menu);
 
   // The button text, with the TDM logo in front of it.
   function setGo(text) {
@@ -119,6 +146,8 @@
   const tabbedPast = new WeakSet();
   let current = null; // element the pill belongs to
   let currentUrl = "";
+  let choices = []; // [{url, kind}] the background recorded for this tab, newest last
+  let decoSince = { el: null, at: 0 };
   let miss = { el: null, at: 0 }; // last element with no usable URL, to avoid asking every frame
   let pointer = { x: -1, y: -1 };
   let raf = 0;
@@ -137,15 +166,31 @@
     pin("transform", "translateX(-100%)");
   }
 
-  function show(el, url) {
+  function closeMenu(refocus) {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    more.setAttribute("aria-expanded", "false");
+    if (refocus) more.focus();
+  }
+
+  function labelFor(url) {
+    return url && !/^https?:\/\/(www\.)?youtube\.com\//i.test(url) ? buttonLabel(url, mediaKind(url) || undefined) : LABEL;
+  }
+
+  function show(el, url, list) {
     current = el;
     currentUrl = url;
+    choices = list;
+    closeMenu(false);
+    more.hidden = list.length < 2;
+    setGo(labelFor(url));
     if (!host.isConnected) document.documentElement.append(host);
     place();
     pin("display", "block");
   }
 
   function hide() {
+    closeMenu(false);
     pin("display", "none");
     current = null;
     viaKeyboard = false;
@@ -153,20 +198,59 @@
 
   // An element's own http(s) URL, else (for blob:/data: players) the stream
   // the background saw on the network for this tab, else nothing.
+  // A YouTube video page link as https://www.youtube.com/watch?v=ID (or a
+  // Shorts link), or "" when `raw` is not one.
+  function youtubeVideoLink(raw) {
+    try {
+      const u = new URL(raw, location.href);
+      if (!/(^|\.)youtube\.com$/i.test(u.hostname)) return "";
+      const id = u.pathname === "/watch" ? u.searchParams.get("v") : (u.pathname.match(/^\/shorts\/([^/]+)/) || [])[1];
+      if (!id || !/^[A-Za-z0-9_-]{11}$/.test(id)) return "";
+      return u.pathname === "/watch" ? `https://www.youtube.com/watch?v=${id}` : `https://www.youtube.com/shorts/${id}`;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  // On YouTube the media URLs (i.ytimg.com pictures, googlevideo.com chunks)
+  // are not the video, so the button hands over the video's page link: the
+  // open page for the main player, otherwise the link of the card the
+  // thumbnail or hover preview belongs to.
+  function youtubeLinkFor(el) {
+    if (el.closest("ytd-watch-flexy #movie_player, ytd-shorts #shorts-player, #player #movie_player")) {
+      const own = youtubeVideoLink(location.href);
+      if (own) return own;
+    }
+    const sel = 'a[href*="/watch?v="], a[href*="/shorts/"]';
+    let node = el;
+    for (let depth = 0; node && depth < 10; depth++, node = node.parentElement) {
+      const a = node.matches && node.matches(sel) ? node : node.querySelector && node.querySelector(sel);
+      const link = a && youtubeVideoLink(a.getAttribute("href"));
+      if (link) return link;
+    }
+    return youtubeVideoLink(location.href);
+  }
+
   async function urlFor(el) {
+    if (/(^|\.)youtube\.com$/i.test(location.hostname)) return { url: youtubeLinkFor(el), list: [] };
     if (el.tagName === "IMG") {
       // A picture is saved from its own address; only web links qualify.
       const src = el.currentSrc || el.src || "";
-      return /^https?:/i.test(src) ? src : "";
+      return { url: /^https?:/i.test(src) ? src : "", list: [] };
     }
     const direct = sourcesOf(el)[0];
-    if (direct) return direct;
-    if (!isStreamed(el)) return "";
+    if (direct) return { url: direct, list: [] };
+    if (!isStreamed(el)) return { url: "", list: [] };
     try {
-      const best = pickStream(await api.runtime.sendMessage({ cmd: "mediaForTab" }));
-      return best ? best.url : "";
+      const all = await api.runtime.sendMessage({ cmd: "mediaForTab" });
+      const seen = new Set();
+      const list = (Array.isArray(all) ? all : []).filter(
+        (m) => m && typeof m.url === "string" && !seen.has(m.url) && seen.add(m.url),
+      );
+      const best = pickStream(list);
+      return { url: best ? best.url : "", list };
     } catch (_) {
-      return ""; // extension reloaded underneath us
+      return { url: "", list: [] }; // extension reloaded underneath us
     }
   }
 
@@ -174,12 +258,21 @@
     if (el === current) return place();
     if (dismissed.has(el) || document.fullscreenElement) return;
     if (miss.el === el && Date.now() - miss.at < MISS_RETRY_MS) return;
-    const url = await urlFor(el);
+    if (
+      el.tagName === "VIDEO" &&
+      isDecorative({ muted: el.muted, loop: el.loop, controls: el.controls, autoplay: el.autoplay, width: el.clientWidth, height: el.clientHeight })
+    ) {
+      // A muted looping background clip: only after a deliberate hover.
+      if (decoSince.el !== el) decoSince = { el, at: Date.now() };
+      const wait = DECORATIVE_HOVER_MS - (Date.now() - decoSince.at);
+      if (wait > 0) return void setTimeout(schedule, wait + 20);
+    }
+    const { url, list } = await urlFor(el);
     if (!url) {
       miss = { el, at: Date.now() };
       return;
     }
-    show(el, url);
+    show(el, url, list);
   }
 
   function mediaAt(x, y) {
@@ -244,6 +337,26 @@
     true,
   );
   root.addEventListener("keydown", (e) => {
+    if (!menu.hidden || (e.target === more && (e.key === "ArrowDown" || e.key === "ArrowUp"))) {
+      const items = [...menu.querySelectorAll("button")];
+      const i = items.indexOf(e.target);
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        return closeMenu(true);
+      }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (menu.hidden) openMenu();
+        else items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
+        return;
+      }
+      if (e.key === "Home" || e.key === "End") {
+        e.preventDefault();
+        return items[e.key === "Home" ? 0 : items.length - 1].focus();
+      }
+      if (e.key === "Tab") closeMenu(false);
+    }
     if (e.key !== "Escape" && !(e.key === "Tab" && (e.shiftKey ? e.target === go : e.target === close))) return;
     e.preventDefault();
     const back = current;
@@ -263,25 +376,65 @@
     go.removeAttribute("aria-busy");
     resetTimer = setTimeout(() => {
       go.className = "go";
-      setGo(LABEL);
+      setGo(labelFor(currentUrl));
     }, 2500);
   }
 
-  go.addEventListener("click", async () => {
-    if (!currentUrl || go.getAttribute("aria-busy")) return;
+  async function send(url) {
+    if (!url || go.getAttribute("aria-busy")) return;
     go.setAttribute("aria-busy", "true");
     setGo("Sending…");
     let reply = null;
     try {
-      reply = await api.runtime.sendMessage({ cmd: "downloadMedia", url: currentUrl });
+      reply = await api.runtime.sendMessage({ cmd: "downloadMedia", url });
     } catch (_) {
       /* extension reloaded; reported as a failure below */
     }
     const result = reply && reply.result;
-    if (result === "accepted") feedback("ok", "✓ Sent to TDM");
-    else if (result === "offline") feedback("err", "TDM isn't running");
+    if (result === "accepted") {
+      // Avoid double sends: once sent, the button stays away from this element.
+      const sent = current;
+      if (sent) dismissed.add(sent);
+      feedback("ok", "✓ Sent to TDM");
+      clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => {
+        go.className = "go";
+        if (current === sent) hide();
+      }, 1800);
+    } else if (result === "offline") feedback("err", "TDM isn't running");
     else feedback("err", "Couldn't send");
-  });
+  }
+
+  function openMenu() {
+    if (more.hidden) return;
+    const best = pickStream(choices);
+    const rows = [...choices].reverse().map((item) => {
+      const d = describeChoice(item);
+      const b = document.createElement("button");
+      b.type = "button";
+      b.setAttribute("role", "menuitem");
+      if (best && item.url === best.url) b.className = "best";
+      const t = document.createElement("b");
+      t.textContent = d.label;
+      t.style.fontWeight = "600";
+      const sm = document.createElement("small");
+      sm.textContent = d.detail;
+      b.title = item.url;
+      b.append(t, sm);
+      b.addEventListener("click", () => {
+        closeMenu(false);
+        void send(item.url);
+      });
+      return b;
+    });
+    menu.replaceChildren(...rows);
+    menu.hidden = false;
+    more.setAttribute("aria-expanded", "true");
+    (rows.find((b) => b.className === "best") || rows[0]).focus();
+  }
+
+  more.addEventListener("click", () => (menu.hidden ? openMenu() : closeMenu(true)));
+  go.addEventListener("click", () => void send(currentUrl));
 
   close.addEventListener("click", () => {
     const back = current;
