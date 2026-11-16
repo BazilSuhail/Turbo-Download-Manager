@@ -154,5 +154,49 @@ function saveMediaSites() {
 mediaSitesOn.addEventListener("change", saveMediaSites);
 mediaSitesText.addEventListener("change", saveMediaSites);
 
+// ---- user exclusions and capture log (read straight from storage) ----
+function li(text, button) {
+  const el = document.createElement("li");
+  el.textContent = text;
+  if (button) el.append(" ", button);
+  return el;
+}
+
+async function renderUserHosts() {
+  const { userExceptionHosts: hosts = [] } = await api.storage.local.get("userExceptionHosts");
+  $("userHosts").replaceChildren(
+    ...hosts.map((h) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = "Remove";
+      b.addEventListener("click", async () => {
+        await api.storage.local.set({ userExceptionHosts: hosts.filter((x) => x !== h) });
+      });
+      return li(h, b);
+    }),
+  );
+  $("userHostsEmpty").hidden = hosts.length > 0;
+}
+
+async function renderCaptureLog() {
+  const { captureLog = [] } = await api.storage.session.get("captureLog");
+  $("captureLog").replaceChildren(
+    ...captureLog
+      .slice()
+      .reverse()
+      .map((e) =>
+        li(`${new Date(e.t).toLocaleTimeString()}  ${e.outcome}  ${e.file || "(no name)"}  ${e.host}  - ${e.reason}`),
+      ),
+  );
+  $("captureLogEmpty").hidden = captureLog.length > 0;
+}
+
+api.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.userExceptionHosts) void renderUserHosts();
+  if (area === "session" && changes.captureLog) void renderCaptureLog();
+});
+void renderUserHosts();
+void renderCaptureLog();
+
 refresh();
 setInterval(refresh, 2000);

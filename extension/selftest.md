@@ -154,6 +154,19 @@ the service-worker console (**Details → Inspect views: service worker**).
     Expect: the pill is gone after a reload; if cookies were allowed, sending
     cookies still works.
 
+## L2. Link grabber (popup)
+
+43. On a page with many links (a file index or release page), open the popup
+    and press **Grab links**.
+    Expect: type chips with counts, a list with checkboxes; the filter box and
+    chips narrow it; **Select all** ticks only what is shown; Tab/Space reach
+    and toggle everything.
+44. Tick two files and press **Download 2**.
+    Expect: both reach the app (with the page as referer) and the popup says
+    "Sent 2". With the app closed, it reports the rest failed and keeps them ticked.
+45. Open the popup on `chrome://extensions`.
+    Expect: "TDM can't look inside this page."
+
 ## N. Firefox
 
 33. `node extension/build.mjs`, then load `dist/firefox/manifest.json` from
@@ -164,3 +177,25 @@ the service-worker console (**Details → Inspect views: service worker**).
     ones resume and finish in the browser. Nothing stays paused.
 35. Repeat G, L and M.
     Expect: the same results as in Chromium.
+
+## Media button extras (manual)
+
+36. On a page whose player streams via blob: and loads two manifests or files, hover the video.
+    Expect: a ▾ next to the button; it lists kind plus filename/host, best marked. Arrows move, Enter sends, Esc closes and refocuses ▾.
+37. Hover a plain MP4 video.
+    Expect: the label reads "Download video (MP4)"; an HLS page reads "Download HLS stream"; no ▾ with a single choice.
+38. Hover a muted, looping, autoplaying hero background video.
+    Expect: no button for the first 600 ms, then it appears; videos with controls show it at once.
+39. Click the button and wait for "✓ Sent to TDM".
+    Expect: the button then hides and does not return for that element until reload; × also dismisses.
+
+## O. Capture control
+
+40. Right-click the page, choose *Let the browser handle downloads for 30
+    seconds*, then click a captured file type.
+    Expect: the browser downloads it; after 30 s it is captured again.
+41. Right-click a page on a site, choose *Never capture downloads from this
+    site*, then download a captured type from it (and a subdomain).
+    Expect: the browser keeps both. Options lists the host; Remove restores capture.
+42. Open Options, Capture log, after a few downloads.
+    Expect: rows with time, file, host, outcome and reason; no full URLs.

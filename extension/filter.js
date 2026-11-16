@@ -61,6 +61,27 @@ export function belowMinSize(size, minBytes) {
   return !!minBytes && size > 0 && size < minBytes;
 }
 
+/// True while the "let the browser handle it" pause is running. `until` is an
+/// epoch-ms timestamp from storage; anything that is not a number means off.
+export function captureSuspended(now, until) {
+  return typeof until === "number" && Number.isFinite(until) && now < until;
+}
+
+/// The app's excluded hosts plus the user's own, lower-cased and de-duplicated.
+export function mergeHosts(appHosts, userHosts) {
+  const clean = (l) => (Array.isArray(l) ? l : []).map((h) => String(h).trim().toLowerCase()).filter(Boolean);
+  return [...new Set([...clean(appHosts), ...clean(userHosts)])];
+}
+
+/// A capture-log row. Host and file name only: a full URL can carry tokens.
+export function logEntry(now, url, filename, outcome, reason) {
+  let host = "";
+  try {
+    host = new URL(url).hostname;
+  } catch (_) {}
+  return { t: now, host, file: String(filename || "").slice(0, 120), outcome, reason: String(reason || "") };
+}
+
 /// Firefox exposes the promise-based `browser`; Chromium only has `chrome`
 /// (promise-based in MV3 too). Prefer `browser` when both exist.
 export function pickApi(scope) {
