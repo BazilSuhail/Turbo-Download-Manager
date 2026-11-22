@@ -111,6 +111,25 @@
       </section>
 
       <section class="card">
+        <h2>Sites TDM never captures</h2>
+        <p class="hint">
+          Added from the page right-click menu, "Never capture downloads from this
+          site". Subdomains are included. The app's own exclusions are listed under Details.
+        </p>
+        <ul id="userHosts"></ul>
+        <p class="hint" id="userHostsEmpty">None.</p>
+      </section>
+
+      <section class="card">
+        <h2>Capture log</h2>
+        <p class="hint">
+          The last 20 decisions, newest first. Host and file name only, kept until the browser closes.
+        </p>
+        <ul id="captureLog"></ul>
+        <p class="hint" id="captureLogEmpty">Nothing yet.</p>
+      </section>
+
+      <section class="card">
         <h2>Details</h2>
         <dl>
           <dt>Native host</dt><dd><code id="hostName"></code></dd>

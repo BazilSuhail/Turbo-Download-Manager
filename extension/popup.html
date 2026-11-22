@@ -55,6 +55,27 @@
       </div>
     </section>
 
+    <section class="card" id="grab">
+      <div class="row spread">
+        <strong>Links on this page</strong>
+        <button id="grabBtn" class="btn small" type="button" aria-expanded="false" aria-controls="grabPanel">Grab links</button>
+      </div>
+      <div id="grabPanel" hidden>
+        <div id="chips" class="chips" role="group" aria-label="Filter by type"></div>
+        <input id="grabQuery" class="query" type="search" placeholder="Filter links" aria-label="Filter links" />
+        <div class="row spread bulk">
+          <span class="row">
+            <button id="selAll" class="btn small" type="button">Select all</button>
+            <button id="selNone" class="btn small" type="button">None</button>
+          </span>
+          <span id="grabCount" class="hint" role="status" aria-live="polite"></span>
+        </div>
+        <ul id="links"></ul>
+        <p id="grabNote" class="hint" hidden></p>
+        <button id="grabGo" class="btn primary" type="button" disabled>Download 0</button>
+      </div>
+    </section>
+
     <footer class="row spread">
       <span id="hostVersion" class="hint"></span>
       <span class="row">

@@ -36,11 +36,12 @@ fn build_extension() {
     if !ext.join("build.mjs").is_file() {
         return;
     }
-    const SOURCES: [&str; 17] = [
+    const SOURCES: [&str; 18] = [
         "build.mjs",
         "manifest.json",
         "background.js",
         "filter.js",
+        "grab.js",
         "media-core.js",
         "media.js",
         "popup.html",

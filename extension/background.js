@@ -18,6 +18,9 @@
 import {
   basename,
   belowMinSize,
+  captureSuspended,
+  logEntry,
+  mergeHosts,
   checkIncognitoAccess,
   httpUrl,
   isTorrentLink,
@@ -45,6 +48,9 @@ const MAX_SELECTED_LINKS = 200;
 const MENU_LINK = "tdm-link";
 const MENU_MEDIA = "tdm-media";
 const MENU_SELECTION = "tdm-selection";
+const MENU_NEVER = "tdm-never-site";
+const MENU_PAUSE = "tdm-pause";
+const PAUSE_MS = 30000;
 const MEDIA_SCRIPT_ID = "tdm-media";
 // Media detection is on exactly when both are granted. Asking for webRequest
 // too keeps the cookie grant (which also needs <all_urls>) from silently
@@ -251,32 +257,72 @@ async function refreshIncognito() {
   return allowed;
 }
 
+// Capture log: the last CAPTURE_LOG_KEEP decisions, host and file name only.
+const CAPTURE_LOG_KEEP = 20;
+let logChain = Promise.resolve();
+function logDecision(item, outcome, reason) {
+  const entry = logEntry(Date.now(), item.finalUrl || item.url, basename(item.filename), outcome, reason);
+  logChain = logChain
+    .then(async () => {
+      const { captureLog = [] } = await api.storage.session.get("captureLog");
+      await api.storage.session.set({ captureLog: [...captureLog, entry].slice(-CAPTURE_LOG_KEEP) });
+    })
+    .catch(quiet);
+}
+
+// Hosts the user excluded from the options page or the page menu.
+async function userExceptionHosts() {
+  const { userExceptionHosts: l = [] } = await api.storage.local.get("userExceptionHosts");
+  return l;
+}
+
 async function decide(item) {
+  let outcome = "skipped";
+  let why = "";
+  const skip = (reason) => {
+    why = reason;
+    return false;
+  };
+  try {
+    const take = await decideInner(item, skip);
+    if (take) outcome = "captured";
+    else if (why) outcome = why.startsWith("declined") ? "declined" : "skipped";
+    return take;
+  } finally {
+    if (why || outcome === "captured") logDecision(item, outcome, why || "sent to TDM");
+  }
+}
+
+async function decideInner(item, skip) {
   const raw = item.finalUrl || item.url;
   const url = httpUrl(raw);
   if (!url) return false;
-  const { enabled = true } = await api.storage.local.get("enabled");
-  if (!enabled) return false;
+  const { enabled = true, captureSuspendedUntil } = await api.storage.local.get(["enabled", "captureSuspendedUntil"]);
+  if (!enabled) return skip("capture is off");
+  if (captureSuspended(Date.now(), captureSuspendedUntil)) return skip("paused: browser handles it");
   if (isTorrentLink(raw) && !(await torrentsEnabled())) {
     console.info("torrent download ignored: torrents are off in the extension options");
-    return false;
+    return skip("torrents are off");
   }
   // A private download is ours only if the user allowed TDM in Incognito; else the browser keeps it.
-  if (item.incognito === true && !(await refreshIncognito())) return false;
+  if (item.incognito === true && !(await refreshIncognito())) return skip("private window not allowed");
   if (!(await claim(item.id))) return false;
   try {
     const filename = basename(item.filename) || undefined;
     // Pre-filter on the last known lists so a page full of uninteresting
     // downloads never tries to wake a host that is not installed.
+    const mine = await userExceptionHosts();
     const cached = await cachedLists();
-    if (cached.captureExtensions.length && !shouldCapture(url, filename, cached)) return false;
+    cached.exceptionHosts = mergeHosts(cached.exceptionHosts, mine);
+    if (cached.captureExtensions.length && !shouldCapture(url, filename, cached)) return skip("type or site not captured");
 
     const lists = await ensureHost();
-    if (!shouldCapture(url, filename, lists)) return false;
+    if (lists) lists.exceptionHosts = mergeHosts(lists.exceptionHosts, mine);
+    if (!shouldCapture(url, filename, lists)) return skip(lists ? "type or site not captured" : "app not reachable");
     // The options page may override the app's floor; a number there wins, KiB.
     const { captureMinKib } = await api.storage.local.get("captureMinKib");
     const minBytes = typeof captureMinKib === "number" ? captureMinKib * 1024 : lists.captureMinSize;
-    if (belowMinSize(item.totalBytes, minBytes)) return false;
+    if (belowMinSize(item.totalBytes, minBytes)) return skip("below minimum size");
 
     const reply = await requestWithTimeout(
       await downloadMessage(raw, {
@@ -287,7 +333,8 @@ async function decide(item) {
       VERDICT_TIMEOUT_MS,
     );
     await setLast(`${reply ? reply.type : "no reply"}: ${raw}`);
-    return !!reply && reply.type === "accepted";
+    if (!reply || reply.type !== "accepted") return skip(`declined by app (${reply ? reply.type : "no reply"})`);
+    return true;
   } finally {
     inFlight.delete(item.id);
   }
@@ -492,6 +539,9 @@ function createMenus() {
     add({ id: MENU_LINK, title: "Download with TDM", contexts: ["link"] });
     add({ id: MENU_MEDIA, title: "Download media with TDM", contexts: ["image", "video", "audio"] });
     add({ id: MENU_SELECTION, title: "Download selected links with TDM", contexts: ["selection"] });
+    add({ id: MENU_NEVER, title: "Never capture downloads from this site", contexts: ["page"] });
+    // Firefox MV3 and Chromium both take "action"; the toolbar button and the page menu share the pause item.
+    add({ id: MENU_PAUSE, title: "Let the browser handle downloads for 30 seconds", contexts: ["action", "page", "link"] });
   });
 }
 
@@ -526,6 +576,17 @@ async function selectedLinks(tab, frameId) {
 api.contextMenus.onClicked.addListener((info, tab) => {
   const referer = info.pageUrl || (tab && tab.url) || undefined;
   void (async () => {
+    if (info.menuItemId === MENU_PAUSE) {
+      await api.storage.local.set({ captureSuspendedUntil: Date.now() + PAUSE_MS });
+      return void (await setLast("capture paused for 30 seconds"));
+    }
+    if (info.menuItemId === MENU_NEVER) {
+      const u = httpUrl(info.pageUrl || (tab && tab.url));
+      if (!u) return;
+      const mine = await userExceptionHosts();
+      await api.storage.local.set({ userExceptionHosts: mergeHosts(mine, [u.hostname]) });
+      return void (await setLast(`TDM will not capture downloads from ${u.hostname}`));
+    }
     if (info.menuItemId === MENU_SELECTION) {
       const links = [...new Set(await selectedLinks(tab, info.frameId))].filter((u) => httpUrl(u));
       // Sequential: the host answers in order and one slow reply must not time out the rest.
@@ -582,17 +643,12 @@ function fromExtensionPage(sender) {
   return sender.id === api.runtime.id && typeof sender.url === "string" && sender.url.startsWith(api.runtime.getURL(""));
 }
 
-// A content script may start a download only for a URL on the origin of the
-// tab it runs in. Anything else is refused by the caller.
-function sameOriginAsTab(raw, sender) {
-  const target = httpUrl(raw);
-  const tabUrl = sender.tab && sender.tab.url;
-  if (!target || !tabUrl) return false;
-  try {
-    return new URL(tabUrl).origin === target.origin;
-  } catch (_) {
-    return false;
-  }
+// A content script may hand over any web (http/https) URL. The user pressed
+// the button over that player or picture, and media is usually served from
+// another host (a CDN, i.ytimg.com, ...), so a same-origin rule refused almost
+// every click. blob:, data:, file: and non-URLs are still refused.
+function webUrlFromContent(raw, sender) {
+  return !!(sender.tab && httpUrl(raw));
 }
 
 api.runtime.onMessage.addListener((msg, sender, reply) => {
@@ -604,9 +660,9 @@ api.runtime.onMessage.addListener((msg, sender, reply) => {
   };
 
   if (msg.cmd === "downloadMedia" && typeof msg.url === "string") {
-    if (!page && !sameOriginAsTab(msg.url, sender)) {
+    if (!page && !webUrlFromContent(msg.url, sender)) {
       // The reason only; the URL is not logged.
-      console.warn("downloadMedia refused: URL is not on the sender's tab origin");
+      console.warn("downloadMedia refused: not a web (http/https) URL");
       return answer(Promise.resolve({ result: "rejected" }));
     }
     // From the popup the page details come in the message; from the content

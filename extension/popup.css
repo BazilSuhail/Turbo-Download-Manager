@@ -67,6 +67,40 @@ label .hint { margin: 0; }
 .grant { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
 .grant .btn { margin-top: 8px; width: 100%; }
 
+/* Link grabber */
+#grabPanel { display: grid; gap: 8px; margin-top: 10px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 9px;
+}
+.chip[aria-pressed="true"] { background: var(--btn); border-color: var(--btn); color: var(--on-btn); }
+.chip:focus-visible, .query:focus-visible, #links input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.query {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 5px 9px;
+  width: 100%;
+}
+.bulk .row { gap: 6px; }
+#links { list-style: none; margin: 0; max-height: 220px; overflow-y: auto; padding: 0; }
+#links li { border-top: 1px solid var(--line); }
+#links li:first-child { border-top: 0; }
+#links label { align-items: center; cursor: pointer; display: flex; gap: 8px; padding: 6px 0; }
+#links .name { flex: 1; }
+#grabGo { width: 100%; }
+
 footer { padding: 0 4px; }
 footer .hint { margin: 0; }
 footer .row { gap: 12px; }

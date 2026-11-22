@@ -1,5 +1,7 @@
 import "./media-core.js"; // defines globalThis.TdmMedia
 
+import { filterLinks, normalizeLinks } from "./grab.js";
+
 const { filenameFromTitle } = globalThis.TdmMedia;
 const api = globalThis.browser ?? globalThis.chrome;
 const $ = (id) => document.getElementById(id);
@@ -157,6 +159,147 @@ async function loadMedia() {
   else if (streamed) showEmpty("This page streams its video. With media detection on, start playback and reopen this popup.");
   else showEmpty("No video or audio found on this page.");
 }
+
+// ------------------------------------------------------------- link grabber
+
+const CHIPS = [
+  ["all", "All"],
+  ["video", "Video"],
+  ["audio", "Audio"],
+  ["archives", "Archives"],
+  ["documents", "Documents"],
+  ["programs", "Programs"],
+  ["images", "Images"],
+  ["other", "Other"],
+];
+// Runs inside the page, so it must not touch anything outside itself. Links
+// first, then media sources, then images; the raw list is capped before it
+// crosses back so a huge page cannot stall the popup.
+function collectLinks() {
+  const out = [];
+  const add = (url, text) => url && out.push({ url, text });
+  for (const a of document.querySelectorAll("a[href]")) add(a.href, a.textContent || a.title);
+  for (const m of document.querySelectorAll("video[src], audio[src], source[src]")) add(m.currentSrc || m.src, "");
+  for (const i of document.querySelectorAll("img[src]")) add(i.currentSrc || i.src, i.alt);
+  return out.slice(0, 20000);
+}
+
+const grab = { items: [], type: "all", checked: new Set(), shown: [] };
+
+async function loadLinks() {
+  $("grabCount").textContent = "Reading page…";
+  const run = async (target) => (await api.scripting.executeScript({ target, func: collectLinks })).flatMap((r) => r.result || []);
+  let raw;
+  try {
+    raw = await run({ tabId: tab.id, allFrames: true });
+  } catch (_) {
+    try {
+      raw = await run({ tabId: tab.id }); // a cross-origin frame refused; the top frame may not
+    } catch (_) {
+      $("grabCount").textContent = "";
+      $("grabNote").textContent = "TDM can't look inside this page.";
+      $("grabNote").hidden = false;
+      return;
+    }
+  }
+  const { items, truncated } = normalizeLinks(raw);
+  grab.items = items;
+  grab.checked = new Set();
+  $("grabNote").textContent = `Showing the first ${items.length} links.`;
+  $("grabNote").hidden = !truncated;
+  renderChips();
+  renderLinks();
+}
+
+function renderChips() {
+  const counts = { all: grab.items.length };
+  for (const i of grab.items) counts[i.type] = (counts[i.type] || 0) + 1;
+  $("chips").replaceChildren(
+    ...CHIPS.filter(([t]) => t === "all" || counts[t]).map(([t, name]) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "chip";
+      b.textContent = `${name} ${counts[t] || 0}`;
+      b.setAttribute("aria-pressed", String(grab.type === t));
+      b.addEventListener("click", () => {
+        grab.type = t;
+        renderChips();
+        renderLinks();
+      });
+      return b;
+    }),
+  );
+}
+
+function renderLinks() {
+  grab.shown = filterLinks(grab.items, grab.type, $("grabQuery").value);
+  $("links").replaceChildren(
+    ...grab.shown.map((item) => {
+      const li = document.createElement("li");
+      const label = document.createElement("label");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = grab.checked.has(item.url);
+      box.addEventListener("change", () => {
+        box.checked ? grab.checked.add(item.url) : grab.checked.delete(item.url);
+        renderTotals();
+      });
+      const name = document.createElement("span");
+      name.className = "name";
+      const title = document.createElement("span");
+      title.className = "title";
+      title.textContent = item.name;
+      title.title = item.url;
+      const where = document.createElement("span");
+      where.className = "where";
+      where.textContent = item.text || new URL(item.url).hostname;
+      name.append(title, where);
+      label.append(box, name);
+      li.append(label);
+      return li;
+    }),
+  );
+  renderTotals();
+}
+
+function renderTotals() {
+  const n = grab.checked.size;
+  $("grabCount").textContent = `${grab.shown.length} shown, ${n} selected`;
+  $("grabGo").textContent = `Download ${n}`;
+  $("grabGo").disabled = !n;
+}
+
+function selectShown(on) {
+  for (const i of grab.shown) on ? grab.checked.add(i.url) : grab.checked.delete(i.url);
+  renderLinks();
+}
+
+$("grabBtn").addEventListener("click", () => {
+  const open = $("grabPanel").hidden;
+  $("grabPanel").hidden = !open;
+  $("grabBtn").setAttribute("aria-expanded", String(open));
+  if (open && !grab.items.length) loadLinks();
+});
+$("grabQuery").addEventListener("input", renderLinks);
+$("selAll").addEventListener("click", () => selectShown(true));
+$("selNone").addEventListener("click", () => selectShown(false));
+// One at a time so the app is not flooded with prompts; failed ones stay checked for a retry.
+$("grabGo").addEventListener("click", async () => {
+  const urls = [...grab.checked];
+  const button = $("grabGo");
+  button.disabled = true;
+  let sent = 0;
+  for (const url of urls) {
+    button.textContent = `Sending ${sent + 1} of ${urls.length}…`;
+    const reply = await send({ cmd: "downloadMedia", url, pageUrl: tab && tab.url, title: "" });
+    if (reply && reply.result === "accepted") {
+      sent++;
+      grab.checked.delete(url);
+    } else if (reply && reply.result === "offline") break;
+  }
+  renderLinks();
+  $("grabCount").textContent = sent === urls.length ? `Sent ${sent} ✓` : `Sent ${sent} of ${urls.length}; the rest failed or the app is offline`;
+});
 
 refresh();
 setInterval(refresh, 2000);

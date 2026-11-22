@@ -75,11 +75,25 @@ the app empties the list); a download is taken over only when
 - automatic capture is on (popup or options page), and
 - the URL is `http:`/`https:` — never `blob:`, `data:`, `file:` or an
   extension URL, and
-- its host is not in `exceptionHosts` (suffix match, so `example.com` also
-  covers `cdn.example.com`), and
+- its host is not in `exceptionHosts` or in your own list (suffix match, so
+  `example.com` also covers `cdn.example.com`), and
+- capture is not paused (see below), and
 - its file extension is in `captureExtensions`.
 
 An empty `captureExtensions` list captures nothing.
+
+**Bypass.** Right-click the page or the toolbar button and choose *Let the
+browser handle downloads for 30 seconds*; nothing is captured until the
+timer ends. (Browsers do not expose the Alt key to the downloads API, so a
+held-key bypass is not possible without a content script on every page.)
+
+**Never on this site.** The page menu item *Never capture downloads from this
+site* adds the host to your own exclusion list (`storage.local`), merged with
+the app's `exceptionHosts`. Remove entries on the options page.
+
+**Capture log.** The options page lists the last 20 decisions (time, file
+name, host, captured / declined / skipped and why). No full URLs; it is kept
+in `storage.session` and cleared when the browser closes.
 
 Chromium holds a download in `onDeterminingFilename` until the app answers.
 Firefox has no such event, so there the download is paused in `onCreated`,
@@ -102,6 +116,12 @@ sites, and then:
   button, **Esc** goes back. It never appears for `blob:`/`data:` players
   unless a real stream URL for that tab has been seen on the network, and it
   is not shown in fullscreen.
+- the button label says what will be sent ("Download video (MP4)", "Download
+  HLS stream"). When the background has recorded several streams or files for
+  the tab, a **▾** opens a menu to pick one (Arrow keys move, **Esc** closes);
+  a plain click sends the best (newest manifest, else newest file). Muted,
+  looping, control-less background clips appear only after a 600 ms hover.
+  After a successful send the button stays hidden for that element.
 - responses whose URL or `Content-Type` look like a whole media file or a
   stream manifest are remembered per tab (stream segments such as `.ts` and
   `.m4s` are ignored) and listed in the popup.
@@ -114,6 +134,16 @@ removes the permissions and unregisters the script.
 Without the grant the popup still lists the `<video>`/`<audio>` sources of the
 current page. Opening the popup grants `activeTab`, which is enough to read
 the page once.
+
+### Grab links from this page
+
+The popup's **Grab links** button reads every `<a href>`, `<video>`/`<audio>`/
+`<source>` and `<img>` source of the current page (and its frames) with
+`activeTab` + `scripting`; no extra permission. Only http(s) links are kept,
+deduped, capped at 2000. Filter by type chip (Video, Audio, Archives,
+Documents, Programs, Images) or text, tick links, and **Download N** sends each
+to TDM one at a time with the page as referer. The sorting logic is in
+`grab.js`, checked by `grab.test.mjs`.
 
 ## 5. Permissions
 

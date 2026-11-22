@@ -38,6 +38,7 @@ use tdm::scheduler;
 use tdm::torrent_store::{self, TorrentSource};
 use tdm::transfer;
 use tdm::ui::keymap;
+use tdm::ui::listfmt::{self, SortKey};
 use tdm::hosts::HostLimits;
 use tdm::ipc::{Advert, Incoming, Inbox};
 use tdm::model::{AUTO_RETRY_MAX, OptionsTab, ProxySettings, Settings, WindowGeometry};
@@ -103,6 +104,9 @@ enum Message {
     SearchChanged(String),
     /// Enter in the search box. Deliberately does nothing, so the list keeps its selection.
     SearchSubmit,
+    /// The sort button: next key. The arrow beside it flips the direction.
+    CycleSort,
+    FlipSort,
     Tick,
     /// A display frame (or a shimmer tick): advance animations.
     Frame(Instant),
@@ -432,6 +436,8 @@ fn magnet_name(magnet: &str) -> Option<String> {
 struct App {
     url: String,
     search: String,
+    sort: SortKey,
+    sort_desc: bool,
     downloads: Vec<Entry>,
     next_id: u64,
     /// The keyboard cursor: the row Space and Delete act on.
@@ -900,6 +906,8 @@ impl App {
         let mut app = Self {
             url: String::new(),
             search: String::new(),
+            sort: SortKey::Added,
+            sort_desc: false,
             downloads: Vec::new(),
             next_id: 1,
             selected: None,
@@ -1193,7 +1201,8 @@ impl App {
 
     fn visible(&self) -> Vec<&Entry> {
         let needle = self.search.trim().to_lowercase();
-        self.downloads
+        let mut list: Vec<&Entry> = self
+            .downloads
             .iter()
             .filter(|e| match self.filter {
                 Filter::All => true,
@@ -1206,7 +1215,17 @@ impl App {
                     || e.name.to_lowercase().contains(&needle)
                     || e.handle.url().to_lowercase().contains(&needle)
             })
-            .collect()
+            .collect();
+        if self.sort != SortKey::Added || self.sort_desc {
+            fn row(e: &Entry) -> listfmt::SortRow<'_> {
+                listfmt::SortRow { id: e.id, name: &e.name, total: e.snapshot.total, done: e.snapshot.done, speed: e.speed }
+            }
+            list.sort_by(|a, b| {
+                let o = listfmt::compare(self.sort, &row(a), &row(b));
+                if self.sort_desc { o.reverse() } else { o }
+            });
+        }
+        list
     }
 
     /// Whether the clock currently allows the queue to run.
@@ -2128,6 +2147,14 @@ impl App {
                 Task::none()
             }
             Message::SearchSubmit => Task::none(),
+            Message::CycleSort => {
+                self.sort = self.sort.next();
+                Task::none()
+            }
+            Message::FlipSort => {
+                self.sort_desc = !self.sort_desc;
+                Task::none()
+            }
             Message::TypeRename(id) => {
                 self.type_prompt = None;
                 let Some(ix) = self.index_of(id) else { return Task::none() };
@@ -2993,7 +3020,7 @@ impl App {
             let elapsed = now.duration_since(entry.last_tick).as_secs_f64();
             if entry.snapshot.status == Status::Running && elapsed > 0.0 {
                 let delta = entry.snapshot.done.saturating_sub(entry.last_done);
-                entry.speed = delta as f64 / elapsed;
+                entry.speed = listfmt::smooth(entry.speed, delta as f64 / elapsed);
             } else {
                 entry.speed = 0.0;
             }
@@ -3474,11 +3501,30 @@ impl App {
         ]
         .spacing(6)
         .align_y(Alignment::Center);
+        let sort_ctl = row![
+            tip(
+                button(text(format!("Sort: {}", self.sort.label())).size(12))
+                    .padding([6, 8])
+                    .style(theme::flat(self.sort != SortKey::Added))
+                    .on_press(Message::CycleSort),
+                "Sort the list: click to change the column",
+            ),
+            tip(
+                button(text(if self.sort_desc { "\u{25BC}" } else { "\u{25B2}" }).size(11))
+                    .padding([6, 6])
+                    .style(theme::flat(false))
+                    .on_press(Message::FlipSort),
+                "Reverse the sort order",
+            ),
+        ]
+        .align_y(Alignment::Center);
         let toolbar = row![
             scrollable(tools)
                 .width(Length::Fill)
                 .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(0).scroller_width(0))),
             space(Length::Fixed(8.0), Length::Shrink),
+            sort_ctl,
+            space(Length::Fixed(6.0), Length::Shrink),
             search,
         ]
         .align_y(Alignment::Center);
@@ -3989,6 +4035,32 @@ impl App {
             Status::Running => None,
         };
         let bar = progress_bar(0.0..=1.0, frac).girth(6).style(theme::progress(bar_colour, shimmer));
+        let bar: Element<'a, Message> = match s.total {
+            Some(total) if running && s.parts.len() > 1 => {
+                let spans = listfmt::part_spans(&s.parts, total);
+                let mut strip = row![].height(4);
+                for (portion, filled) in spans {
+                    let fill = (filled * 1000.0) as u16;
+                    let seg = row![
+                        container(Space::new()).width(Length::FillPortion(fill)).height(4).style(|t: &Theme| {
+                            container::Style { background: Some(theme::Palette::of(t).accent.into()), ..Default::default() }
+                        }),
+                        Space::new().width(Length::FillPortion(1000 - fill)),
+                    ]
+                    .width(Length::FillPortion(portion));
+                    strip = strip.push(seg);
+                }
+                container(strip)
+                    .width(Length::Fill)
+                    .height(4)
+                    .style(|t: &Theme| container::Style {
+                        background: Some(theme::Palette::of(t).border.into()),
+                        ..Default::default()
+                    })
+                    .into()
+            }
+            _ => bar.into(),
+        };
 
         // The name is cut to what the title has room for, with the full name in a tooltip.
         let pills_w = 100.0 + if type_pill.is_some() { 100.0 } else { 0.0 };
@@ -5239,13 +5311,7 @@ fn time_left(s: &Snapshot, speed: f64) -> String {
     match s.total {
         Some(total) if speed > 1.0 && total > s.done => {
             let secs = ((total - s.done) as f64 / speed) as u64;
-            if secs >= 3600 {
-                format!("{}h {}m left", secs / 3600, (secs % 3600) / 60)
-            } else if secs >= 60 {
-                format!("{}m {}s left", secs / 60, secs % 60)
-            } else {
-                format!("{secs}s left")
-            }
+            format!("{} left", listfmt::fmt_eta(secs))
         }
         _ => "\u{2014}".to_owned(),
     }
@@ -5549,6 +5615,8 @@ mod tests {
         App {
             url: String::new(),
             search: String::new(),
+            sort: SortKey::Added,
+            sort_desc: false,
             downloads: Vec::new(),
             next_id: 1,
             selected: None,

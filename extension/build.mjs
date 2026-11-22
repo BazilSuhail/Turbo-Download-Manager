@@ -19,6 +19,7 @@ const DIST = join(SRC, "dist");
 const FILES = [
   "background.js",
   "filter.js",
+  "grab.js",
   "media-core.js",
   "media.js",
   "popup.html",
